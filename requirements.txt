@@ -34,3 +34,6 @@ psutil>=5.9.0
 # Development
 black>=23.0.0
 flake8>=6.0.0
+
+# Chart
+matplotlib>=3.10.8

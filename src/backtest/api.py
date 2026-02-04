@@ -1,6 +1,7 @@
 """
 回测API接口
 提供统一的回测接口供外部调用
+支持多因子回测系统
 """
 from typing import Dict, List, Optional, Callable, Any
 from datetime import datetime, timezone
@@ -35,26 +36,8 @@ class BacktestAPI:
         
         Returns:
             BacktestResult 回测结果
-        
-        Example:
-            >>> config = BacktestConfig(
-            ...     name="simple_ma_strategy",
-            ...     start_date=datetime(2024, 1, 1),
-            ...     end_date=datetime(2024, 12, 31),
-            ...     initial_balance=10000,
-            ...     symbols=["BTCUSDT", "ETHUSDT"],
-            ... )
-            >>> 
-            >>> def simple_strategy(portfolio, klines):
-            ...     weights = {}
-            ...     for symbol, kline in klines.items():
-            ...         weights[symbol] = 0.5 if kline.close > kline.open else 0.0
-            ...     return weights
-            >>> 
-            >>> result = BacktestAPI.run_backtest(config, simple_strategy)
         """
         try:
-            # 1. 创建数据重放引擎
             logger.info(f"Creating replay engine for {len(config.symbols)} symbols")
             replay_engine = DataReplayEngine(
                 symbols=config.symbols,
@@ -69,10 +52,8 @@ class BacktestAPI:
             available_symbols = replay_engine.get_available_symbols()
             logger.info(f"Loaded data for symbols: {available_symbols}")
             
-            # 2. 创建回测执行器
             executor = BacktestExecutor(config, replay_engine)
             
-            # 3. 运行回测
             logger.info(f"Running backtest: {config.name}")
             result = executor.run(strategy_func)
             
@@ -90,20 +71,11 @@ class BacktestAPI:
     ) -> BacktestResult:
         """
         运行多周期回测
-        
-        Args:
-            config: 回测配置
-            strategy_func: 策略函数，接收(portfolio_state, {interval: {symbol: kline}}），返回目标持仓权重
-            intervals: K线周期列表 (e.g., ["5m", "1h", "4h"])
-        
-        Returns:
-            BacktestResult 回测结果
         """
         if intervals is None:
             intervals = ["5m"]
         
         try:
-            # 1. 创建多周期重放引擎
             logger.info(f"Creating multi-interval replay engine: {intervals}")
             replay_engine = MultiIntervalReplayEngine(
                 symbols=config.symbols,
@@ -112,27 +84,20 @@ class BacktestAPI:
                 intervals=intervals
             )
             
-            # 获取主周期的重放引擎
             primary_engine = replay_engine.engines[intervals[0]]
             
             if not primary_engine.has_data():
                 raise ValueError(f"No historical data found for symbols: {config.symbols}")
             
-            # 2. 创建回测执行器
             executor = BacktestExecutor(config, primary_engine)
             
-            # 3. 运行回测（包装策略函数以支持多周期）
             def wrapped_strategy(portfolio: PortfolioState, klines: Dict[str, KlineSnapshot]) -> Dict[str, float]:
-                # 为每个周期构建K线数据
                 multi_interval_klines = {}
                 for interval in intervals:
                     engine = replay_engine.get_engine(interval)
                     multi_interval_klines[interval] = engine.get_current_snapshot()
-                
-                # 调用原始策略函数
                 return strategy_func(portfolio, multi_interval_klines)
             
-            # 运行回测
             logger.info(f"Running multi-interval backtest: {config.name}")
             result = executor.run(wrapped_strategy)
             
@@ -143,12 +108,54 @@ class BacktestAPI:
             raise
     
     @staticmethod
+    def run_factor_backtest(
+        calculator: Any,
+        start_date: datetime,
+        end_date: datetime,
+        initial_balance: float = 10000.0,
+        symbols: Optional[List[str]] = None,
+        capital_allocation: str = "rank_weight",
+        long_count: int = 5,
+        short_count: int = 5,
+        verbose: bool = True,
+    ) -> BacktestResult:
+        """
+        运行因子回测 - 使用新的多因子回测系统
+        
+        Args:
+            calculator: 因子计算器 (AlphaCalculatorBase)
+            start_date: 开始日期
+            end_date: 结束日期
+            initial_balance: 初始资金
+            symbols: 交易对列表
+            capital_allocation: 资金分配方式
+            long_count: 做多数量
+            short_count: 做空数量
+            verbose: 是否打印进度
+        
+        Returns:
+            BacktestResult 回测结果
+        """
+        from .backtest import run_backtest
+        
+        result = run_backtest(
+            calculator=calculator,
+            start_date=start_date,
+            end_date=end_date,
+            initial_balance=initial_balance,
+            symbols=symbols,
+            capital_allocation=capital_allocation,
+            long_count=long_count,
+            short_count=short_count,
+            verbose=verbose,
+        )
+        
+        return result
+    
+    @staticmethod
     def analyze_result(result: BacktestResult) -> Dict:
         """
         分析回测结果
-        
-        Args:
-            result: 回测结果
         
         Returns:
             包含详细统计指标的字典
@@ -163,14 +170,6 @@ class BacktestAPI:
     ) -> str:
         """
         生成回测报告
-        
-        Args:
-            result: 回测结果
-            output_dir: 输出目录（如果提供会保存文件）
-            format: 输出格式 ("text", "json", "csv")
-        
-        Returns:
-            报告内容（文本格式）
         """
         if format == "text":
             report = BacktestAnalyzer.generate_report(result)
@@ -209,15 +208,6 @@ class BacktestAPI:
     ) -> Dict[str, BacktestResult]:
         """
         批量运行多个回测
-        
-        Args:
-            configs: 回测配置列表
-            strategy_func: 策略函数
-            interval: K线周期
-            compare: 是否生成对比报告
-        
-        Returns:
-            {config_name: BacktestResult} 字典
         """
         results = {}
         
@@ -255,33 +245,20 @@ class BacktestAPI:
         logger.info("=" * 100)
 
 
-# 便捷函数
 def create_backtest_config(
     name: str,
     start_date: datetime,
     end_date: datetime,
     initial_balance: float = 10000.0,
-    symbols: List[str] = None,
+    symbols: Optional[List[str]] = None,
     **kwargs
 ) -> BacktestConfig:
     """
     创建回测配置的便捷函数
-    
-    Args:
-        name: 回测名称
-        start_date: 开始日期
-        end_date: 结束日期
-        initial_balance: 初始资金
-        symbols: 交易对列表
-        **kwargs: 其他配置参数
-    
-    Returns:
-        BacktestConfig
     """
     if symbols is None:
         symbols = []
     
-    # 确保日期是UTC时区
     if start_date.tzinfo is None:
         start_date = start_date.replace(tzinfo=timezone.utc)
     if end_date.tzinfo is None:

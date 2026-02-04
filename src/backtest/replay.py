@@ -53,7 +53,8 @@ class DataReplayEngine:
         # 当前重放状态
         self._current_indices: Dict[str, int] = {symbol: 0 for symbol in symbols}
         self._current_timestamp: Optional[datetime] = None
-        self._all_timestamps: List[datetime] = []
+        # _all_timestamps 已在 _load_historical_klines -> _build_timestamp_index 中设置
+        # 不要在这里重新初始化！
         
         logger.info(
             f"Initialized ReplayEngine: {len(symbols)} symbols, "
@@ -172,6 +173,31 @@ class DataReplayEngine:
         """获取指定时间戳的K线"""
         if symbol not in self.kline_data:
             return None
+        
+        historical_kline = self.kline_data[symbol]
+        df = historical_kline.data
+        
+        if 'open_time' not in df.columns:
+            return None
+        
+        open_times = pd.to_datetime(df['open_time'])
+        
+        if len(open_times) == 0:
+            return None
+        
+        timestamp = pd.to_datetime(timestamp)
+        
+        mask = open_times == timestamp
+        if mask.any():
+            idx = df[mask].index[0]
+            return historical_kline.get_at_index(idx)
+        
+        mask = open_times < timestamp
+        if mask.any():
+            idx = mask.idxmax()
+            return historical_kline.get_at_index(idx)
+        
+        return None
         
         historical_kline = self.kline_data[symbol]
         df = historical_kline.data

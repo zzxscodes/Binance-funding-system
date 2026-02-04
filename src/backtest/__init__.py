@@ -1,37 +1,58 @@
 """
-回测模块 - 历史数据重放和回测系统
-提供完整的历史数据重放、策略回测、结果分析等功能
+回测模块 - 多因子量化交易回测系统
 """
-
 from .models import (
-    BacktestConfig, Order, Position, Trade, PortfolioState, 
+    BacktestConfig,
+    Order, Position, Trade, PortfolioState,
     BacktestResult, KlineSnapshot, HistoricalKline, ReplayEvent,
-    OrderSide, OrderStatus, PositionMode
+    OrderSide, OrderStatus, PositionMode,
+    create_backtest_result,
 )
 from .replay import DataReplayEngine, MultiIntervalReplayEngine
-from .executor import BacktestExecutor
-from .api import BacktestAPI, create_backtest_config
-from .analysis import BacktestAnalyzer
-from .mock_data import MockKlineGenerator, MockDataManager, MockFundingRateGenerator
+from .backtest import (
+    FactorBacktestConfig,
+    WeightVector,
+    TradeRecord,
+    BacktestMetrics,
+    MultiFactorBacktest,
+    SingleCalculatorBacktest,
+    AlphaBacktest,
+    run_single_calculator_backtest,
+    run_alpha_backtest,
+    run_backtest,
+    compare_calculators,
+)
+from .metrics import (
+    FactorMetrics,
+    AlphaMetrics,
+    FactorEvaluator,
+    AlphaEvaluator,
+    evaluate_factor_ic,
+    evaluate_factor_group_return,
+)
 
 __all__ = [
-    # Models
-    'BacktestConfig', 'Order', 'Position', 'Trade', 'PortfolioState',
+    'BacktestConfig',
+    'Order', 'Position', 'Trade', 'PortfolioState',
     'BacktestResult', 'KlineSnapshot', 'HistoricalKline', 'ReplayEvent',
     'OrderSide', 'OrderStatus', 'PositionMode',
-    
-    # Replay engine
+    'create_backtest_result',
     'DataReplayEngine', 'MultiIntervalReplayEngine',
-    
-    # Executor
-    'BacktestExecutor',
-    
-    # API
-    'BacktestAPI', 'create_backtest_config',
-    
-    # Analysis
-    'BacktestAnalyzer',
-    
-    # Mock data
-    'MockKlineGenerator', 'MockDataManager', 'MockFundingRateGenerator',
+    'FactorBacktestConfig',
+    'WeightVector',
+    'TradeRecord',
+    'BacktestMetrics',
+    'MultiFactorBacktest',
+    'SingleCalculatorBacktest',
+    'AlphaBacktest',
+    'run_single_calculator_backtest',
+    'run_alpha_backtest',
+    'run_backtest',
+    'compare_calculators',
+    'FactorMetrics',
+    'AlphaMetrics',
+    'FactorEvaluator',
+    'AlphaEvaluator',
+    'evaluate_factor_ic',
+    'evaluate_factor_group_return',
 ]

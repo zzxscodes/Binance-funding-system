@@ -179,33 +179,47 @@ class BacktestExecutor:
             target_weights: Dict[symbol, weight] 目标持仓权重
             portfolio_state: 当前投资组合状态
         """
-        # 将权重转换为实际数量
+        if not target_weights:
+            return
+        
         target_quantities = self._weights_to_quantities(target_weights, portfolio_state)
         
-        # 对每个交易对，计算需要的订单
-        for symbol in list(self.positions.keys()) + list(target_quantities.keys()):
-            current_qty = self.positions.get(symbol, Position(symbol=symbol, mode=PositionMode.FLAT)).quantity
+        if not target_quantities:
+            return
+        
+        for symbol in target_quantities.keys():
+            current_position = self.positions.get(symbol)
+            current_qty = current_position.quantity if current_position else 0.0
             target_qty = target_quantities.get(symbol, 0.0)
             
-            # 计算需要成交的数量
             delta_qty = target_qty - current_qty
             
-            if abs(delta_qty) > 1e-8:  # 有足够大的变化
+            if abs(delta_qty) > 1e-10:
+                price = self._current_prices.get(symbol)
+                if price is None or price <= 0:
+                    logger.warning(f"No valid price for {symbol}, skipping")
+                    continue
+                
+                order_value = abs(delta_qty) * price
+                required_margin = order_value / max(self.config.leverage, 1.0)
+                
+                if required_margin > self.available_balance:
+                    logger.debug(f"Insufficient margin for {symbol}: required={required_margin:.2f}, available={self.available_balance:.2f}")
+                    continue
+                
                 if delta_qty > 0:
-                    # 增持（买入）
-                    order = self._create_and_execute_order(
+                    self._create_and_execute_order(
                         symbol=symbol,
                         side=OrderSide.LONG,
                         quantity=delta_qty,
-                        price=self._current_prices.get(symbol, 0.0)
+                        price=price
                     )
                 else:
-                    # 减持（卖出）
-                    order = self._create_and_execute_order(
+                    self._create_and_execute_order(
                         symbol=symbol,
                         side=OrderSide.SHORT,
                         quantity=abs(delta_qty),
-                        price=self._current_prices.get(symbol, 0.0)
+                        price=price
                     )
     
     def _weights_to_quantities(self, weights: Dict[str, float], portfolio_state: PortfolioState) -> Dict[str, float]:
@@ -360,15 +374,14 @@ class BacktestExecutor:
         
         # 计算统计指标
         if len(self.trades) > 0:
-            result.total_trades = len(self.trades)
-            
             # 计算收益
             final_balance = self.total_balance
             result.total_return = ((final_balance - self.initial_balance) / self.initial_balance) * 100
             
             # 年化收益（简化计算）
             if len(self.portfolio_history) > 0:
-                days = (self._current_timestamp - self.portfolio_history[0].timestamp).days
+                first_ts = self.portfolio_history[0].timestamp if hasattr(self.portfolio_history[0], 'timestamp') else self._current_timestamp
+                days = (self._current_timestamp - first_ts).days if hasattr(first_ts, 'days') else 0
                 if days > 0:
                     result.annual_return = result.total_return * (365.0 / days)
             
@@ -377,6 +390,7 @@ class BacktestExecutor:
             losing_trades = [t for t in self.trades if t.pnl < 0]
             result.winning_trades = len(winning_trades)
             result.losing_trades = len(losing_trades)
+            result.total_trades = len(self.trades)
             result.win_rate = (len(winning_trades) / len(self.trades)) * 100 if len(self.trades) > 0 else 0
             
             # 平均PnL
@@ -393,7 +407,12 @@ class BacktestExecutor:
             
             # 最大回撤
             if len(self.portfolio_history) > 1:
-                cumulative_returns = [s.total_pnl for s in self.portfolio_history]
+                cumulative_returns = []
+                for s in self.portfolio_history:
+                    if isinstance(s, dict):
+                        cumulative_returns.append(s.get('total_pnl', 0))
+                    else:
+                        cumulative_returns.append(s.total_pnl)
                 running_max = 0
                 max_dd = 0
                 for ret in cumulative_returns:
@@ -407,7 +426,11 @@ class BacktestExecutor:
             if len(self.portfolio_history) > 1:
                 returns = []
                 for i in range(1, len(self.portfolio_history)):
-                    ret = (self.portfolio_history[i].total_pnl - self.portfolio_history[i-1].total_pnl) / self.initial_balance
+                    prev = self.portfolio_history[i-1]
+                    curr = self.portfolio_history[i]
+                    prev_balance = prev.total_balance if hasattr(prev, 'total_balance') else prev.get('total_balance', self.initial_balance)
+                    curr_balance = curr.total_balance if hasattr(curr, 'total_balance') else curr.get('total_balance', self.initial_balance)
+                    ret = (curr_balance - prev_balance) / prev_balance
                     returns.append(ret)
                 
                 if len(returns) > 1:
