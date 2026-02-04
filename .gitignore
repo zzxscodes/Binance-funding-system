@@ -1,0 +1,144 @@
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.whl
+
+# Virtual Environment
+quant/
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Testing
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+htmlcov/
+.hypothesis/
+
+# Data files (runtime data, but keep directory structure)
+data/klines/**/*.parquet
+data/trades/**/*.parquet
+data/funding_rates/**/*.parquet
+data/premium_index/**/*.parquet
+data/positions/*.json
+data/universe/**/*.csv
+data/signals/*.json
+data/equity_curve/**/*.json
+data/strategy_reports/**/*.json
+data/api_performance/**/*.json
+data/performance/**/*.json
+data/system.pids
+# Keep .empty files to preserve directory structure
+!data/**/.empty
+
+# Logs
+logs/**/*.log
+logs/**/*.log.*
+logs/**/*.txt
+logs/**/*.txt.*
+# Keep .empty files to preserve directory structure
+!logs/.empty
+
+# Excel files (generated reports)
+*.xlsx
+*.xls
+
+# Environment variables and secrets
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.p12
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Ruff (Python linter)
+.ruff_cache/
+
+# pyenv
+.python-version
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*~
+*.lock
+*.lockfile
+
+# Process IDs
+*.pid
+
+# IPC sockets and files (Unix/Windows)
+*.sock
+*.ipc
+ipc_*
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3

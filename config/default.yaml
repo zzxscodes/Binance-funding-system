@@ -1,0 +1,278 @@
+binance:
+  # 注意：这些是默认配置，实际使用的端点和密钥由execution.mode决定
+  api_base: https://fapi.binance.com
+  ws_base: wss://fstream.binance.com
+
+# 网络请求限流配置（防止触发Binance API限流和IP封禁）
+network:
+  # 每秒最大请求数（Binance推荐：10 req/s）
+  max_requests_per_second: 10.0
+  # 每分钟最大请求数（Binance限制：1200 req/min）
+  max_requests_per_minute: 1200
+  # 突发请求允许数量（令牌桶大小）
+  burst_size: 20
+
+data:
+  universe_update_time: "23:55"
+  timezone: Asia/Shanghai
+  kline_interval: 5m
+  max_history_days: 30
+  
+  # 数据目录配置（所有目录都基于data_directory，便于统一管理）
+  data_directory: data  # 数据根目录
+  universe_directory: data/universe  # Universe文件目录
+  trades_directory: data/trades  # 逐笔成交数据目录
+  klines_directory: data/klines  # K线数据目录
+  funding_rates_directory: data/funding_rates  # 资金费率数据目录
+  premium_index_directory: data/premium_index  # 溢价指数K线数据目录
+  positions_directory: data/positions  # 目标持仓文件目录
+  signals_directory: data/signals  # 进程间信号文件目录
+  equity_curve_directory: data/equity_curve  # 净值曲线数据目录
+  position_history_directory: data/position_history  # 持仓历史数据目录
+  strategy_reports_directory: data/strategy_reports  # 策略报告数据目录
+  
+  # 数据层进程配置
+  save_interval: 60  # 定期保存间隔（秒）
+  cleanup_interval: 3600  # 数据清理间隔（秒）
+  universe_check_interval: 300  # Universe更新检查间隔（秒，5分钟）
+  
+  # Trades缓冲区配置
+  trades_buffer_max_size: 1000  # 每个symbol最多缓存条数
+  trades_buffer_total_max_size: 100000  # 所有symbol的总缓冲区大小限制
+  
+  # 资金费率采集配置
+  funding_rate_collect_interval: 28800  # 8小时（资金费率每8小时更新一次）
+  funding_rate_collect_days: 30  # 采集最近N天的历史数据
+  
+  # 溢价指数K线采集配置
+  premium_index_collect_interval: 300  # 5分钟
+  premium_index_collect_days: 7  # 采集最近N天的历史数据
+  
+  # 数据完整性检查配置
+  completeness_threshold: 0.95  # 数据完整性阈值（95%）
+  data_complete_retry_throttle: 10.0  # data_complete重试节流时间（秒）
+  data_complete_retry_attempts: 3  # data_complete重试次数
+  data_complete_retry_delays: [0.05, 0.2, 0.5]  # data_complete重试延迟（秒）
+  incomplete_symbols_log_interval: 5.0  # 不完整symbol日志记录间隔（秒）
+  
+  # Tran_stats阈值配置（人民币）
+  tran_stats_tier1_threshold_rmb: 40000  # 第一档阈值（人民币）
+  tran_stats_tier2_threshold_rmb: 200000  # 第二档阈值（人民币）
+  tran_stats_tier3_threshold_rmb: 1000000  # 第三档阈值（人民币）
+  usd_rmb_rate: 7.0  # 美元对人民币汇率
+  
+  # 数据API缓存配置
+  cache_max_klines: 8640  # 缓存最大K线数（288*30）
+  
+  # 历史数据采集并发配置
+  history_collect_max_concurrent: 1  # 历史数据采集最大并发数（降低到1，避免触发403限流）
+
+strategy:
+  history_days: 30
+  calculation_interval: 5m
+  
+  # Alpha引擎配置
+  alpha:
+    # 并发模式：thread（线程池，默认，Windows友好）| process（进程池，CPU密集型）| none（串行，用于调试）
+    concurrency: thread
+    # 最大并发数（默认等于calculators数量，可根据CPU核心数调整）
+    max_workers: null  # null表示自动设置为calculators数量
+  
+  # 策略进程配置
+  process:
+    trigger_wait_timeout: 300.0  # 触发文件等待超时（秒）
+    trigger_wait_interval: 1.0  # 触发文件检查间隔（秒）
+    trigger_file_max_retries: 3  # 触发文件读取最大重试次数
+    trigger_file_retry_delay: 0.5  # 触发文件重试延迟（秒）
+    run_waiting_timeout: 3600.0  # 运行等待模式超时（秒）
+  
+  # Calculator（因子）配置
+  calculators:
+    # 如果配置了enabled列表，只加载列表中的calculators
+    # 如果未配置或为空，则自动发现calculators目录下的所有calculators
+    # 支持格式：
+    #   - "模块名" (如 "mean_buy_dolvol4_over_dolvol_rank")
+    #   - "完整模块路径" (如 "src.strategy.calculators.researcher1_factor1")
+    enabled:
+    #  - "mean_buy_dolvol4_over_dolvol_rank"
+
+
+execution:
+  # 执行模式: 'testnet' (测试网), 'mock' (模拟), 'live' (实盘)
+  mode: live  # 可选: testnet, mock, live
+  
+  # dry-run开关：所有模式都可以启用dry-run
+  # 启用后，即使使用真实API，也不会产生真实订单（使用test_order endpoint）
+  # 注意：testnet模式下，dry_run=false会使用真实testnet API，但不会产生真实订单（testnet本身就是测试环境）
+  dry_run: true  # true: 启用dry-run（不产生真实订单）, false: 正常模式（可能产生真实订单）
+  
+  # 合约交易配置（所有模式共用）
+  contract_settings:
+    margin_type: CROSSED      # 保证金模式: CROSSED (全仓) 或 ISOLATED (逐仓)
+    position_mode: one_way    # 持仓模式: one_way (单向持仓) 或 dual_side (双向持仓)
+    leverage: 20              # 杠杆倍数: 1-125
+  
+  # 订单执行配置
+  order:
+    max_concurrent: 5  # 最大并发订单数
+    monitor_interval: 2.0  # 订单监控检查间隔（秒）
+    monitor_timeout: 30.0  # 订单监控超时（秒）
+    position_diff_threshold: 0.00001  # 持仓偏差阈值（小于此值不调整）
+    default_tick_size: 0.01  # 默认价格精度
+    default_step_size: 0.01  # 默认数量精度
+    default_min_qty: 0.001  # 默认最小数量
+    default_min_notional: 5.0  # 默认最小订单金额（USDT）
+  
+  # TWAP/VWAP订单配置
+  twap:
+    default_duration_minutes: 60  # 默认执行时长（分钟）
+    max_splits: null  # 最大分割数（null表示不限制）
+  
+  vwap:
+    default_duration_minutes: 60  # 默认执行时长（分钟）
+    lookback_days: 5  # 历史数据回看天数
+    max_splits: 60  # 最大分割数
+  
+  # ===== testnet模式配置 =====
+  # 仅在 mode=testnet 时使用
+  # 使用Binance测试网环境，需要testnet API密钥
+  testnet:
+    api_base: https://testnet.binancefuture.com  # 测试网REST API地址
+    ws_base: wss://stream.binancefuture.com       # 测试网WebSocket地址
+    # 测试网账户配置（支持多账户，每个账户需要自己的testnet API密钥）
+    # 注意：如果配置了account_id，必须同时配置api_key和api_secret，否则该账户不会被启动
+    # 如果不需要某个账户，请注释掉整个账户配置块
+    accounts:
+      - account_id: account1
+        # 优先级：环境变量 {ACCOUNT_ID}_TESTNET_API_KEY/SECRET > 配置文件
+        # 环境变量示例：ACCOUNT1_TESTNET_API_KEY, ACCOUNT1_TESTNET_API_SECRET
+        api_key: your_account1_testnet_api_key_here
+        api_secret: your_account1_testnet_api_secret_here
+      # 以下账户配置不完整，不会被启动。如需启用，请取消注释并填写API密钥
+      # - account_id: account2
+      #   api_key: your_account2_testnet_api_key_here
+      #   api_secret: your_account2_testnet_api_secret_here
+      # - account_id: account3
+      #   api_key: your_account3_testnet_api_key_here
+      #   api_secret: your_account3_testnet_api_secret_here
+  
+  # ===== mock模式配置 =====
+  # 仅在 mode=mock 时使用
+  # 使用模拟端点和模拟账户信息，不需要真实API密钥
+  mock:
+    api_base: https://mock.binance.com  # 模拟API地址（实际不会连接，仅用于标识）
+    ws_base: wss://mock.binance.com      # 模拟WebSocket地址（实际不会连接，仅用于标识）
+    # 模拟账户配置（支持多账户，每个账户有模拟的账户信息）
+    accounts:
+      - account_id: account1
+        total_wallet_balance: 100000.0  # 总钱包余额（USDT）
+        available_balance: 50000.0     # 可用余额（USDT）
+        initial_positions: []           # 初始持仓列表，格式: [{"symbol": "BTCUSDT", "position_amt": 0.1, "entry_price": 50000.0}]
+      - account_id: account2
+        total_wallet_balance: 200000.0
+        available_balance: 100000.0
+        initial_positions: []
+      - account_id: account3
+        total_wallet_balance: 150000.0
+        available_balance: 75000.0
+        initial_positions: []
+  
+  # ===== live模式配置 =====
+  # 仅在 mode=live 时使用
+  # 使用Binance实盘环境，需要真实API密钥（⚠️ 会产生真实订单和真实交易）
+  live:
+    api_base: https://fapi.binance.com  # 实盘REST API地址
+    ws_base: wss://fstream.binance.com   # 实盘WebSocket地址
+    # 实盘账户配置（支持多账户，每个账户需要自己的真实API密钥）
+    # 注意：如果配置了account_id，必须同时配置api_key和api_secret，否则该账户不会被启动
+    # 如果不需要某个账户，请注释掉整个账户配置块
+    accounts:
+      - account_id: account1
+        # 优先级：环境变量 {ACCOUNT_ID}_API_KEY/SECRET > 配置文件
+        # 环境变量示例：ACCOUNT1_API_KEY, ACCOUNT1_API_SECRET
+        api_key: your_account1_api_key_here
+        api_secret: your_account1_api_secret_here
+      # 以下账户配置不完整，不会被启动。如需启用，请取消注释并填写API密钥
+      # - account_id: account2
+      #   api_key: your_account2_api_key_here
+      #   api_secret: your_account2_api_secret_here
+      # - account_id: account3
+      #   api_key: your_account3_api_key_here
+      #   api_secret: your_account3_api_secret_here
+
+monitoring:
+  check_interval: 60
+  # 性能监控配置
+  performance:
+    enabled: true  # 是否启用性能监控（默认关闭，避免生产环境性能影响）
+    output_directory: data/performance  # 性能数据输出目录
+    max_rounds_in_memory: 100  # 内存中最多保留的轮次数
+    round_age_limit_seconds: 3600  # 轮次过期时间（秒）
+    auto_cleanup_interval: 300  # 自动清理间隔（秒）
+    
+    # 性能告警阈值
+    performance_alerts:
+      enabled: false
+      thresholds:
+        'execution/target_positions_loading': 2.0          # 目标持仓加载 > 2秒告警
+        'execution/positions_execution': 10.0              # 头寸执行 > 10秒告警
+        'execution/orders_monitoring': 30.0                # 订单监控 > 30秒告警
+        'event_coordinator/message_handling': 0.5          # 消息处理 > 0.5秒告警
+        'event_coordinator/strategy_notification': 1.0     # 策略通知 > 1秒告警
+        'monitoring/account_monitoring': 5.0               # 账户监控 > 5秒告警
+        'monitoring/account_info_fetch': 3.0               # 账户信息获取 > 3秒告警
+        'monitoring/metrics_calculation': 2.0              # 指标计算 > 2秒告警
+        'monitoring/alert_check': 1.0                      # 告警检查 > 1秒告警
+        'alpha_engine/calculators_execution': 15.0         # 计算器执行 > 15秒告警
+  
+  alert_thresholds:
+    # 持仓偏差告警阈值
+    position_deviation: 0.05  # 平均持仓偏差阈值（默认5%）
+    max_deviation_multiplier: 2.0  # 最大偏差倍数（默认2倍，即最大偏差 = position_deviation * 2）
+    
+    # 敞口告警阈值
+    max_exposure: 1000000  # 最大总敞口（默认100万USDT）
+    net_exposure_ratio: 0.8  # 净敞口比例阈值（默认80%，超过此值会告警）
+    
+    # 账户健康度告警阈值
+    min_available_ratio: 0.1  # 最小可用余额比例（默认10%，低于此值会告警）
+    max_unrealized_loss_ratio: 0.1  # 最大未实现亏损比例（默认10%，超过此值会告警）
+    max_utilization: 110.0  # 最大账户利用率（默认110%，超过此值会告警）
+    # 说明：在杠杆交易中（20倍杠杆），账户利用率可能略高于100%是正常的
+    # 110%的阈值允许正常的杠杆使用，同时仍能检测异常高的利用率（如超过150%）
+
+ipc:
+  socket_type: tcp
+  tcp_host: 127.0.0.1
+  tcp_port: 8888
+  socket_path: /tmp/binance_quant.sock
+  # 事件协调进程配置
+  signal_file_max_retries: 10  # 信号文件写入最大重试次数
+  signal_file_retry_delay_base: 0.05  # 信号文件重试延迟基数（秒）
+  signal_file_retry_delay_max: 1.0  # 信号文件重试延迟最大值（秒）
+
+logging:
+  level: INFO
+  log_directory: logs
+  log_file: binance_quant.log
+  max_bytes: 10485760
+  backup_count: 7
+
+# 存储配置
+storage:
+  max_retries: 3  # 存储操作最大重试次数
+  retry_delay: 0.5  # 存储重试延迟（秒）
+  retry_delay_multiplier: 2.0  # 重试延迟倍数（指数退避）
+
+# 网络请求配置
+network:
+  # 已在文件开头定义，这里补充其他配置
+  http_timeout: 30.0  # HTTP请求超时（秒）
+  http_max_retries: 3  # HTTP请求最大重试次数
+  websocket_reconnect_delay_base: 1.0  # WebSocket重连延迟基数（秒）
+  websocket_reconnect_delay_max: 30.0  # WebSocket重连延迟最大值（秒）
+  websocket_reconnect_jitter: 0.5  # WebSocket重连抖动（秒）
+
+
+
+

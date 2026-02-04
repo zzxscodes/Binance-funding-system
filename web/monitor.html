@@ -1,0 +1,1075 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>交易系统监控面板</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #0f1419;
+            color: #e4e4e4;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            background: #1a1f2e;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        h1 {
+            color: #4fc3f7;
+            font-size: 24px;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        
+        .status-running {
+            background: #2e7d32;
+            color: white;
+        }
+        
+        .status-stopped {
+            background: #c62828;
+            color: white;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .card {
+            background: #1a1f2e;
+            border-radius: 8px;
+            padding: 20px;
+            border: 1px solid #2a2f3e;
+        }
+        
+        .card h2 {
+            color: #4fc3f7;
+            font-size: 18px;
+            margin-bottom: 15px;
+            border-bottom: 1px solid #2a2f3e;
+            padding-bottom: 10px;
+        }
+        
+        .process-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid #2a2f3e;
+        }
+        
+        .process-item:last-child {
+            border-bottom: none;
+        }
+        
+        .process-name {
+            font-weight: 500;
+        }
+        
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            margin: 10px 0;
+        }
+        
+        .metric-label {
+            color: #9e9e9e;
+        }
+        
+        .metric-value {
+            color: #4fc3f7;
+            font-weight: bold;
+        }
+        
+        .alert {
+            background: #ff6b6b;
+            color: white;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        
+        .refresh-btn {
+            background: #4fc3f7;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-top: 10px;
+        }
+        
+        .refresh-btn:hover {
+            background: #29b6f6;
+        }
+        
+        .auto-refresh {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .timestamp {
+            color: #9e9e9e;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+        
+        .performance-card {
+            background: #1a1f2e;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid #2a2f3e;
+        }
+        
+        .performance-card h2 {
+            color: #4fc3f7;
+            font-size: 18px;
+            margin-bottom: 15px;
+            border-bottom: 1px solid #2a2f3e;
+            padding-bottom: 10px;
+        }
+        
+        .performance-module {
+            background: #0f1419;
+            padding: 12px;
+            margin: 10px 0;
+            border-radius: 4px;
+            border-left: 3px solid #4fc3f7;
+        }
+        
+        .performance-module-name {
+            color: #4fc3f7;
+            font-weight: bold;
+            margin-bottom: 8px;
+        }
+        
+        .performance-stat {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 0;
+            font-size: 14px;
+        }
+        
+        .performance-stat-label {
+            color: #9e9e9e;
+        }
+        
+        .performance-stat-value {
+            color: #66bb6a;
+            font-weight: bold;
+        }
+        
+        .performance-operation {
+            font-size: 12px;
+            color: #9e9e9e;
+            margin-left: 10px;
+        }
+        
+        .account-card {
+            background: #1a1f2e;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid #2a2f3e;
+        }
+        
+        .account-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #2a2f3e;
+        }
+        
+        .account-name {
+            color: #4fc3f7;
+            font-size: 20px;
+            font-weight: bold;
+        }
+        
+        .alerts-count {
+            background: #ff6b6b;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        
+        .chart-container {
+            position: relative;
+            height: 300px;
+            margin-top: 15px;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            border-bottom: 1px solid #2a2f3e;
+        }
+        
+        .tab {
+            padding: 8px 16px;
+            cursor: pointer;
+            color: #9e9e9e;
+            border-bottom: 2px solid transparent;
+            transition: all 0.3s;
+        }
+        
+        .tab.active {
+            color: #4fc3f7;
+            border-bottom-color: #4fc3f7;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .report-section {
+            margin-bottom: 20px;
+        }
+        
+        .report-section h3 {
+            color: #4fc3f7;
+            font-size: 16px;
+            margin-bottom: 10px;
+            padding-bottom: 5px;
+            border-bottom: 1px solid #2a2f3e;
+        }
+        
+        .report-item {
+            margin: 8px 0;
+            padding: 8px;
+            background: #0f1419;
+            border-radius: 4px;
+        }
+        
+        .report-item strong {
+            color: #4fc3f7;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 交易系统监控面板</h1>
+            <div>
+                <span class="status-badge" id="systemStatus">检查中...</span>
+            </div>
+        </header>
+        
+        <div class="grid">
+            <div class="card">
+                <h2>系统进程状态</h2>
+                <div id="processesList"></div>
+                <div class="timestamp" id="processesTimestamp"></div>
+            </div>
+            
+            <div class="card">
+                <h2>系统信息</h2>
+                <div id="systemInfo"></div>
+                <div class="timestamp" id="systemTimestamp"></div>
+            </div>
+        </div>
+        
+        <div id="performanceContainer"></div>
+        
+        <div id="accountsContainer"></div>
+        
+        <div class="auto-refresh">
+            <button class="refresh-btn" onclick="refreshData()">手动刷新</button>
+            <label>
+                <input type="checkbox" id="autoRefresh" checked onchange="toggleAutoRefresh()">
+                自动刷新 (5秒)
+            </label>
+        </div>
+    </div>
+    
+    <!-- Load Chart.js before scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" onload="console.log('Chart.js loaded successfully')" onerror="console.error('Chart.js failed to load')"></script>
+    
+    <script>
+        let autoRefreshInterval = null;
+        const API_BASE = window.location.origin;
+        
+        // 确保 Chart.js 加载完成后再执行
+        function waitForChartJS(callback, maxWait = 10000) {
+            if (typeof Chart !== 'undefined') {
+                // Chart.js 已经加载，立即执行回调
+                callback();
+                return;
+            }
+            
+            const startTime = Date.now();
+            const checkInterval = setInterval(() => {
+                if (typeof Chart !== 'undefined') {
+                    clearInterval(checkInterval);
+                    callback();
+                } else if (Date.now() - startTime > maxWait) {
+                    clearInterval(checkInterval);
+                    console.error('Chart.js failed to load within timeout');
+                    // 即使超时也尝试执行回调，让 loadEquityCurve 处理错误
+                    callback();
+                }
+            }, 100);
+        }
+        
+        async function fetchAPI(endpoint) {
+            try {
+                const response = await fetch(`${API_BASE}${endpoint}`);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                return await response.json();
+            } catch (error) {
+                console.error(`Error fetching ${endpoint}:`, error);
+                return null;
+            }
+        }
+        
+        function formatNumber(num) {
+            if (num === null || num === undefined) return 'N/A';
+            return new Intl.NumberFormat('zh-CN', {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            }).format(num);
+        }
+        
+        function formatBytes(bytes) {
+            if (!bytes) return 'N/A';
+            const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            let size = bytes;
+            let unitIndex = 0;
+            while (size >= 1024 && unitIndex < units.length - 1) {
+                size /= 1024;
+                unitIndex++;
+            }
+            return `${size.toFixed(2)} ${units[unitIndex]}`;
+        }
+        
+        async function updateProcesses() {
+            const data = await fetchAPI('/api/processes');
+            if (!data) return;
+            
+            const container = document.getElementById('processesList');
+            container.innerHTML = '';
+            
+            const processNames = {
+                'event_coordinator': '事件协调器',
+                'data_layer': '数据层',
+                'strategy_process': '策略进程',
+                'execution_process': '执行进程',
+                'monitoring_process': '监控进程'
+            };
+            
+            for (const [key, info] of Object.entries(data)) {
+                const name = processNames[key] || key;
+                const status = info.status === 'running' ? '运行中' : '已停止';
+                
+                // 对于执行进程，如果有多个账户，显示每个账户的状态
+                if (key === 'execution_process' && info.accounts && Object.keys(info.accounts).length > 0) {
+                    // 显示总计数
+                    const summaryItem = document.createElement('div');
+                    summaryItem.className = 'process-item';
+                    summaryItem.innerHTML = `
+                        <span class="process-name"><strong>${name}</strong> (${info.account_count || info.count} 个账户)</span>
+                        <span class="status-badge ${info.status === 'running' ? 'status-running' : 'status-stopped'}">
+                            ${status}
+                        </span>
+                    `;
+                    container.appendChild(summaryItem);
+                    
+                    // 显示每个账户的执行进程
+                    for (const [accountId, accountProcs] of Object.entries(info.accounts)) {
+                        const accountItem = document.createElement('div');
+                        accountItem.className = 'process-item';
+                        accountItem.style.paddingLeft = '20px';
+                        accountItem.style.fontSize = '14px';
+                        
+                        const accountStatus = accountProcs.length > 0 ? '运行中' : '已停止';
+                        const accountCount = accountProcs.length > 0 ? `(${accountProcs.length})` : '';
+                        
+                        accountItem.innerHTML = `
+                            <span class="process-name">  └─ 账户: ${accountId}</span>
+                            <span class="status-badge ${accountProcs.length > 0 ? 'status-running' : 'status-stopped'}">
+                                ${accountStatus} ${accountCount}
+                            </span>
+                        `;
+                        container.appendChild(accountItem);
+                    }
+                } else {
+                    // 其他进程正常显示
+                    const item = document.createElement('div');
+                    item.className = 'process-item';
+                    
+                    const count = info.count > 0 ? `(${info.count})` : '';
+                    
+                    item.innerHTML = `
+                        <span class="process-name">${name}</span>
+                        <span class="status-badge ${info.status === 'running' ? 'status-running' : 'status-stopped'}">
+                            ${status} ${count}
+                        </span>
+                    `;
+                    container.appendChild(item);
+                }
+            }
+            
+            document.getElementById('processesTimestamp').textContent = 
+                `更新时间: ${new Date().toLocaleString('zh-CN')}`;
+        }
+        
+        async function updateSystemInfo() {
+            const data = await fetchAPI('/api/system');
+            if (!data) return;
+            
+            const container = document.getElementById('systemInfo');
+            container.innerHTML = '';
+            
+            const info = [
+                { label: '平台', value: data.platform || 'N/A' },
+                { label: 'Python版本', value: data.python_version || 'N/A' },
+                { label: 'CPU核心数', value: data.cpu_count || 'N/A' },
+                { label: '内存使用率', value: data.memory_percent ? `${data.memory_percent.toFixed(1)}%` : 'N/A' },
+                { label: '总内存', value: formatBytes(data.memory_total) },
+                { label: '可用内存', value: formatBytes(data.memory_available) }
+            ];
+            
+            info.forEach(item => {
+                const metric = document.createElement('div');
+                metric.className = 'metric';
+                metric.innerHTML = `
+                    <span class="metric-label">${item.label}:</span>
+                    <span class="metric-value">${item.value}</span>
+                `;
+                container.appendChild(metric);
+            });
+            
+            document.getElementById('systemTimestamp').textContent = 
+                `更新时间: ${new Date().toLocaleString('zh-CN')}`;
+        }
+        
+        async function updatePerformance() {
+            const data = await fetchAPI('/api/performance');
+            if (!data || !data.enabled) {
+                // 如果性能监控未启用，隐藏容器
+                const container = document.getElementById('performanceContainer');
+                if (container) {
+                    container.innerHTML = '';
+                }
+                return;
+            }
+            
+            const container = document.getElementById('performanceContainer');
+            container.innerHTML = '';
+            
+            try {
+                const card = document.createElement('div');
+                card.className = 'performance-card';
+                
+                let html = '<h2>⚡ 性能监控</h2>';
+                
+                // 显示统计信息
+                if (data.statistics) {
+                    const stats = data.statistics;
+                    html += `
+                        <div style="padding: 10px 0; border-bottom: 1px solid #2a2f3e; margin-bottom: 15px;">
+                            <div class="metric">
+                                <span class="metric-label">总轮次:</span>
+                                <span class="metric-value">${stats.total_rounds || 0}</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">总测量次数:</span>
+                                <span class="metric-value">${stats.total_measurements || 0}</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">运行时间:</span>
+                                <span class="metric-value">${(stats.runtime_seconds || 0).toFixed(1)} 秒</span>
+                            </div>
+                        </div>
+                    `;
+                }
+                
+                // 显示当前轮次的模块性能数据
+                if (data.current_round && data.current_round.modules) {
+                    html += '<div style="margin-bottom: 15px;"><strong style="color: #4fc3f7;">当前轮次模块性能:</strong></div>';
+                    
+                    for (const [moduleName, moduleData] of Object.entries(data.current_round.modules)) {
+                        html += `
+                            <div class="performance-module">
+                                <div class="performance-module-name">${moduleName}</div>
+                                <div class="performance-stat">
+                                    <span class="performance-stat-label">平均耗时:</span>
+                                    <span class="performance-stat-value">${(moduleData.avg_time * 1000).toFixed(2)} ms</span>
+                                </div>
+                                <div class="performance-stat">
+                                    <span class="performance-stat-label">总耗时:</span>
+                                    <span class="performance-stat-value">${(moduleData.total_time * 1000).toFixed(2)} ms</span>
+                                </div>
+                                <div class="performance-stat">
+                                    <span class="performance-stat-label">调用次数:</span>
+                                    <span class="performance-stat-value">${moduleData.count}</span>
+                                </div>
+                                <div class="performance-stat">
+                                    <span class="performance-stat-label">最小/最大:</span>
+                                    <span class="performance-stat-value">${(moduleData.min_time * 1000).toFixed(2)} / ${(moduleData.max_time * 1000).toFixed(2)} ms</span>
+                                </div>
+                        `;
+                        
+                        // 显示操作级性能数据
+                        if (moduleData.operations && Object.keys(moduleData.operations).length > 0) {
+                            html += '<div style="margin-top: 8px; padding-left: 10px; border-left: 2px solid #66bb6a;">';
+                            for (const [opName, opData] of Object.entries(moduleData.operations)) {
+                                html += `
+                                    <div style="font-size: 12px; color: #9e9e9e; margin: 4px 0;">
+                                        ${opName}: avg=${(opData.avg * 1000).toFixed(2)}ms, count=${opData.count}
+                                    </div>
+                                `;
+                            }
+                            html += '</div>';
+                        }
+                        
+                        html += '</div>';
+                    }
+                }
+                
+                // 显示分析报告摘要
+                if (data.analysis && data.analysis.modules) {
+                    html += '<div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #2a2f3e;"><strong style="color: #4fc3f7;">历史性能分析:</strong></div>';
+                    
+                    // 按总耗时排序
+                    const sortedModules = Object.entries(data.analysis.modules)
+                        .sort((a, b) => (b[1].total_time || 0) - (a[1].total_time || 0))
+                        .slice(0, 5); // 显示前5个耗时最长的模块
+                    
+                    for (const [moduleName, moduleData] of sortedModules) {
+                        const totalTime = moduleData.total_time || 0;
+                        const avgTime = moduleData.avg_time_per_operation || 0;
+                        const rounds = moduleData.rounds || 0;
+                        
+                        if (totalTime > 0) {
+                            html += `
+                                <div class="performance-module" style="border-left-color: #ff9800;">
+                                    <div class="performance-module-name">${moduleName}</div>
+                                    <div class="performance-stat">
+                                        <span class="performance-stat-label">总耗时:</span>
+                                        <span class="performance-stat-value">${(totalTime * 1000).toFixed(2)} ms</span>
+                                    </div>
+                                    <div class="performance-stat">
+                                        <span class="performance-stat-label">平均耗时:</span>
+                                        <span class="performance-stat-value">${(avgTime * 1000).toFixed(2)} ms</span>
+                                    </div>
+                                    <div class="performance-stat">
+                                        <span class="performance-stat-label">轮次数:</span>
+                                        <span class="performance-stat-value">${rounds}</span>
+                                    </div>
+                                </div>
+                            `;
+                        }
+                    }
+                }
+                
+                card.innerHTML = html;
+                container.appendChild(card);
+                
+            } catch (error) {
+                console.error('Error rendering performance data:', error);
+                container.innerHTML = '<div class="performance-card"><h2>⚡ 性能监控</h2><div class="alert">加载性能数据失败</div></div>';
+            }
+        }
+        
+        async function updateAccounts() {
+            const data = await fetchAPI('/api/accounts');
+            if (!data) return;
+            
+            const container = document.getElementById('accountsContainer');
+            container.innerHTML = '';
+            
+            for (const [accountId, accountData] of Object.entries(data)) {
+                if (accountData.error) {
+                    const card = document.createElement('div');
+                    card.className = 'account-card';
+                    card.innerHTML = `
+                        <div class="account-header">
+                            <span class="account-name">${accountId}</span>
+                        </div>
+                        <div class="alert">错误: ${accountData.error}</div>
+                    `;
+                    container.appendChild(card);
+                    continue;
+                }
+                
+                const metrics = accountData.account_metrics || {};
+                const exposure = accountData.exposure || {};
+                const deviation = accountData.deviation || {};
+                const alerts = accountData.alerts || [];
+                
+                const card = document.createElement('div');
+                card.className = 'account-card';
+                
+                let alertsHtml = '';
+                if (alerts.length > 0) {
+                    alertsHtml = '<div class="alert">' + alerts.map(a => a.message).join('<br>') + '</div>';
+                }
+                
+                card.innerHTML = `
+                    <div class="account-header">
+                        <span class="account-name">账户: ${accountId}</span>
+                        ${alerts.length > 0 ? `<span class="alerts-count">${alerts.length} 个告警</span>` : ''}
+                    </div>
+                    ${alertsHtml}
+                    
+                    <div class="tabs">
+                        <div class="tab active" onclick="switchTab('${accountId}', 'metrics')">账户指标</div>
+                        <div class="tab" onclick="switchTab('${accountId}', 'equity')">Equity Curve</div>
+                        <div class="tab" onclick="switchTab('${accountId}', 'report')">策略报告</div>
+                    </div>
+                    
+                    <div id="${accountId}-metrics" class="tab-content active">
+                        <div class="metric">
+                            <span class="metric-label">总余额:</span>
+                            <span class="metric-value">${formatNumber(metrics.total_wallet_balance)} USDT</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">可用余额:</span>
+                            <span class="metric-value">${formatNumber(metrics.available_balance)} USDT</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">未实现盈亏:</span>
+                            <span class="metric-value">${formatNumber(metrics.total_unrealized_pnl)} USDT</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">持仓数量:</span>
+                            <span class="metric-value">${metrics.open_positions_count || 0}</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">持仓价值:</span>
+                            <span class="metric-value">${formatNumber(metrics.position_value)} USDT</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">净敞口:</span>
+                            <span class="metric-value">${formatNumber(exposure.net_exposure)} USDT</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">总敞口:</span>
+                            <span class="metric-value">${formatNumber(exposure.total_exposure)} USDT</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">平均偏差:</span>
+                            <span class="metric-value">${formatNumber(deviation.avg_deviation)}</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">最大偏差:</span>
+                            <span class="metric-value">${formatNumber(deviation.max_deviation)}</span>
+                        </div>
+                    </div>
+                    
+                    <div id="${accountId}-equity" class="tab-content">
+                        <div class="chart-container">
+                            <canvas id="${accountId}-equity-chart"></canvas>
+                        </div>
+                        <div id="${accountId}-equity-summary"></div>
+                    </div>
+                    
+                    <div id="${accountId}-report" class="tab-content">
+                        <div id="${accountId}-report-content">加载中...</div>
+                    </div>
+                    
+                    <div class="timestamp">更新时间: ${accountData.timestamp ? new Date(accountData.timestamp).toLocaleString('zh-CN') : 'N/A'}</div>
+                `;
+                container.appendChild(card);
+                
+                // 加载Equity Curve和策略报告（等待 Chart.js 加载完成）
+                waitForChartJS(() => {
+                    loadEquityCurve(accountId);
+                });
+                loadStrategyReport(accountId);
+            }
+        }
+        
+        async function updateSystemStatus() {
+            const data = await fetchAPI('/api/status');
+            if (!data) return;
+            
+            const statusBadge = document.getElementById('systemStatus');
+            if (data.status === 'running') {
+                statusBadge.className = 'status-badge status-running';
+                statusBadge.textContent = '系统运行中';
+            } else {
+                statusBadge.className = 'status-badge status-stopped';
+                statusBadge.textContent = '系统已停止';
+            }
+        }
+        
+        async function refreshData() {
+            await Promise.all([
+                updateSystemStatus(),
+                updateProcesses(),
+                updateSystemInfo(),
+                updatePerformance(),
+                updateAccounts()
+            ]);
+        }
+        
+        function toggleAutoRefresh() {
+            const checkbox = document.getElementById('autoRefresh');
+            if (checkbox.checked) {
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                }
+                autoRefreshInterval = setInterval(refreshData, 5000);
+                refreshData();
+            } else {
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                    autoRefreshInterval = null;
+                }
+            }
+        }
+        
+        const equityCharts = {};
+        
+        function switchTab(accountId, tabName) {
+            // 更新标签页状态
+            const tabs = document.querySelectorAll(`#accountsContainer .account-card:has([id="${accountId}-metrics"]) .tab`);
+            tabs.forEach(tab => tab.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            // 更新内容显示
+            const contents = document.querySelectorAll(`#accountsContainer .account-card:has([id="${accountId}-metrics"]) .tab-content`);
+            contents.forEach(content => content.classList.remove('active'));
+            document.getElementById(`${accountId}-${tabName}`).classList.add('active');
+        }
+        
+        async function loadEquityCurve(accountId) {
+            try {
+                const data = await fetchAPI(`/api/equity-curve/${accountId}`);
+                if (!data || !data.data || data.data.length === 0) {
+                    document.getElementById(`${accountId}-equity`).innerHTML = 
+                        '<div style="padding: 20px; text-align: center; color: #9e9e9e;">暂无Equity Curve数据</div>';
+                    return;
+                }
+                
+                const chartData = data.data;
+                const summary = data.summary || {};
+                
+                // 准备图表数据
+                const labels = chartData.map(d => {
+                    try {
+                        return new Date(d.timestamp).toLocaleString('zh-CN');
+                    } catch (e) {
+                        return d.timestamp || '';
+                    }
+                });
+                const equityValues = chartData.map(d => parseFloat(d.equity) || 0);
+                const returnValues = chartData.map(d => parseFloat(d.return_pct) || 0);
+                
+                // 创建或更新图表
+                const canvas = document.getElementById(`${accountId}-equity-chart`);
+                if (!canvas) {
+                    console.error(`Canvas element not found for ${accountId}-equity-chart`);
+                    document.getElementById(`${accountId}-equity`).innerHTML = 
+                        '<div style="padding: 20px; text-align: center; color: #ff6b6b;">图表元素未找到</div>';
+                    return;
+                }
+                
+                const ctx = canvas.getContext('2d');
+                if (!ctx) {
+                    console.error(`Failed to get 2d context for ${accountId}-equity-chart`);
+                    document.getElementById(`${accountId}-equity`).innerHTML = 
+                        '<div style="padding: 20px; text-align: center; color: #ff6b6b;">无法创建图表上下文</div>';
+                    return;
+                }
+                
+                if (equityCharts[accountId]) {
+                    equityCharts[accountId].destroy();
+                }
+                
+                // 检查 Chart 是否可用，如果未加载则等待
+                if (typeof Chart === 'undefined') {
+                    console.warn('Chart.js not loaded yet, waiting...');
+                    // 等待 Chart.js 加载（最多等待 5 秒）
+                    let retries = 0;
+                    const maxRetries = 50; // 5秒
+                    const checkChart = setInterval(() => {
+                        retries++;
+                        if (typeof Chart !== 'undefined') {
+                            clearInterval(checkChart);
+                            // Chart.js 已加载，重新调用函数
+                            console.log('Chart.js loaded, retrying...');
+                            loadEquityCurve(accountId);
+                        } else if (retries >= maxRetries) {
+                            clearInterval(checkChart);
+                            console.error('Chart.js failed to load after 5 seconds');
+                            const equityDiv = document.getElementById(`${accountId}-equity`);
+                            if (equityDiv) {
+                                equityDiv.innerHTML = 
+                                    '<div style="padding: 20px; text-align: center; color: #ff6b6b;">Chart.js 加载超时，请刷新页面重试</div>';
+                            }
+                        }
+                    }, 100);
+                    return;
+                }
+                
+                equityCharts[accountId] = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: '净值 (USDT)',
+                            data: equityValues,
+                            borderColor: '#4fc3f7',
+                            backgroundColor: 'rgba(79, 195, 247, 0.1)',
+                            tension: 0.4,
+                            yAxisID: 'y'
+                        }, {
+                            label: '收益率 (%)',
+                            data: returnValues,
+                            borderColor: '#66bb6a',
+                            backgroundColor: 'rgba(102, 187, 106, 0.1)',
+                            tension: 0.4,
+                            yAxisID: 'y1'
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                labels: {
+                                    color: '#e4e4e4'
+                                }
+                            },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false
+                            }
+                        },
+                        scales: {
+                            x: {
+                                ticks: {
+                                    color: '#9e9e9e',
+                                    maxRotation: 45,
+                                    minRotation: 45
+                                },
+                                grid: {
+                                    color: '#2a2f3e'
+                                }
+                            },
+                            y: {
+                                type: 'linear',
+                                display: true,
+                                position: 'left',
+                                ticks: {
+                                    color: '#4fc3f7'
+                                },
+                                grid: {
+                                    color: '#2a2f3e'
+                                }
+                            },
+                            y1: {
+                                type: 'linear',
+                                display: true,
+                                position: 'right',
+                                ticks: {
+                                    color: '#66bb6a'
+                                },
+                                grid: {
+                                    drawOnChartArea: false
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                // 添加摘要信息（在图表容器外部）
+                if (summary.initial_equity !== undefined) {
+                    const summaryContainer = document.getElementById(`${accountId}-equity-summary`);
+                    if (summaryContainer) {
+                        summaryContainer.innerHTML = `
+                            <div style="margin-top: 15px; padding: 10px; background: #0f1419; border-radius: 4px;">
+                                <div class="metric">
+                                    <span class="metric-label">初始净值:</span>
+                                    <span class="metric-value">${formatNumber(summary.initial_equity)} USDT</span>
+                                </div>
+                                <div class="metric">
+                                    <span class="metric-label">当前净值:</span>
+                                    <span class="metric-value">${formatNumber(summary.current_equity)} USDT</span>
+                                </div>
+                                <div class="metric">
+                                    <span class="metric-label">总收益:</span>
+                                    <span class="metric-value">${formatNumber(summary.total_return)} USDT (${formatNumber(summary.total_return_pct)}%)</span>
+                                </div>
+                                <div class="metric">
+                                    <span class="metric-label">最大回撤:</span>
+                                    <span class="metric-value">${formatNumber(summary.max_drawdown)} USDT (${formatNumber(summary.max_drawdown_pct)}%)</span>
+                                </div>
+                            </div>
+                        `;
+                    } else {
+                        // 如果摘要容器不存在，创建它
+                        const equityDiv = document.getElementById(`${accountId}-equity`);
+                        if (equityDiv) {
+                            const summaryDiv = document.createElement('div');
+                            summaryDiv.id = `${accountId}-equity-summary`;
+                            summaryDiv.innerHTML = `
+                                <div style="margin-top: 15px; padding: 10px; background: #0f1419; border-radius: 4px;">
+                                    <div class="metric">
+                                        <span class="metric-label">初始净值:</span>
+                                        <span class="metric-value">${formatNumber(summary.initial_equity)} USDT</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric-label">当前净值:</span>
+                                        <span class="metric-value">${formatNumber(summary.current_equity)} USDT</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric-label">总收益:</span>
+                                        <span class="metric-value">${formatNumber(summary.total_return)} USDT (${formatNumber(summary.total_return_pct)}%)</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric-label">最大回撤:</span>
+                                        <span class="metric-value">${formatNumber(summary.max_drawdown)} USDT (${formatNumber(summary.max_drawdown_pct)}%)</span>
+                                    </div>
+                                </div>
+                            `;
+                            equityDiv.appendChild(summaryDiv);
+                        }
+                    }
+                }
+                
+            } catch (error) {
+                console.error(`Error loading equity curve for ${accountId}:`, error);
+                console.error('Error details:', error.message, error.stack);
+                const errorDiv = document.getElementById(`${accountId}-equity`);
+                if (errorDiv) {
+                    errorDiv.innerHTML = 
+                        `<div style="padding: 20px; text-align: center; color: #ff6b6b;">
+                            加载Equity Curve失败<br>
+                            <small style="color: #9e9e9e; font-size: 12px;">${error.message || '未知错误'}</small>
+                         </div>`;
+                }
+            }
+        }
+        
+        async function loadStrategyReport(accountId) {
+            try {
+                const report = await fetchAPI(`/api/strategy-report/${accountId}`);
+                if (!report || Object.keys(report).length === 0) {
+                    document.getElementById(`${accountId}-report-content`).innerHTML = 
+                        '<div style="padding: 20px; text-align: center; color: #9e9e9e;">暂无策略报告数据</div>';
+                    return;
+                }
+                
+                let html = '';
+                
+                // 币种列表（只显示数值，不显示描述）
+                if (report.coin_selection && report.coin_selection.symbols) {
+                    html += '<div class="report-section">';
+                    html += '<h3>币种列表</h3>';
+                    html += `<div class="report-item"><strong>交易对数量:</strong> ${report.coin_selection.symbols_count || 0}</div>`;
+                    html += `<div class="report-item"><strong>交易对:</strong> ${report.coin_selection.symbols.join(', ') || 'N/A'}</div>`;
+                    html += '</div>';
+                }
+                
+                // 资金费率结构（显示所有选中交易对，包括无数据的情况）
+                if (report.funding_rate_structure && Object.keys(report.funding_rate_structure).length > 0) {
+                    html += '<div class="report-section">';
+                    html += '<h3>资金费率结构</h3>';
+                    for (const [symbol, fr] of Object.entries(report.funding_rate_structure)) {
+                        html += `<div class="report-item">`;
+                        if (fr.status === 'ok' && fr.data_points > 0) {
+                            html += `<strong>${symbol}:</strong> 平均费率=${(fr.mean_rate * 100).toFixed(4)}%, `;
+                            html += `最新费率=${(fr.latest_rate * 100).toFixed(4)}%, `;
+                            html += `标准差=${(fr.std_rate * 100).toFixed(4)}%, `;
+                            html += `数据点数=${fr.data_points}`;
+                        } else {
+                            html += `<strong>${symbol}:</strong> <span style="color: #9e9e9e;">${fr.message || '无数据'}</span>`;
+                        }
+                        html += `</div>`;
+                    }
+                    html += '</div>';
+                }
+                
+                // 开仓时间点
+                if (report.position_openings && report.position_openings.length > 0) {
+                    html += '<div class="report-section">';
+                    html += '<h3>开仓时间点</h3>';
+                    html += `<div class="report-item"><strong>开仓次数:</strong> ${report.position_openings.length}</div>`;
+                    report.position_openings.slice(0, 10).forEach(opening => {
+                        const time = new Date(opening.timestamp).toLocaleString('zh-CN');
+                        html += `<div class="report-item">${opening.symbol}: ${opening.position_amt > 0 ? '做多' : '做空'} ${Math.abs(opening.position_amt)} @ ${opening.entry_price} (${time})</div>`;
+                    });
+                    if (report.position_openings.length > 10) {
+                        html += `<div class="report-item">...还有 ${report.position_openings.length - 10} 条记录</div>`;
+                    }
+                    html += '</div>';
+                }
+                
+                // 策略磨损分析（只显示数值）
+                if (report.strategy_wear) {
+                    html += '<div class="report-section">';
+                    html += '<h3>策略磨损分析</h3>';
+                    const wear = report.strategy_wear;
+                    html += `<div class="report-item"><strong>手续费:</strong> ${formatNumber(wear.total_fees || 0)} USDT</div>`;
+                    html += `<div class="report-item"><strong>滑点:</strong> ${formatNumber(wear.slippage || 0)} USDT</div>`;
+                    html += `<div class="report-item"><strong>资金费率成本:</strong> ${formatNumber(wear.funding_fees || 0)} USDT</div>`;
+                    html += `<div class="report-item"><strong>总磨损:</strong> ${formatNumber(wear.total_wear || 0)} USDT (${formatNumber(wear.wear_pct || 0)}%)</div>`;
+                    html += `<div class="report-item"><strong>交易次数:</strong> ${wear.total_trades || 0}</div>`;
+                    html += '</div>';
+                }
+                
+                document.getElementById(`${accountId}-report-content`).innerHTML = html || 
+                    '<div style="padding: 20px; text-align: center; color: #9e9e9e;">暂无策略报告数据</div>';
+                
+            } catch (error) {
+                console.error(`Error loading strategy report for ${accountId}:`, error);
+                document.getElementById(`${accountId}-report-content`).innerHTML = 
+                    '<div style="padding: 20px; text-align: center; color: #ff6b6b;">加载策略报告失败</div>';
+            }
+        }
+        
+        // 初始化
+        document.addEventListener('DOMContentLoaded', () => {
+            refreshData();
+            toggleAutoRefresh();
+        });
+    </script>
+</body>
+</html>
