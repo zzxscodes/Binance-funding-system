@@ -49,6 +49,9 @@ class StrategyReportGenerator:
         self.data_api = get_data_api()
         self.system_api = get_system_api()
 
+        # 可配置的历史条数上限（默认1000条）
+        self.position_history_limit = config.get("monitoring.position_history_limit", 500)
+
         # 记录开仓历史（内存缓存）
         self._position_history: Dict[str, List[Dict]] = defaultdict(list)
 
@@ -66,7 +69,14 @@ class StrategyReportGenerator:
                 try:
                     with open(history_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                        self._position_history[account_id] = data.get("records", [])
+                        records = data.get("records", [])
+                        # 加载后应用历史条数限制，只保留最近的N条
+                        if len(records) > self.position_history_limit:
+                            records = records[-self.position_history_limit:]
+                            logger.debug(
+                                f"Trimmed position history for {account_id} to {len(records)} records (limit: {self.position_history_limit})"
+                            )
+                        self._position_history[account_id] = records
                     logger.debug(
                         f"Loaded {len(self._position_history[account_id])} position records for {account_id}"
                     )
@@ -76,6 +86,17 @@ class StrategyReportGenerator:
                     )
         except Exception as e:
             logger.error(f"Failed to load position history: {e}", exc_info=True)
+
+    def _trim_position_history(self, account_id: str) -> None:
+        """修剪持仓历史数据，保持在配置的限制范围内"""
+        if account_id in self._position_history:
+            history = self._position_history[account_id]
+            if len(history) > self.position_history_limit:
+                # 保留最近的N条记录
+                self._position_history[account_id] = history[-self.position_history_limit:]
+                logger.debug(
+                    f"Trimmed position history for {account_id} to {self.position_history_limit} records"
+                )
 
     def _save_position_history(self, account_id: str) -> None:
         """保存持仓历史数据到文件"""
@@ -134,6 +155,9 @@ class StrategyReportGenerator:
 
             # 添加到内存
             self._position_history[account_id].append(record)
+
+            # 修剪历史记录，保持在限制范围内
+            self._trim_position_history(account_id)
 
             # 立即保存到文件（支持跨进程共享）
             self._save_position_history(account_id)
