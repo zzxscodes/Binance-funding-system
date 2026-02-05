@@ -143,7 +143,7 @@ execution:
     max_splits: 60  # 最大分割数
 
   # ===== 动态选择订单执行方式配置 =====
-  # 动态选择执行方式（MARKET/LIMIT/TWAP/VWAP）
+  # 动态选择执行方式（MARKET/LIMIT/TWAP/VWAP，内部开关会回退至market，如果有历史成交量数据时优先使用vwap）
   method_selection:
     enabled: true  # 是否启用动态选择执行方式
     default_method: MARKET  # 默认执行方式（当动态选择禁用时使用）
