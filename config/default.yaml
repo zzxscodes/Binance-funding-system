@@ -12,6 +12,12 @@ network:
   # 突发请求允许数量（令牌桶大小）
   burst_size: 20
 
+  http_timeout: 30.0  # HTTP请求超时（秒）
+  http_max_retries: 3  # HTTP请求最大重试次数
+  websocket_reconnect_delay_base: 1.0  # WebSocket重连延迟基数（秒）
+  websocket_reconnect_delay_max: 30.0  # WebSocket重连延迟最大值（秒）
+  websocket_reconnect_jitter: 0.5  # WebSocket重连抖动（秒）
+
 data:
   universe_update_time: "23:55"
   timezone: Asia/Shanghai
@@ -264,14 +270,6 @@ storage:
   retry_delay: 0.5  # 存储重试延迟（秒）
   retry_delay_multiplier: 2.0  # 重试延迟倍数（指数退避）
 
-# 网络请求配置
-network:
-  # 已在文件开头定义，这里补充其他配置
-  http_timeout: 30.0  # HTTP请求超时（秒）
-  http_max_retries: 3  # HTTP请求最大重试次数
-  websocket_reconnect_delay_base: 1.0  # WebSocket重连延迟基数（秒）
-  websocket_reconnect_delay_max: 30.0  # WebSocket重连延迟最大值（秒）
-  websocket_reconnect_jitter: 0.5  # WebSocket重连抖动（秒）
 
 
 
