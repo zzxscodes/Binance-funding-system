@@ -126,7 +126,11 @@ def _discover_all_calculators() -> List[AlphaCalculatorBase]:
     # 遍历calculators包下的所有模块
     try:
         package = importlib.import_module(calculators_pkg)
-        package_path = Path(package.__file__).parent if hasattr(package, "__file__") else CALCULATORS_DIR
+        package_path = (
+            Path(package.__file__).parent
+            if hasattr(package, "__file__")
+            else CALCULATORS_DIR
+        )
 
         for finder, name, ispkg in pkgutil.iter_modules([str(package_path)]):
             if name == "__init__" or ispkg:
@@ -183,7 +187,9 @@ def _load_calculators_from_config() -> List[AlphaCalculatorBase]:
             continue
 
         # 处理完整模块路径
-        if item.startswith("calculators.") or item.startswith("src.strategy.calculators."):
+        if item.startswith("calculators.") or item.startswith(
+            "src.strategy.calculators."
+        ):
             module_name = item
         elif "." in item:
             # 假设是完整模块路径
@@ -227,7 +233,7 @@ def load_calculators() -> Sequence[AlphaCalculatorBase]:
         # 自动发现
         discovered = _discover_all_calculators()
         calculators.extend(discovered)
-        logger.info(f"自动发现了 {len(discovered)} 个calculators")
+        logger.debug(f"自动发现了 {len(discovered)} 个calculators")
 
     # 去重（按name）
     seen_names = set()
@@ -239,5 +245,6 @@ def load_calculators() -> Sequence[AlphaCalculatorBase]:
         else:
             logger.warning(f"发现重复的calculator名称: {calc.name}，跳过")
 
-    logger.info(f"最终加载 {len(unique_calculators)} 个calculators: {[c.name for c in unique_calculators]}")
+    logger.info(f"加载了 {len(unique_calculators)} 个calculators")
+    logger.debug(f"calculators: {[c.name for c in unique_calculators]}")
     return unique_calculators

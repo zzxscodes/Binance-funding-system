@@ -108,12 +108,12 @@ strategy:
 
 execution:
   # 执行模式: 'testnet' (测试网), 'mock' (模拟), 'live' (实盘)
-  mode: live  # 可选: testnet, mock, live
+  mode: testnet  # 可选: testnet, mock, live
   
   # dry-run开关：所有模式都可以启用dry-run
   # 启用后，即使使用真实API，也不会产生真实订单（使用test_order endpoint）
   # 注意：testnet模式下，dry_run=false会使用真实testnet API，但不会产生真实订单（testnet本身就是测试环境）
-  dry_run: true  # true: 启用dry-run（不产生真实订单）, false: 正常模式（可能产生真实订单）
+  dry_run: false  # true: 启用dry-run（不产生真实订单）, false: 正常模式（可能产生真实订单）
   
   # 合约交易配置（所有模式共用）
   contract_settings:
@@ -145,7 +145,7 @@ execution:
   # ===== 动态选择订单执行方式配置 =====
   # 动态选择执行方式（MARKET/LIMIT/TWAP/VWAP，内部开关会回退至market，如果有历史成交量数据时优先使用vwap）
   method_selection:
-    enabled: true  # 是否启用动态选择执行方式
+    enabled: false  # 是否启用动态选择执行方式
     default_method: MARKET  # 默认执行方式（当动态选择禁用时使用）
     
     # 阈值配置（所有百分比值为小数，如0.05表示5%）
