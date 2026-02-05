@@ -43,6 +43,9 @@ class DryRunBinanceClient:
         self.use_real_exchange_info = use_real_exchange_info
         self.session: Optional[aiohttp.ClientSession] = None
 
+        # 可配置的订单历史条数上限（默认500条）
+        self.order_history_limit = config.get("monitoring.position_history_limit", 500)
+
         # 订单存储（用于 get_order_status / open_orders 的一致性）
         self._orders: Dict[int, Dict] = {}
         
@@ -141,6 +144,20 @@ class DryRunBinanceClient:
                 logger.info("Dry-run Binance client initialized (no API keys required, using real exchange info)")
             else:
                 logger.info("Dry-run Binance client initialized (no API keys required, using default mock data)")
+
+    def _trim_order_history(self) -> None:
+        """修剪订单历史数据，保持在配置的限制范围内"""
+        if len(self._orders) > self.order_history_limit:
+            # 获取所有订单ID并按时间排序，保留最近的N条
+            order_ids = sorted(self._orders.keys())
+            orders_to_remove = order_ids[:-self.order_history_limit]
+            
+            for order_id in orders_to_remove:
+                del self._orders[order_id]
+            
+            logger.debug(
+                f"Trimmed order history to {self.order_history_limit} records, removed {len(orders_to_remove)} old orders"
+            )
     
     def _load_mock_account_info(self, account_id: Optional[str]) -> Dict:
         """
@@ -378,6 +395,9 @@ class DryRunBinanceClient:
 
         # 存储订单（便于后续查询）
         self._orders[int(order_id)] = dict(result)
+
+        # 修剪订单历史，保持在限制范围内
+        self._trim_order_history()
         
         logger.info(
             f"DRY-RUN: Order placed (simulated): {symbol} {side} {order_type} "
