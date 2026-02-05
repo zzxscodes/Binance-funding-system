@@ -22,6 +22,22 @@ from .backtest import (
     run_backtest,
     compare_calculators,
 )
+from .executor import (
+    BacktestExecutor,
+    FactorBacktestExecutor,
+    run_backtest as run_backtest_new,
+)
+from .order_engine import (
+    OrderEngine,
+    OrderBook,
+    Order,
+    Trade as OrderEngineTrade,
+    OrderType,
+    OrderSide as OEOrderSide,
+    OrderStatus as OEOrderStatus,
+    SymbolInfo,
+    TWAPExecutor,
+)
 from .metrics import (
     FactorMetrics,
     AlphaMetrics,
@@ -49,6 +65,16 @@ __all__ = [
     'run_alpha_backtest',
     'run_backtest',
     'compare_calculators',
+    'BacktestExecutor',
+    'FactorBacktestExecutor',
+    'OrderEngine',
+    'OrderBook',
+    'Order',
+    'OrderType',
+    'OrderSide',
+    'OrderStatus',
+    'SymbolInfo',
+    'TWAPExecutor',
     'FactorMetrics',
     'AlphaMetrics',
     'FactorEvaluator',

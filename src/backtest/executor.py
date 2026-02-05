@@ -1,442 +1,622 @@
 """
-回测执行引擎
-执行回测策略，模拟订单、持仓、账户资金等
+回测执行引擎 - 重构版
+对齐实盘业务逻辑：订单规范化、持仓管理、权重转换
 """
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Tuple
 from datetime import datetime, timezone
-from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
 import uuid
 import logging
+import time
 
+import pandas as pd
+import numpy as np
+
+from ..common.config import config
 from ..common.logger import get_logger
+from ..common.utils import format_symbol, round_qty
+from ..data.storage import get_data_storage
+from ..data.api import get_data_api
 from .models import (
-    BacktestConfig, Order, Position, Trade, PortfolioState, OrderSide,
-    OrderStatus, PositionMode, KlineSnapshot, BacktestResult
+    BacktestConfig, BacktestResult, PortfolioState, Trade, OrderSide,
+    OrderStatus, PositionMode, KlineSnapshot, create_backtest_result
 )
 from .replay import DataReplayEngine
+from .order_engine import (
+    OrderEngine, OrderBook, Order, Trade as EngineTrade,
+    OrderType, OrderSide as EngineOrderSide, OrderStatus as EngineOrderStatus,
+    SymbolInfo, get_default_symbol_info, TWAPExecutor
+)
 
-logger = get_logger('backtest_engine')
+logger = logging.getLogger('backtest_executor')
+
+
+@dataclass
+class BacktestOrder:
+    """回测订单"""
+    order_id: str
+    symbol: str
+    side: OrderSide
+    quantity: float
+    price: float
+    filled_quantity: float = 0.0
+    filled_price: float = 0.0
+    status: OrderStatus = OrderStatus.PENDING
+    created_at: Optional[datetime] = None
+    commission: float = 0.0
+
+
+@dataclass
+class BacktestPosition:
+    """回测持仓"""
+    symbol: str
+    mode: PositionMode
+    quantity: float = 0.0
+    entry_price: float = 0.0
+    current_price: float = 0.0
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    accumulated_commission: float = 0.0
+    entry_time: Optional[datetime] = None
 
 
 class BacktestExecutor:
     """
-    回测执行引擎
-    驱动整个回测过程：
-    1. 迭代历史K线数据
-    2. 调用策略生成目标持仓
-    3. 执行订单、更新持仓和账户状态
-    4. 记录所有交易和账户状态
+    回测执行引擎 - 重构版
+
+    对齐实盘业务逻辑：
+    1. 订单规范化（精度、最小金额）
+    2. 权重转换为实际数量
+    3. 持仓偏差计算
+    4. 限价单/市价单撮合
+    5. 部分成交模拟
+    6. 滑点和市场冲击
     """
-    
+
     def __init__(self, config: BacktestConfig, replay_engine: DataReplayEngine):
-        """
-        初始化回测执行器
-        
-        Args:
-            config: 回测配置
-            replay_engine: 数据重放引擎
-        """
         self.config = config
         self.replay_engine = replay_engine
-        
-        # 账户状态
-        self.initial_balance = config.initial_balance
-        self.total_balance = config.initial_balance
-        self.available_balance = config.initial_balance
-        self.used_margin = 0.0
-        
-        # 持仓追踪
-        self.positions: Dict[str, Position] = {}
-        self.open_orders: Dict[str, Order] = {}
-        self.trades: List[Trade] = []
-        
-        # 历史数据
+
+        self.order_engine = OrderEngine(
+            initial_balance=config.initial_balance,
+            taker_fee=config.taker_fee,
+            maker_fee=config.maker_fee
+        )
+
+        self._init_symbols()
+        self._register_symbols()
+
         self.portfolio_history: List[PortfolioState] = []
-        
-        # 手续费
-        self.total_commission = 0.0
-        self.maker_fee = config.maker_fee
-        self.taker_fee = config.taker_fee
-        
-        # 状态追踪
+        self.backtest_trades: List[Trade] = []
+
         self._current_timestamp: Optional[datetime] = None
         self._current_prices: Dict[str, float] = {}
-        self._unrealized_pnl = 0.0
-        
+
+        self._slippage = config.slippage
+
         logger.info(f"Initialized BacktestExecutor: {config.name}, balance={config.initial_balance}")
-    
-    def run(self, strategy_func: Callable[[PortfolioState, Dict[str, KlineSnapshot]], Dict[str, float]]) -> BacktestResult:
+
+    def _init_symbols(self):
+        """初始化交易所信息"""
+        self.exchange_info: Dict[str, SymbolInfo] = {}
+
+        for symbol in self.config.symbols:
+            info = self._get_symbol_info(symbol)
+            self.exchange_info[symbol] = info
+
+    def _get_symbol_info(self, symbol: str) -> SymbolInfo:
+        """获取交易对信息（模拟）"""
+        info = get_default_symbol_info(symbol)
+        info.leverage = int(self.config.leverage)
+        return info
+
+    def _register_symbols(self):
+        """注册所有交易对到订单引擎"""
+        for symbol, info in self.exchange_info.items():
+            self.order_engine.register_symbol(symbol, info)
+
+    def run(
+        self,
+        strategy_func: Callable[[PortfolioState, Dict[str, KlineSnapshot]], Dict[str, float]],
+        verbose: bool = True
+    ) -> BacktestResult:
         """
         运行回测
-        
+
         Args:
-            strategy_func: 策略函数，接收(portfolio_state, klines)，返回目标持仓权重Dict[symbol, weight]
-        
+            strategy_func: 策略函数，接收(portfolio_state, klines)，返回目标持仓权重
+            verbose: 是否打印进度
+
         Returns:
-            BacktestResult 回测结果
+            BacktestResult
         """
-        import time
         start_time = time.time()
         start_datetime = datetime.now(timezone.utc)
-        
-        logger.info(f"Starting backtest: {self.config.name}")
-        
+
+        if verbose:
+            logger.info(f"Starting backtest: {self.config.name}")
+            logger.info(f"Period: {self.replay_engine.start_date.date()} ~ {self.replay_engine.end_date.date()}")
+            logger.info(f"Initial balance: ${self.config.initial_balance:,.0f}")
+            logger.info(f"Leverage: {self.config.leverage}x")
+            logger.info(f"Slippage: {self._slippage * 100:.2f} bps")
+
+        self.portfolio_history = []
+        self.backtest_trades = []
+
+        step_count = 0
         try:
-            # 迭代重放所有数据
-            step_count = 0
             for timestamp, klines_snapshot in self.replay_engine.replay_iterator():
                 self._current_timestamp = timestamp
-                
-                # 1. 更新当前价格
                 self._update_prices(klines_snapshot)
-                
-                # 2. 获取投资组合状态
+
                 portfolio_state = self._get_portfolio_state()
-                
-                # 3. 调用策略获取目标持仓
+
                 try:
                     target_weights = strategy_func(portfolio_state, klines_snapshot)
                 except Exception as e:
                     logger.error(f"Strategy error at {timestamp}: {e}", exc_info=True)
                     target_weights = {}
-                
-                # 4. 执行目标持仓
+
                 if target_weights:
                     self._execute_target_positions(target_weights, portfolio_state)
-                
-                # 5. 记录账户状态
+
                 self.portfolio_history.append(portfolio_state)
-                
+
                 step_count += 1
-                if step_count % 1000 == 0:
-                    logger.debug(f"Backtest progress: {step_count} steps, {timestamp}")
-            
-            # 平仓所有持仓
-            self._close_all_positions()
-            
-            end_time = time.time()
-            end_datetime = datetime.now(timezone.utc)
-            execution_time = end_time - start_time
-            
-            logger.info(f"Backtest completed in {execution_time:.2f}s, {len(self.trades)} trades")
-            
-            # 生成回测结果
-            result = self._generate_backtest_result(start_datetime, end_datetime, execution_time)
-            
-            return result
-            
+                if verbose and step_count % 1000 == 0:
+                    logger.info(f"Progress: {step_count} steps, {timestamp}")
+
         except Exception as e:
-            logger.error(f"Backtest failed: {e}", exc_info=True)
+            logger.error(f"Backtest error: {e}", exc_info=True)
             raise
-    
+
+        self._close_all_positions()
+
+        end_time = time.time()
+        end_datetime = datetime.now(timezone.utc)
+        execution_time = end_time - start_time
+
+        if verbose:
+            logger.info(f"Backtest completed in {execution_time:.2f}s, {len(self.backtest_trades)} trades")
+
+        result = self._generate_backtest_result(start_datetime, end_datetime, execution_time)
+        return result
+
     def _update_prices(self, klines_snapshot: Dict[str, KlineSnapshot]):
-        """更新所有交易对的当前价格"""
+        """更新当前价格"""
+        self._current_prices = {}
         for symbol, kline in klines_snapshot.items():
             self._current_prices[symbol] = kline.close
-            
-            # 更新对应持仓的当前价格和未实现PnL
-            if symbol in self.positions:
-                self.positions[symbol].update_price(kline.close)
-    
+
+            self.order_engine.update_market_data(
+                symbol=symbol,
+                open_=kline.open,
+                high=kline.high,
+                low=kline.low,
+                close=kline.close,
+                volume=kline.volume
+            )
+
+            if symbol in self.order_engine.positions:
+                pos = self.order_engine.positions[symbol]
+                pos['current_price'] = kline.close
+
     def _get_portfolio_state(self) -> PortfolioState:
-        """获取当前投资组合状态"""
-        # 计算已实现和未实现PnL
-        realized_pnl = sum(t.pnl for t in self.trades)
-        unrealized_pnl = sum(p.unrealized_pnl for p in self.positions.values() if p.quantity != 0)
+        """获取投资组合状态"""
+        prices = self._current_prices.copy()
+        total_equity = self.order_engine.get_total_equity(prices)
+        available_balance = self.order_engine.get_balance()
+        used_margin = 0.0
+
+        positions = {}
+        unrealized_pnl = 0
+
+        current_time = self._current_timestamp or datetime.now(timezone.utc)
+
+        for symbol, pos_data in self.order_engine.positions.items():
+            qty = pos_data['quantity']
+            if abs(qty) > 1e-8:
+                entry_price = pos_data.get('entry_price', 0) or 0.0
+                current_price = prices.get(symbol, entry_price) or entry_price
+                if qty > 0:
+                    upnl = qty * (current_price - entry_price)
+                else:
+                    upnl = -qty * (entry_price - current_price)
+
+                unrealized_pnl += upnl
+
+                position_value = abs(qty) * current_price
+                used_margin += position_value / max(self.config.leverage, 1.0)
+
+                positions[symbol] = BacktestPosition(
+                    symbol=symbol,
+                    mode=PositionMode.LONG if qty > 0 else PositionMode.SHORT,
+                    quantity=qty,
+                    entry_price=pos_data['entry_price'],
+                    current_price=current_price,
+                    unrealized_pnl=upnl,
+                    realized_pnl=pos_data['realized_pnl'],
+                    accumulated_commission=pos_data['commission']
+                )
+
+        realized_pnl = sum(t.pnl for t in self.backtest_trades) if self.backtest_trades else 0
         total_pnl = realized_pnl + unrealized_pnl
-        
-        # 更新账户余额
-        self.total_balance = self.initial_balance + total_pnl - self.total_commission
-        self.available_balance = self.total_balance - self.used_margin
-        
-        # 计算已用保证金（简单实现：假设1倍杠杆下需要的保证金）
-        self.used_margin = 0.0
-        for position in self.positions.values():
-            if position.quantity != 0:
-                # 假设使用杠杆，所需保证金 = 仓位价值 / 杠杆倍数
-                position_value = abs(position.quantity * position.current_price)
-                self.used_margin += position_value / max(self.config.leverage, 1.0)
-        
+
         return PortfolioState(
-            timestamp=self._current_timestamp,
-            total_balance=self.total_balance,
-            available_balance=self.available_balance,
-            used_margin=self.used_margin,
+            timestamp=current_time,
+            total_balance=total_equity,
+            available_balance=available_balance,
+            used_margin=used_margin,
             total_pnl=total_pnl,
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl,
-            positions=dict(self.positions),
-            open_orders=dict(self.open_orders),
-            trades_count=len(self.trades),
-            commission_paid=self.total_commission
+            positions=positions,
+            trades_count=len(self.backtest_trades),
+            commission_paid=sum(t.commission for t in self.backtest_trades) if self.backtest_trades else 0.0
         )
-    
-    def _execute_target_positions(self, target_weights: Dict[str, float], portfolio_state: PortfolioState):
-        """
-        执行目标持仓
-        
-        Args:
-            target_weights: Dict[symbol, weight] 目标持仓权重
-            portfolio_state: 当前投资组合状态
-        """
-        if not target_weights:
-            return
-        
-        target_quantities = self._weights_to_quantities(target_weights, portfolio_state)
-        
-        if not target_quantities:
-            return
-        
-        for symbol in target_quantities.keys():
-            current_position = self.positions.get(symbol)
-            current_qty = current_position.quantity if current_position else 0.0
-            target_qty = target_quantities.get(symbol, 0.0)
-            
-            delta_qty = target_qty - current_qty
-            
-            if abs(delta_qty) > 1e-10:
-                price = self._current_prices.get(symbol)
-                if price is None or price <= 0:
-                    logger.warning(f"No valid price for {symbol}, skipping")
-                    continue
-                
-                order_value = abs(delta_qty) * price
-                required_margin = order_value / max(self.config.leverage, 1.0)
-                
-                if required_margin > self.available_balance:
-                    logger.debug(f"Insufficient margin for {symbol}: required={required_margin:.2f}, available={self.available_balance:.2f}")
-                    continue
-                
-                if delta_qty > 0:
-                    self._create_and_execute_order(
-                        symbol=symbol,
-                        side=OrderSide.LONG,
-                        quantity=delta_qty,
-                        price=price
-                    )
-                else:
-                    self._create_and_execute_order(
-                        symbol=symbol,
-                        side=OrderSide.SHORT,
-                        quantity=abs(delta_qty),
-                        price=price
-                    )
-    
-    def _weights_to_quantities(self, weights: Dict[str, float], portfolio_state: PortfolioState) -> Dict[str, float]:
-        """将权重转换为实际持仓数量"""
+
+    def _convert_weights_to_quantities(
+        self,
+        target_weights: Dict[str, float],
+        portfolio_state: PortfolioState
+    ) -> Dict[str, float]:
+        """将权重转换为实际数量（对齐实盘逻辑）"""
         quantities = {}
-        
-        for symbol, weight in weights.items():
-            if weight == 0:
-                quantities[symbol] = 0.0
-                continue
-            
+
+        total_weight = sum(abs(w) for w in target_weights.values())
+        if total_weight < 1e-8:
+            return {}
+
+        normalized_weights = {sym: w / total_weight for sym, w in target_weights.items()}
+
+        available_balance = portfolio_state.available_balance
+
+        for symbol, weight in normalized_weights.items():
             if symbol not in self._current_prices:
-                logger.warning(f"No price available for {symbol}, skipping")
                 continue
-            
+
             price = self._current_prices[symbol]
-            
-            # 计算数量：(可用资金 * 权重) / 价格
-            amount = portfolio_state.available_balance * abs(weight)
-            quantity = amount / price
-            
-            # 如果权重为负表示反向（这里简化处理，只考虑正向持仓）
+            if price <= 0:
+                continue
+
+            target_notional = abs(weight) * available_balance * self.config.leverage
+            quantity = target_notional / price
+
+            info = self.exchange_info.get(symbol)
+            if info:
+                quantity = round_qty(quantity, info.step_size)
+                if quantity < info.min_qty:
+                    continue
+
+                notional = quantity * price
+                if notional < info.min_notional:
+                    continue
+
             if weight < 0:
                 quantity = -quantity
-            
+
             quantities[symbol] = quantity
-        
+
         return quantities
-    
-    def _create_and_execute_order(self, symbol: str, side: OrderSide, quantity: float, price: float) -> Optional[Trade]:
-        """创建并执行订单"""
-        try:
-            # 检查余额
-            order_value = quantity * price
-            required_margin = order_value / max(self.config.leverage, 1.0)
-            
-            if required_margin > self.available_balance:
-                logger.warning(
-                    f"Insufficient margin for {symbol}: required={required_margin:.2f}, available={self.available_balance:.2f}"
-                )
-                return None
-            
-            # 计算手续费
-            commission = order_value * self.taker_fee
-            
-            # 应用滑点
-            slippage_amount = order_value * (self.config.slippage / 10000.0)
-            actual_price = price * (1 + self.config.slippage / 10000.0) if side == OrderSide.LONG else price * (1 - self.config.slippage / 10000.0)
-            
-            # 创建Trade记录
-            trade = Trade(
-                trade_id=str(uuid.uuid4()),
+
+    def _normalize_orders(
+        self,
+        orders: List[Dict],
+        prices: Dict[str, float]
+    ) -> List[Dict]:
+        """规范化订单（对齐实盘逻辑）"""
+        normalized = []
+
+        for order in orders:
+            symbol = order['symbol']
+            quantity = order['quantity']
+            info = self.exchange_info.get(symbol)
+
+            if not info:
+                continue
+
+            quantity = round_qty(quantity, info.step_size)
+            if quantity < info.min_qty:
+                continue
+
+            price = prices.get(symbol, 0)
+            notional = quantity * price
+            if notional < info.min_notional:
+                continue
+
+            order['normalized_quantity'] = quantity
+            normalized.append(order)
+
+        return normalized
+
+    def _calculate_position_diff(
+        self,
+        target_quantities: Dict[str, float]
+    ) -> List[Dict]:
+        """计算持仓偏差，生成订单（对齐实盘逻辑）"""
+        orders = []
+
+        all_symbols = set(target_quantities.keys()) | set(self.order_engine.positions.keys())
+
+        for symbol in all_symbols:
+            target_qty = target_quantities.get(symbol, 0.0)
+            pos_data = self.order_engine.positions.get(symbol, {'quantity': 0.0})
+            current_qty = pos_data.get('quantity', 0.0)
+
+            diff = target_qty - current_qty
+
+            if abs(diff) < 1e-8:
+                continue
+
+            if diff > 0:
+                side = EngineOrderSide.BUY
+            else:
+                side = EngineOrderSide.SELL
+
+            reduce_only = False
+            if current_qty > 0 and diff < 0:
+                reduce_only = True
+            elif current_qty < 0 and diff > 0:
+                reduce_only = True
+
+            orders.append({
+                'symbol': symbol,
+                'side': side,
+                'quantity': abs(diff),
+                'reduce_only': reduce_only,
+                'current_position': current_qty,
+                'target_position': target_qty,
+            })
+
+        return orders
+
+    def _execute_target_positions(
+        self,
+        target_weights: Dict[str, float],
+        portfolio_state: PortfolioState
+    ):
+        """执行目标持仓"""
+        if not target_weights:
+            return
+
+        target_quantities = self._convert_weights_to_quantities(target_weights, portfolio_state)
+        if not target_quantities:
+            return
+
+        orders = self._calculate_position_diff(target_quantities)
+        if not orders:
+            return
+
+        normalized_orders = self._normalize_orders(orders, self._current_prices)
+
+        for order in normalized_orders:
+            symbol = order['symbol']
+            side = order['side']
+            quantity = order['normalized_quantity']
+            reduce_only = order.get('reduce_only', False)
+
+            self.order_engine.place_order(
                 symbol=symbol,
                 side=side,
+                order_type=OrderType.MARKET,
                 quantity=quantity,
-                price=actual_price,
-                executed_at=self._current_timestamp,
-                commission=commission
+                reduce_only=reduce_only
             )
-            
-            # 更新持仓
-            if symbol not in self.positions:
-                self.positions[symbol] = Position(
-                    symbol=symbol,
-                    mode=PositionMode.LONG if side == OrderSide.LONG else PositionMode.SHORT,
-                    entry_time=self._current_timestamp
-                )
-            
-            position = self.positions[symbol]
-            
-            # 更新持仓数量和平均价格
-            old_qty = position.quantity
-            new_qty = position.quantity + (quantity if side == OrderSide.LONG else -quantity)
-            
-            # 计算新的持仓成本
-            if new_qty == 0:
-                # 平仓
-                if old_qty != 0:
-                    pnl = (actual_price - position.entry_price) * old_qty
-                    trade.pnl = pnl
-                position.mode = PositionMode.FLAT
-                position.quantity = 0.0
-                position.unrealized_pnl = 0.0
-            else:
-                # 更新持仓
-                if old_qty == 0:
-                    # 新开仓
-                    position.entry_price = actual_price
-                    position.quantity = new_qty
-                    position.mode = PositionMode.LONG if new_qty > 0 else PositionMode.SHORT
-                else:
-                    # 加仓或减仓
-                    if (old_qty > 0 and new_qty > 0) or (old_qty < 0 and new_qty < 0):
-                        # 加仓
-                        position.entry_price = (position.entry_price * old_qty + actual_price * (new_qty - old_qty)) / new_qty
-                    else:
-                        # 反向开仓
-                        position.entry_price = actual_price
-                    
-                    position.quantity = new_qty
-                    position.mode = PositionMode.LONG if new_qty > 0 else PositionMode.SHORT
-            
-            # 更新账户
-            self.total_commission += commission
-            self.trades.append(trade)
-            
-            return trade
-            
-        except Exception as e:
-            logger.error(f"Failed to execute order for {symbol}: {e}", exc_info=True)
-            return None
-    
+
+        self._sync_trades()
+
+    def _sync_trades(self):
+        """同步订单引擎的交易到回测记录"""
+        engine_trades = self.order_engine.get_trades()
+        current_time = self._current_timestamp or datetime.now(timezone.utc)
+
+        for engine_trade in engine_trades:
+            trade_time = getattr(engine_trade, 'executed_at', None) or current_time
+
+            trade = Trade(
+                trade_id=engine_trade.trade_id,
+                symbol=engine_trade.symbol,
+                side=OrderSide.LONG if engine_trade.side == EngineOrderSide.BUY else OrderSide.SHORT,
+                quantity=engine_trade.quantity,
+                price=engine_trade.price,
+                executed_at=trade_time,
+                commission=engine_trade.commission,
+                pnl=0.0
+            )
+
+            self._update_trade_pnl(trade)
+            self.backtest_trades.append(trade)
+
+    def _update_trade_pnl(self, trade: Trade):
+        """更新交易盈亏"""
+        pos = self.order_engine.positions.get(trade.symbol, {'quantity': 0.0})
+        if pos:
+            trade.pnl = pos.get('realized_pnl', 0.0)
+
     def _close_all_positions(self):
         """平仓所有持仓"""
-        for symbol in list(self.positions.keys()):
-            position = self.positions[symbol]
-            if position.quantity != 0:
-                # 计算平仓价格（使用最后已知价格）
-                close_price = self._current_prices.get(symbol, position.entry_price)
-                
-                # 创建平仓Trade
-                trade = Trade(
-                    trade_id=str(uuid.uuid4()),
+        for symbol in list(self.order_engine.positions.keys()):
+            pos_data = self.order_engine.positions.get(symbol)
+            if pos_data and abs(pos_data['quantity']) > 1e-8:
+                close_price = self._current_prices.get(symbol, pos_data['entry_price'])
+
+                side = EngineOrderSide.SELL if pos_data['quantity'] > 0 else EngineOrderSide.BUY
+
+                self.order_engine.place_order(
                     symbol=symbol,
-                    side=OrderSide.SHORT if position.quantity > 0 else OrderSide.LONG,
-                    quantity=abs(position.quantity),
-                    price=close_price,
-                    executed_at=self._current_timestamp,
-                    commission=0.0  # 已在持仓期间计算
+                    side=side,
+                    order_type=OrderType.MARKET,
+                    quantity=abs(pos_data['quantity']),
+                    reduce_only=True
                 )
-                
-                # 计算PnL
-                if position.quantity > 0:
-                    trade.pnl = position.quantity * (close_price - position.entry_price)
-                else:
-                    trade.pnl = position.quantity * (position.entry_price - close_price)
-                
-                self.trades.append(trade)
-                position.quantity = 0.0
-                position.mode = PositionMode.FLAT
-    
-    def _generate_backtest_result(self, start_datetime: datetime, end_datetime: datetime, execution_time: float) -> BacktestResult:
+
+        self._sync_trades()
+
+    def _generate_backtest_result(
+        self,
+        start_datetime: datetime,
+        end_datetime: datetime,
+        execution_time: float
+    ) -> BacktestResult:
         """生成回测结果"""
-        result = BacktestResult(
+        result = create_backtest_result(
             config=self.config,
-            trades=self.trades,
-            portfolio_history=self.portfolio_history,
-            start_time=start_datetime,
-            end_time=end_datetime,
-            execution_time_seconds=execution_time
+            portfolio_df=pd.DataFrame([
+                {
+                    'timestamp': s.timestamp,
+                    'total_balance': s.total_balance,
+                    'available_balance': s.available_balance,
+                    'total_pnl': s.total_pnl,
+                }
+                for s in self.portfolio_history
+            ]),
+            trades=self.backtest_trades,
+            factor_weights={},
+            next_returns={},
         )
-        
-        # 计算统计指标
-        if len(self.trades) > 0:
-            # 计算收益
-            final_balance = self.total_balance
-            result.total_return = ((final_balance - self.initial_balance) / self.initial_balance) * 100
-            
-            # 年化收益（简化计算）
-            if len(self.portfolio_history) > 0:
-                first_ts = self.portfolio_history[0].timestamp if hasattr(self.portfolio_history[0], 'timestamp') else self._current_timestamp
-                days = (self._current_timestamp - first_ts).days if hasattr(first_ts, 'days') else 0
-                if days > 0:
-                    result.annual_return = result.total_return * (365.0 / days)
-            
-            # 胜率
-            winning_trades = [t for t in self.trades if t.pnl > 0]
-            losing_trades = [t for t in self.trades if t.pnl < 0]
-            result.winning_trades = len(winning_trades)
-            result.losing_trades = len(losing_trades)
-            result.total_trades = len(self.trades)
-            result.win_rate = (len(winning_trades) / len(self.trades)) * 100 if len(self.trades) > 0 else 0
-            
-            # 平均PnL
-            total_pnl = sum(t.pnl for t in self.trades)
-            result.avg_profit_per_trade = total_pnl / len(self.trades) if len(self.trades) > 0 else 0
-            result.max_profit_per_trade = max((t.pnl for t in self.trades), default=0)
-            result.max_loss_per_trade = min((t.pnl for t in self.trades), default=0)
-            
-            # 盈亏比
-            if len(losing_trades) > 0:
-                avg_win = sum(t.pnl for t in winning_trades) / len(winning_trades) if winning_trades else 0
-                avg_loss = abs(sum(t.pnl for t in losing_trades) / len(losing_trades)) if losing_trades else 1
-                result.profit_factor = avg_win / avg_loss if avg_loss > 0 else 0
-            
-            # 最大回撤
-            if len(self.portfolio_history) > 1:
-                cumulative_returns = []
-                for s in self.portfolio_history:
-                    if isinstance(s, dict):
-                        cumulative_returns.append(s.get('total_pnl', 0))
-                    else:
-                        cumulative_returns.append(s.total_pnl)
-                running_max = 0
-                max_dd = 0
-                for ret in cumulative_returns:
-                    running_max = max(running_max, ret)
-                    drawdown = running_max - ret
-                    max_dd = max(max_dd, drawdown)
-                
-                result.max_drawdown = (max_dd / self.initial_balance) * 100 if self.initial_balance > 0 else 0
-            
-            # 夏普比率（简化计算）
-            if len(self.portfolio_history) > 1:
-                returns = []
-                for i in range(1, len(self.portfolio_history)):
-                    prev = self.portfolio_history[i-1]
-                    curr = self.portfolio_history[i]
-                    prev_balance = prev.total_balance if hasattr(prev, 'total_balance') else prev.get('total_balance', self.initial_balance)
-                    curr_balance = curr.total_balance if hasattr(curr, 'total_balance') else curr.get('total_balance', self.initial_balance)
-                    ret = (curr_balance - prev_balance) / prev_balance
-                    returns.append(ret)
-                
-                if len(returns) > 1:
-                    import statistics
-                    avg_return = statistics.mean(returns)
-                    std_dev = statistics.stdev(returns) if len(returns) > 1 else 1
-                    result.sharpe_ratio = (avg_return / std_dev * (252 ** 0.5)) if std_dev > 0 else 0
-        
+
+        result.start_time = start_datetime
+        result.end_time = end_datetime
+        result.execution_time_seconds = execution_time
+
         return result
+
+
+class FactorBacktestExecutor:
+    """
+    因子回测执行器 - 兼容原有API
+    """
+
+    def __init__(
+        self,
+        config,
+        replay_engine: Optional[DataReplayEngine] = None
+    ):
+        from .backtest import FactorBacktestConfig as OldConfig
+
+        if isinstance(config, OldConfig):
+            bt_config = BacktestConfig(
+                name=config.name,
+                start_date=config.start_date,
+                end_date=config.end_date,
+                initial_balance=config.initial_balance,
+                symbols=config.symbols or [],
+                leverage=config.leverage,
+                interval=config.interval,
+                capital_allocation=getattr(config, 'capital_allocation', 'equal_weight'),
+                long_count=getattr(config, 'long_count', 10),
+                short_count=getattr(config, 'short_count', 10),
+            )
+        else:
+            bt_config = config
+
+        if replay_engine is None and hasattr(bt_config, 'symbols'):
+            replay_engine = DataReplayEngine(
+                symbols=bt_config.symbols,
+                start_date=bt_config.start_date,
+                end_date=bt_config.end_date,
+                interval=getattr(bt_config, 'interval', '5m')
+            )
+
+        if replay_engine is None:
+            raise ValueError("replay_engine is required if config doesn't have necessary attributes")
+
+        self.executor = BacktestExecutor(bt_config, replay_engine)
+
+    def run(
+        self,
+        strategy_func: Callable,
+        verbose: bool = True
+    ) -> BacktestResult:
+        """运行回测"""
+        return self.executor.run(strategy_func, verbose=verbose)
+
+
+def run_backtest(
+    calculator,
+    start_date: datetime,
+    end_date: datetime,
+    initial_balance: float = 10000.0,
+    symbols: Optional[List[str]] = None,
+    capital_allocation: str = "rank_weight",
+    long_count: int = 5,
+    short_count: int = 5,
+    leverage: float = 1.0,
+    verbose: bool = True,
+) -> BacktestResult:
+    """
+    运行回测 - 兼容原有API
+
+    Example:
+        >>> from src.backtest import run_backtest
+        >>> from src.strategy.calculators import MeanBuyDolvol4OverDolvolRankCalculator
+        >>>
+        >>> calc = MeanBuyDolvol4OverDolvolRankCalculator(lookback_bars=1000)
+        >>> result = run_backtest(
+        ...     calculator=calc,
+        ...     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        ...     end_date=datetime(2024, 3, 31, tzinfo=timezone.utc),
+        ... )
+    """
+    from .backtest import FactorBacktestConfig
+
+    config = FactorBacktestConfig(
+        name=f"bt_{getattr(calculator, 'name', 'unknown')}",
+        start_date=start_date,
+        end_date=end_date,
+        initial_balance=initial_balance,
+        symbols=symbols,
+        capital_allocation=capital_allocation,
+        long_count=long_count,
+        short_count=short_count,
+        leverage=leverage,
+    )
+
+    replay_engine = DataReplayEngine(
+        symbols=config.symbols or ["BTCUSDT", "ETHUSDT"],
+        start_date=config.start_date,
+        end_date=config.end_date,
+        interval="5m"
+    )
+
+    executor = BacktestExecutor(
+        config=BacktestConfig(
+            name=config.name,
+            start_date=config.start_date,
+            end_date=config.end_date,
+            initial_balance=config.initial_balance,
+            symbols=config.symbols or ["BTCUSDT", "ETHUSDT"],
+            leverage=config.leverage,
+            interval="5m",
+        ),
+        replay_engine=replay_engine
+    )
+
+    def strategy_wrapper(portfolio_state, klines):
+        from .backtest import AlphaDataView
+
+        view = AlphaDataView(
+            bar_data=klines,
+            tran_stats={},
+            symbols=set(klines.keys()),
+            copy_on_read=False
+        )
+
+        raw_weights = calculator.run(view)
+
+        processed_weights = {}
+        sorted_items = sorted(raw_weights.items(), key=lambda x: x[1], reverse=True)
+
+        long_n = min(config.long_count, len(sorted_items) // 2)
+        short_n = min(config.short_count, len(sorted_items) - long_n)
+
+        for i, (sym, w) in enumerate(sorted_items):
+            if i < long_n:
+                processed_weights[sym] = config.leverage / long_n
+            elif i >= len(sorted_items) - short_n and w < 0:
+                processed_weights[sym] = -config.leverage / short_n
+
+        return processed_weights
+
+    return executor.run(strategy_wrapper, verbose=verbose)

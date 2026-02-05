@@ -315,16 +315,18 @@ class MultiFactorBacktest:
     ) -> BacktestResult:
         """
         运行回测 - 返回统一的BacktestResult
-        
+
         Args:
             calculators: 要使用的Calculator列表
             verbose: 是否打印进度
-            
+
         Returns:
             BacktestResult - 统一的回测结果
         """
         from .models import BacktestConfig as ModelBacktestConfig
-        
+
+        metrics, portfolio_df = self.run(calculators, verbose=verbose)
+
         config = ModelBacktestConfig(
             name=self.config.name,
             start_date=self.config.start_date,
@@ -337,7 +339,7 @@ class MultiFactorBacktest:
             short_count=self.config.short_count,
             interval=self.config.interval,
         )
-        
+
         trades = []
         for i, tr in enumerate(self.trades):
             side = OrderSide.LONG if tr.side == "LONG" else OrderSide.SHORT
@@ -351,7 +353,7 @@ class MultiFactorBacktest:
                 commission=tr.commission,
                 pnl=tr.pnl,
             ))
-        
+
         result = create_backtest_result(
             config=config,
             portfolio_df=portfolio_df,
@@ -359,7 +361,7 @@ class MultiFactorBacktest:
             factor_weights=getattr(self, 'factor_weights', {}),
             next_returns=getattr(self, 'next_returns', {}),
         )
-        
+
         return result
     
     def _process_weights(self, raw_weights: Dict[str, float]) -> WeightVector:
