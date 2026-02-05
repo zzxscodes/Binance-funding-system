@@ -240,6 +240,40 @@ class OrderEngine:
         """更新市场数据"""
         if symbol in self.order_books:
             self.order_books[symbol].update_market_price(open_, high, low, close, volume)
+            # 推进撮合：检查该 symbol 的挂单是否因价格变化而触发成交
+            self._process_pending_limit_orders(symbol)
+
+    def _process_pending_limit_orders(self, symbol: str) -> None:
+        """
+        处理挂单撮合（回测）：
+        - 当 best_ask/best_bid 穿越 limit 价格时，按当前最优价成交剩余数量
+        - 当前实现不做复杂的部分成交深度模拟（深度已在 OrderBook 中体现，挂单触发后按最优价一次成交）
+        """
+        ob = self.order_books.get(symbol)
+        if ob is None:
+            return
+
+        best_bid = ob.get_best_bid()
+        best_ask = ob.get_best_ask()
+        if best_bid is None and best_ask is None:
+            return
+
+        # 遍历当前所有 LIMIT 活跃单
+        for order in list(self.orders.values()):
+            if order.symbol != symbol:
+                continue
+            if order.order_type != OrderType.LIMIT:
+                continue
+            if order.status not in [OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED]:
+                continue
+            if order.price is None:
+                continue
+
+            # 买单：价格 >= best_ask 时可成交；卖单：价格 <= best_bid 时可成交
+            if order.side == OrderSide.BUY and best_ask is not None and order.price >= best_ask:
+                self._execute_limit_order_at_market(order, market_price=best_ask)
+            elif order.side == OrderSide.SELL and best_bid is not None and order.price <= best_bid:
+                self._execute_limit_order_at_market(order, market_price=best_bid)
 
     def place_order(
         self,
@@ -388,21 +422,32 @@ class OrderEngine:
 
     def _execute_limit_order_immediately(self, order: Order, market_price: float):
         """限价单立即成交（吃单）"""
-        exec_price = market_price
-        commission = order.quantity * exec_price * self.taker_fee
+        self._execute_limit_order_at_market(order, market_price=market_price)
 
-        order.filled_quantity = order.quantity
+    def _execute_limit_order_at_market(self, order: Order, market_price: float) -> None:
+        """
+        将限价单在当前市场最优价成交剩余数量（触发吃单）。
+        """
+        remaining = order.remaining_quantity
+        if remaining <= 0:
+            return
+
+        exec_price = market_price
+        commission = remaining * exec_price * self.taker_fee
+
+        order.filled_quantity += remaining
+        # average price：本引擎暂不模拟多次分段成交，remaining 一次性成交即可
         order.average_price = exec_price
         order.status = OrderStatus.FILLED
         order.filled_at = self._current_time
-        order.commission = commission
+        order.commission += commission
 
         trade = Trade(
             trade_id=str(uuid.uuid4())[:8],
             symbol=order.symbol,
             order_id=order.order_id,
             side=order.side,
-            quantity=order.quantity,
+            quantity=remaining,
             price=exec_price,
             executed_at=self._current_time or datetime.now(timezone.utc),
             commission=commission,
@@ -410,16 +455,16 @@ class OrderEngine:
         )
         self.trades.append(trade)
 
-        self._update_position(order, exec_price, order.quantity)
+        self._update_position(order, exec_price, remaining)
 
         if order.side == OrderSide.BUY:
-            cost = order.quantity * exec_price + commission
+            cost = remaining * exec_price + commission
             self.balance -= cost
         else:
-            revenue = order.quantity * exec_price - commission
+            revenue = remaining * exec_price - commission
             self.balance += revenue
 
-        logger.debug(f"Limit order filled immediately: {order.symbol} {order.side} {order.quantity} @ {exec_price}")
+        logger.debug(f"Limit order filled: {order.symbol} {order.side} {remaining} @ {exec_price}")
 
     def _update_position(self, order: Order, price: float, filled_qty: float):
         """更新持仓"""

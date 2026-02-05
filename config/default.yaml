@@ -42,6 +42,9 @@ data:
   cleanup_interval: 3600  # 数据清理间隔（秒）
   universe_check_interval: 300  # Universe更新检查间隔（秒，5分钟）
   
+  # K线聚合器内存限制
+  kline_aggregator_max_klines: 8640  # 每个symbol最多缓存K线数（约30天数据，288*30，与cache_max_klines保持一致）
+  
   # Trades缓冲区配置
   trades_buffer_max_size: 1000  # 每个symbol最多缓存条数
   trades_buffer_total_max_size: 100000  # 所有symbol的总缓冲区大小限制
@@ -138,6 +141,43 @@ execution:
     default_duration_minutes: 60  # 默认执行时长（分钟）
     lookback_days: 5  # 历史数据回看天数
     max_splits: 60  # 最大分割数
+
+  # ===== 动态选择订单执行方式配置 =====
+  # 动态选择执行方式（MARKET/LIMIT/TWAP/VWAP）
+  method_selection:
+    enabled: true  # 是否启用动态选择执行方式
+    default_method: MARKET  # 默认执行方式（当动态选择禁用时使用）
+    
+    # 阈值配置（所有百分比值为小数，如0.05表示5%）
+    thresholds:
+      # 小订单：金额占账户权益比例 <= 此值，使用LIMIT
+      small_order_notional_pct_equity: 0.001  # 0.1% of equity
+      # 大订单：金额占账户权益比例 >= 此值，使用TWAP/VWAP
+      large_order_notional_pct_equity: 0.05  # 5% of equity
+      # 高波动：波动率 >= 此值，使用TWAP/VWAP
+      high_volatility_pct: 0.03  # 日波动率3%
+      # 高流动性冲击：冲击比例 >= 此值，使用TWAP/VWAP
+      high_liquidity_impact_pct: 0.01  # 1% liquidity impact
+      # 低可用余额：可用余额比例 <= 此值且reduce_only，使用MARKET快速平仓
+      low_available_balance_pct: 0.1  # 10% available balance
+    
+    # 各执行方式的启用/禁用配置
+    limit:
+      enabled: true  # 启用LIMIT（适合小订单，获取更好价格）
+      price_offset_pct: 0.001  # LIMIT价格偏移百分比（BUY时设置在当前价格下方0.1%，SELL时设置在上方0.1%）
+      max_wait_seconds: 60  # LIMIT订单最大等待时间（秒），超时后自动撤单并使用fallback执行
+      fallback_method: MARKET  # LIMIT订单超时后的备选执行方式（MARKET/TWAP/VWAP）
+    vwap:
+      enabled: true  # 启用VWAP（适合大订单，利用成交量分布）
+    twap:
+      enabled: true  # 启用TWAP（适合大订单，分散执行时间）
+    
+    # 风险控制：达到阈值时取消所有订单并停止
+    risk_control:
+      enabled: false  # 是否启用风险控制（默认关闭）
+      min_data_points: 100  # 最少数据点数（避免早期误判）
+      stop_loss_max_drawdown_pct: 0.15  # 最大回撤阈值（达到此值取消所有订单并停止）
+      take_profit_total_return_pct: 0.3  # 止盈总收益率（达到此值取消所有订单并获利了结）
   
   # ===== testnet模式配置 =====
   # 仅在 mode=testnet 时使用
@@ -208,6 +248,9 @@ execution:
 
 monitoring:
   check_interval: 60
+
+  # Equity Curve内存限制
+  equity_curve_max_cache: 10000  # Equity Curve内存缓存最大记录数（默认10000条，约7小时）
   # 性能监控配置
   performance:
     enabled: true  # 是否启用性能监控（默认关闭，避免生产环境性能影响）

@@ -3,7 +3,7 @@
 对齐实盘业务逻辑：订单规范化、持仓管理、权重转换
 """
 from typing import Dict, List, Optional, Callable, Any, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
 import uuid
@@ -27,6 +27,17 @@ from .order_engine import (
     OrderEngine, OrderBook, Order, Trade as EngineTrade,
     OrderType, OrderSide as EngineOrderSide, OrderStatus as EngineOrderStatus,
     SymbolInfo, get_default_symbol_info, TWAPExecutor
+)
+from ..execution.execution_method_selector import (
+    ExecutionMethodSelector,
+    AccountSnapshot,
+    SymbolFeatures,
+    PerformanceSnapshot,
+    METHOD_MARKET,
+    METHOD_LIMIT,
+    METHOD_TWAP,
+    METHOD_VWAP,
+    METHOD_CANCEL_ALL_ORDERS,
 )
 
 logger = logging.getLogger('backtest_executor')
@@ -95,6 +106,16 @@ class BacktestExecutor:
 
         self._slippage = config.slippage
 
+        # Execution method selector (shared with live execution)
+        self.method_selector = ExecutionMethodSelector(config)
+
+        # Scheduled child orders for TWAP/VWAP (executed across future bars)
+        self._scheduled_orders: List[Dict] = []
+        self._stop_trading: bool = False
+
+        # Trade sync cursor (avoid duplicate sync)
+        self._synced_trade_count: int = 0
+
         logger.info(f"Initialized BacktestExecutor: {config.name}, balance={config.initial_balance}")
 
     def _init_symbols(self):
@@ -150,6 +171,9 @@ class BacktestExecutor:
                 self._current_timestamp = timestamp
                 self._update_prices(klines_snapshot)
 
+                # Execute any scheduled child orders (TWAP/VWAP) due at this timestamp
+                self._execute_scheduled_orders(timestamp)
+
                 portfolio_state = self._get_portfolio_state()
 
                 try:
@@ -158,10 +182,27 @@ class BacktestExecutor:
                     logger.error(f"Strategy error at {timestamp}: {e}", exc_info=True)
                     target_weights = {}
 
-                if target_weights:
+                if (not self._stop_trading) and target_weights:
                     self._execute_target_positions(target_weights, portfolio_state)
 
                 self.portfolio_history.append(portfolio_state)
+
+                # Risk control check (backtest/live consistent)
+                try:
+                    perf = self._get_performance_snapshot()
+                    acct = AccountSnapshot(
+                        total_wallet_balance=float(portfolio_state.total_balance),
+                        available_balance=float(portfolio_state.available_balance),
+                    )
+                    decision = self.method_selector.select_global_action(acct, perf)
+                    if decision and decision.method == METHOD_CANCEL_ALL_ORDERS:
+                        # Cancel all active orders and stop further trading
+                        self.order_engine.cancel_all_orders(symbol=None)
+                        self._scheduled_orders.clear()
+                        self._stop_trading = True
+                        logger.warning(f"Backtest CANCEL_ALL_ORDERS triggered at {timestamp}: {decision.reason}")
+                except Exception:
+                    pass
 
                 step_count += 1
                 if verbose and step_count % 1000 == 0:
@@ -396,12 +437,12 @@ class BacktestExecutor:
             quantity = order['normalized_quantity']
             reduce_only = order.get('reduce_only', False)
 
-            self.order_engine.place_order(
+            self._place_order_with_dynamic_method(
                 symbol=symbol,
                 side=side,
-                order_type=OrderType.MARKET,
                 quantity=quantity,
-                reduce_only=reduce_only
+                reduce_only=reduce_only,
+                portfolio_state=portfolio_state
             )
 
         self._sync_trades()
@@ -409,9 +450,13 @@ class BacktestExecutor:
     def _sync_trades(self):
         """同步订单引擎的交易到回测记录"""
         engine_trades = self.order_engine.get_trades()
+        if self._synced_trade_count < 0:
+            self._synced_trade_count = 0
+        new_trades = engine_trades[self._synced_trade_count:]
+        self._synced_trade_count = len(engine_trades)
         current_time = self._current_timestamp or datetime.now(timezone.utc)
 
-        for engine_trade in engine_trades:
+        for engine_trade in new_trades:
             trade_time = getattr(engine_trade, 'executed_at', None) or current_time
 
             trade = Trade(
@@ -427,6 +472,282 @@ class BacktestExecutor:
 
             self._update_trade_pnl(trade)
             self.backtest_trades.append(trade)
+
+    def _execute_scheduled_orders(self, timestamp: datetime) -> None:
+        """执行到期的计划订单（用于TWAP/VWAP跨bar执行）"""
+        if not self._scheduled_orders:
+            return
+
+        due = [o for o in self._scheduled_orders if o['execute_at'] <= timestamp]
+        if not due:
+            return
+
+        self._scheduled_orders = [o for o in self._scheduled_orders if o['execute_at'] > timestamp]
+
+        for o in due:
+            self.order_engine.place_order(
+                symbol=o['symbol'],
+                side=o['side'],
+                order_type=OrderType.MARKET,
+                quantity=o['quantity'],
+                reduce_only=o.get('reduce_only', False)
+            )
+        self._sync_trades()
+
+    def _parse_interval_minutes(self, interval: str) -> int:
+        s = str(interval).strip().lower()
+        if not s:
+            raise ValueError("Empty interval")
+        if s.endswith('m'):
+            return int(s[:-1])
+        if s.endswith('h'):
+            return int(s[:-1]) * 60
+        raise ValueError(f"Unsupported interval format: {interval}")
+
+    def _get_symbol_features(self, symbol: str, timestamp: datetime) -> SymbolFeatures:
+        """
+        Backtest features from replay history up to timestamp.
+        Percent values are fractions (0.02 == 2%).
+        """
+        ms_cfg = config.get('execution.method_selection')
+        if not ms_cfg or not isinstance(ms_cfg, dict):
+            return SymbolFeatures()
+        features_cfg = ms_cfg.get('features')
+        if not features_cfg or not isinstance(features_cfg, dict):
+            raise ValueError("Missing config section: execution.method_selection.features")
+        min_bars = features_cfg.get('min_bars')
+        lookback_days = features_cfg.get('lookback_days')
+        if min_bars is None or lookback_days is None:
+            raise ValueError("Missing config keys: execution.method_selection.features.min_bars/lookback_days")
+
+        hist = self.replay_engine.kline_data.get(symbol)
+        if hist is None:
+            return SymbolFeatures()
+        df = hist.data
+        if df is None or df.empty or 'open_time' not in df.columns:
+            return SymbolFeatures()
+
+        ts = pd.to_datetime(timestamp)
+        open_times = pd.to_datetime(df['open_time'])
+        mask = open_times <= ts
+        df2 = df.loc[mask].tail(int(min_bars) * int(lookback_days))  # coarse cap
+        if len(df2) < int(min_bars):
+            return SymbolFeatures()
+
+        vol = None
+        try:
+            if 'close' in df2.columns:
+                ret = pd.to_numeric(df2['close'], errors='coerce').pct_change().dropna()
+                vol = float(ret.std()) if len(ret) > 0 else None
+        except Exception:
+            vol = None
+
+        avg_dolvol = None
+        for col in ['dolvol', 'quote_volume', 'quoteVolume']:
+            if col in df2.columns:
+                try:
+                    avg_dolvol = float(pd.to_numeric(df2[col], errors='coerce').dropna().mean())
+                except Exception:
+                    avg_dolvol = None
+                break
+
+        vwap_dev = None
+        try:
+            if 'vwap' in df2.columns and 'close' in df2.columns:
+                v = pd.to_numeric(df2['vwap'], errors='coerce')
+                c = pd.to_numeric(df2['close'], errors='coerce')
+                valid = (c > 0) & v.notna()
+                if valid.any():
+                    vwap_dev = float(((c[valid] - v[valid]).abs() / c[valid]).mean())
+        except Exception:
+            vwap_dev = None
+
+        return SymbolFeatures(volatility_pct=vol, avg_dolvol=avg_dolvol, vwap_deviation_pct=vwap_dev)
+
+    def _get_performance_snapshot(self) -> PerformanceSnapshot:
+        """
+        Compute performance from portfolio_history (fraction format).
+        """
+        try:
+            if not self.portfolio_history:
+                return PerformanceSnapshot()
+            equity = [float(s.total_balance) for s in self.portfolio_history if s is not None]
+            if not equity:
+                return PerformanceSnapshot()
+            initial = equity[0]
+            if initial <= 0:
+                return PerformanceSnapshot(data_points=len(equity))
+            current = equity[-1]
+            total_return = current / initial - 1.0
+            cummax = np.maximum.accumulate(np.array(equity))
+            dd = (np.array(equity) - cummax).min() / initial
+            return PerformanceSnapshot(
+                total_return_pct=float(total_return),
+                max_drawdown_pct=abs(float(dd)),
+                data_points=len(equity),
+            )
+        except Exception:
+            return PerformanceSnapshot()
+
+    def _place_order_with_dynamic_method(
+        self,
+        symbol: str,
+        side: EngineOrderSide,
+        quantity: float,
+        reduce_only: bool,
+        portfolio_state: PortfolioState
+    ) -> None:
+        """
+        Place order using the shared selector.
+        """
+        # Account snapshot (fraction percent)
+        acct = AccountSnapshot(
+            total_wallet_balance=float(portfolio_state.total_balance),
+            available_balance=float(portfolio_state.available_balance),
+        )
+
+        # Current price
+        px = float(self._current_prices.get(symbol, 0) or 0)
+        notional = px * float(quantity) if px > 0 else None
+        notional_pct_equity = None
+        if notional is not None and acct.total_wallet_balance and acct.total_wallet_balance > 0:
+            notional_pct_equity = float(notional) / float(acct.total_wallet_balance)
+
+        feats = self._get_symbol_features(symbol, self._current_timestamp or datetime.now(timezone.utc))
+        impact_pct = None
+        if notional is not None and feats.avg_dolvol and feats.avg_dolvol > 0:
+            impact_pct = float(notional) / float(feats.avg_dolvol)
+
+        decision = self.method_selector.select_for_order(
+            symbol=symbol,
+            side='BUY' if side == EngineOrderSide.BUY else 'SELL',
+            reduce_only=bool(reduce_only),
+            order_notional=notional,
+            order_notional_pct_equity=notional_pct_equity,
+            liquidity_impact_pct=impact_pct,
+            features=feats,
+            account=acct,
+        )
+
+        method = decision.method.upper()
+        if method == METHOD_LIMIT:
+            limit_cfg = config.get('execution.method_selection.limit')
+            if not limit_cfg or not isinstance(limit_cfg, dict):
+                raise ValueError("Missing config section: execution.method_selection.limit")
+            offset_pct = limit_cfg.get('price_offset_pct')
+            if offset_pct is None:
+                raise ValueError("Missing config key: execution.method_selection.limit.price_offset_pct")
+
+            if px <= 0:
+                method = METHOD_MARKET
+            else:
+                raw_price = px * (1.0 - float(offset_pct)) if side == EngineOrderSide.BUY else px * (1.0 + float(offset_pct))
+                tick = float(self.exchange_info[symbol].tick_size)
+                # BUY 向下，SELL 向上
+                import math
+                p_steps = raw_price / tick if tick > 0 else raw_price
+                limit_price = (math.floor(p_steps) * tick) if side == EngineOrderSide.BUY else (math.ceil(p_steps) * tick)
+                self.order_engine.place_order(
+                    symbol=symbol,
+                    side=side,
+                    order_type=OrderType.LIMIT,
+                    quantity=quantity,
+                    price=limit_price,
+                    reduce_only=reduce_only
+                )
+                return
+
+        if method in [METHOD_TWAP, METHOD_VWAP]:
+            self._schedule_child_orders(symbol, side, quantity, reduce_only, method)
+            return
+
+        # MARKET
+        self.order_engine.place_order(
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.MARKET,
+            quantity=quantity,
+            reduce_only=reduce_only
+        )
+
+    def _schedule_child_orders(self, symbol: str, side: EngineOrderSide, total_qty: float, reduce_only: bool, method: str) -> None:
+        """
+        Schedule TWAP/VWAP child orders over future bars.
+        """
+        interval = config.get('data.kline_interval')
+        if not interval:
+            raise ValueError("Missing config key: data.kline_interval")
+        interval_minutes = self._parse_interval_minutes(interval)
+
+        if method == METHOD_VWAP:
+            duration_minutes = config.get('execution.vwap.default_duration_minutes')
+        else:
+            duration_minutes = config.get('execution.twap.default_duration_minutes')
+        if duration_minutes is None:
+            raise ValueError("Missing config key: execution.twap.default_duration_minutes / execution.vwap.default_duration_minutes")
+
+        num_splits = max(1, int(int(duration_minutes) / int(interval_minutes)))
+        if num_splits <= 1:
+            self.order_engine.place_order(symbol=symbol, side=side, order_type=OrderType.MARKET, quantity=total_qty, reduce_only=reduce_only)
+            return
+
+        # Build quantities
+        quantities: List[float] = []
+        info = self.exchange_info.get(symbol)
+        step = float(info.step_size) if info else 0.001
+        min_qty = float(info.min_qty) if info else 0.001
+
+        if method == METHOD_VWAP:
+            # VWAP-like distribution based on historical average dolvol by minute slot
+            hist = self.replay_engine.kline_data.get(symbol)
+            weights = [1.0] * num_splits
+            if hist is not None and hist.data is not None and (not hist.data.empty) and 'open_time' in hist.data.columns:
+                df = hist.data
+                df = df.copy()
+                df['open_time'] = pd.to_datetime(df['open_time'])
+                # choose volume column
+                vol_col = None
+                for c in ['dolvol', 'quote_volume', 'quoteVolume', 'volume']:
+                    if c in df.columns:
+                        vol_col = c
+                        break
+                if vol_col:
+                    df[vol_col] = pd.to_numeric(df[vol_col], errors='coerce')
+                    df = df.dropna(subset=[vol_col])
+                    if not df.empty:
+                        slot = (df['open_time'].dt.minute // interval_minutes) * interval_minutes
+                        avg = df.groupby(slot)[vol_col].mean().to_dict()
+                        for i in range(num_splits):
+                            t = (self._current_timestamp or datetime.now(timezone.utc)) + timedelta(minutes=i * interval_minutes)
+                            s = (t.minute // interval_minutes) * interval_minutes
+                            weights[i] = float(avg.get(s, 1.0))
+
+            total_w = sum(weights) if sum(weights) > 0 else float(num_splits)
+            for w in weights:
+                q = total_qty * (float(w) / float(total_w))
+                q = round_qty(q, step)
+                quantities.append(q)
+        else:
+            q = round_qty(total_qty / num_splits, step)
+            quantities = [q] * num_splits
+
+        # Normalize quantities to sum close to total_qty (rounding may reduce)
+        quantities = [q for q in quantities if q >= min_qty]
+        if not quantities:
+            self.order_engine.place_order(symbol=symbol, side=side, order_type=OrderType.MARKET, quantity=total_qty, reduce_only=reduce_only)
+            return
+
+        base_time = self._current_timestamp or datetime.now(timezone.utc)
+        for i, q in enumerate(quantities):
+            exec_at = base_time + timedelta(minutes=i * interval_minutes)
+            self._scheduled_orders.append({
+                'execute_at': exec_at,
+                'symbol': symbol,
+                'side': side,
+                'quantity': q,
+                'reduce_only': reduce_only,
+                'method': method,
+            })
 
     def _update_trade_pnl(self, trade: Trade):
         """更新交易盈亏"""

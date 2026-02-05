@@ -42,6 +42,9 @@ class DryRunBinanceClient:
         self.account_id = account_id
         self.use_real_exchange_info = use_real_exchange_info
         self.session: Optional[aiohttp.ClientSession] = None
+
+        # 订单存储（用于 get_order_status / open_orders 的一致性）
+        self._orders: Dict[int, Dict] = {}
         
         # 从配置文件读取模拟账户信息（如果提供了account_id）
         mock_account_info = self._load_mock_account_info(account_id)
@@ -349,8 +352,10 @@ class DryRunBinanceClient:
         order_id = self._order_id_counter
         self._order_id_counter += 1
         
-        # 模拟订单执行（MARKET订单立即成交）
-        status = 'FILLED' if order_type == 'MARKET' else 'NEW'
+        # 模拟订单执行：
+        # dry-run 用于展示与联调，不具备真实撮合环境，因此 MARKET/LIMIT 都按立即成交处理，
+        # 避免上层执行逻辑（如 LIMIT 等待+撤单回退）出现不必要的阻塞。
+        status = 'FILLED' if order_type in ['MARKET', 'LIMIT'] else 'NEW'
         
         # 更新模拟持仓（仅用于dry-run展示，不影响真实账户）
         if status == 'FILLED' and quantity:
@@ -365,10 +370,14 @@ class DryRunBinanceClient:
             'executedQty': quantity if status == 'FILLED' else 0.0,
             'origQty': quantity,
             'price': price or 0.0,
+            'avgPrice': price or 0.0,
             'timeInForce': 'GTC' if order_type == 'LIMIT' else None,
             'reduceOnly': reduce_only,
             'updateTime': int(time.time() * 1000),
         }
+
+        # 存储订单（便于后续查询）
+        self._orders[int(order_id)] = dict(result)
         
         logger.info(
             f"DRY-RUN: Order placed (simulated): {symbol} {side} {order_type} "
@@ -446,35 +455,47 @@ class DryRunBinanceClient:
         symbol = format_symbol(symbol)
         logger.info(f"DRY-RUN: cancel_order() called for {symbol} orderId={order_id}")
         
-        return {
+        res = {
             'orderId': order_id,
             'symbol': symbol,
             'status': 'CANCELED',
             'updateTime': int(time.time() * 1000),
         }
+        if int(order_id) in self._orders:
+            self._orders[int(order_id)].update(res)
+        return res
     
     async def get_order_status(self, symbol: str, order_id: int) -> Dict:
         """查询订单状态（模拟）"""
         symbol = format_symbol(symbol)
         logger.debug(f"DRY-RUN: get_order_status() called for {symbol} orderId={order_id}")
-        
-        # 模拟订单状态（假设订单已成交）
+
+        existing = self._orders.get(int(order_id))
+        if existing:
+            # 补齐 symbol（调用方可能传入不同格式）
+            existing = dict(existing)
+            existing['symbol'] = symbol
+            return existing
+
+        # 未找到订单：返回保守值，避免上层异常
         return {
             'orderId': order_id,
             'symbol': symbol,
-            'status': 'FILLED',
-            'side': 'BUY',
-            'type': 'MARKET',
-            'executedQty': 0.1,
-            'origQty': 0.1,
+            'status': 'UNKNOWN',
             'updateTime': int(time.time() * 1000),
         }
     
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict]:
         """查询活跃订单（模拟）"""
         logger.debug(f"DRY-RUN: get_open_orders() called for symbol={symbol}")
-        # 在dry-run模式下，返回空列表（假设所有订单都已成交）
-        return []
+        sym = format_symbol(symbol) if symbol else None
+        open_status = {'NEW', 'PARTIALLY_FILLED'}
+        orders = []
+        for o in self._orders.values():
+            if o.get('status') in open_status:
+                if sym is None or format_symbol(o.get('symbol', '')) == sym:
+                    orders.append(dict(o))
+        return orders
     
     async def cancel_all_orders(self, symbol: str) -> List[Dict]:
         """取消指定交易对的所有活跃订单（模拟）"""

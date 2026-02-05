@@ -9,9 +9,19 @@ from datetime import datetime, timezone, timedelta
 
 from ..common.logger import get_logger
 from ..common.config import config
-from ..common.utils import format_symbol, round_qty
+from ..common.utils import format_symbol, round_qty, to_system_symbol
 from .binance_client import BinanceClient
 from .position_manager import PositionManager
+from .execution_method_selector import (
+    ExecutionMethodSelector,
+    AccountSnapshot,
+    PerformanceSnapshot,
+    SymbolFeatures,
+    METHOD_MARKET,
+    METHOD_LIMIT,
+    METHOD_TWAP,
+    METHOD_VWAP,
+)
 
 logger = get_logger('order_manager')
 
@@ -30,6 +40,7 @@ class OrderManager:
         self.client = binance_client
         self.dry_run = dry_run
         self.position_manager = PositionManager(binance_client)
+        self.method_selector = ExecutionMethodSelector(config)
         
         # 订单状态跟踪
         self.pending_orders: Dict[str, Dict] = {}  # order_id -> order_info
@@ -45,7 +56,8 @@ class OrderManager:
     
     async def execute_target_positions(
         self,
-        target_positions: Dict[str, float]
+        target_positions: Dict[str, float],
+        performance_snapshot: Optional[PerformanceSnapshot] = None
     ) -> List[Dict]:
         """
         执行目标持仓
@@ -78,7 +90,16 @@ class OrderManager:
                 logger.warning("No valid orders after normalization")
                 return []
             
-            # 4. 执行订单（使用并发控制）
+            # 4. 动态选择执行方式（对策略透明）
+            try:
+                await self._apply_execution_method_selection(normalized_orders, performance_snapshot)
+            except Exception as e:
+                # 选择器错误不应导致执行进程崩溃：降级为 MARKET
+                logger.error(f"Execution method selection failed, falling back to MARKET: {e}", exc_info=True)
+                for o in normalized_orders:
+                    o['order_type'] = 'MARKET'
+
+            # 5. 执行订单（使用并发控制）
             executed_orders = []
             failed_orders = []  # 记录失败的订单，用于错误恢复
             
@@ -148,6 +169,68 @@ class OrderManager:
             quantity = order['normalized_quantity']
             order_type = order.get('order_type', 'MARKET')
             reduce_only = order.get('reduce_only', False)
+
+            # TWAP/VWAP 是执行方式（会拆分成多个 MARKET 子单），不是交易所原生 type
+            if order_type in [METHOD_TWAP, METHOD_VWAP]:
+                kline_interval = config.get('data.kline_interval')
+                if not kline_interval:
+                    raise ValueError("Missing config key: data.kline_interval")
+
+                if order_type == METHOD_TWAP:
+                    child_results = await self.place_twap_order(
+                        symbol=symbol,
+                        side=side,
+                        total_quantity=quantity,
+                        interval=kline_interval,
+                        reduce_only=reduce_only
+                    )
+                else:
+                    child_results = await self.place_vwap_order(
+                        symbol=symbol,
+                        side=side,
+                        total_quantity=quantity,
+                        interval=kline_interval,
+                        reduce_only=reduce_only
+                    )
+
+                tracked = []
+                for r in child_results or []:
+                    if not r:
+                        continue
+                    child_order_id = r.get('orderId')
+                    child_status = r.get('status', 'NEW')
+                    info = {
+                        'order_id': child_order_id,
+                        'symbol': symbol,
+                        'side': side,
+                        'quantity': float(r.get('origQty', 0) or 0) or float(r.get('executedQty', 0) or 0) or quantity,
+                        'order_type': 'MARKET',
+                        'status': child_status,
+                        'executed_time': datetime.now(timezone.utc).isoformat(),
+                        'reduce_only': reduce_only,
+                        'current_position': order.get('current_position'),
+                        'target_position': order.get('target_position'),
+                        'parent_execution_method': order_type,
+                    }
+                    if child_status == 'FILLED':
+                        self.completed_orders.append(info)
+                    else:
+                        self.pending_orders[str(child_order_id)] = info
+                    tracked.append(info)
+
+                return {
+                    'order_id': None,
+                    'symbol': symbol,
+                    'side': side,
+                    'quantity': quantity,
+                    'order_type': order_type,
+                    'status': 'FILLED' if tracked else 'REJECTED',
+                    'executed_time': datetime.now(timezone.utc).isoformat(),
+                    'reduce_only': reduce_only,
+                    'current_position': order.get('current_position'),
+                    'target_position': order.get('target_position'),
+                    'child_orders': tracked,
+                }
             
             # 下单（dry-run模式下会自动使用test_order endpoint或完全离线模拟）
             if self.dry_run and hasattr(self.client, 'dry_run_mode') and self.client.dry_run_mode:
@@ -157,6 +240,7 @@ class OrderManager:
                     side=side,
                     order_type=order_type,
                     quantity=quantity,
+                    price=order.get('price'),
                     position_side='BOTH',
                     reduce_only=reduce_only
                 )
@@ -167,6 +251,7 @@ class OrderManager:
                     side=side,
                     order_type=order_type,
                     quantity=quantity,
+                    price=order.get('price'),
                     position_side='BOTH',
                     reduce_only=reduce_only
                 )
@@ -182,6 +267,8 @@ class OrderManager:
                 'quantity': quantity,
                 'order_type': order_type,
                 'status': status,
+                'price': order.get('price'),
+                'avgPrice': result.get('avgPrice'),
                 'executed_time': datetime.now(timezone.utc).isoformat(),
                 'reduce_only': reduce_only,
                 'current_position': order.get('current_position'),
@@ -200,6 +287,10 @@ class OrderManager:
                 logger.info(
                     f"Order {order_id} for {symbol} placed: {side} {quantity}, status={status}"
                 )
+
+                # LIMIT 单：等待短时间成交，超时则撤单并执行剩余数量（确保执行进程“可收敛”）
+                if order_type == METHOD_LIMIT:
+                    await self._handle_limit_timeout_and_fallback(order_id=order_id, order=order, order_info=order_info)
             
             return order_info
             
@@ -273,7 +364,9 @@ class OrderManager:
             if not self.pending_orders:
                 break
             
-            monitor_interval = config.get('execution.order.monitor_interval', 2.0)
+            monitor_interval = config.get('execution.order.monitor_interval')
+            if monitor_interval is None:
+                raise ValueError("Missing config key: execution.order.monitor_interval")
             await asyncio.sleep(monitor_interval)
     
     async def cancel_all_pending_orders(self, symbol: Optional[str] = None):
@@ -326,10 +419,18 @@ class OrderManager:
             for sym_info in exchange_info.get('symbols', []):
                 if format_symbol(sym_info.get('symbol', '')) == symbol:
                     # 提取精度信息
-                    tick_size = config.get('execution.order.default_tick_size', 0.01)
-                    step_size = config.get('execution.order.default_step_size', 0.01)
-                    min_qty = config.get('execution.order.default_min_qty', 0.001)
-                    min_notional = config.get('execution.order.default_min_notional', 5.0)
+                    tick_size = config.get('execution.order.default_tick_size')
+                    step_size = config.get('execution.order.default_step_size')
+                    min_qty = config.get('execution.order.default_min_qty')
+                    min_notional = config.get('execution.order.default_min_notional')
+                    if tick_size is None:
+                        raise ValueError("Missing config key: execution.order.default_tick_size")
+                    if step_size is None:
+                        raise ValueError("Missing config key: execution.order.default_step_size")
+                    if min_qty is None:
+                        raise ValueError("Missing config key: execution.order.default_min_qty")
+                    if min_notional is None:
+                        raise ValueError("Missing config key: execution.order.default_min_notional")
                     
                     for filter_item in sym_info.get('filters', []):
                         filter_type = filter_item.get('filterType', '')
@@ -359,11 +460,19 @@ class OrderManager:
             # 如果没有找到，返回默认值
             default_info = {
                 'symbol': symbol,
-                'tick_size': config.get('execution.order.default_tick_size', 0.01),
-                'step_size': config.get('execution.order.default_step_size', 0.01),
-                'min_qty': config.get('execution.order.default_min_qty', 0.001),
-                'min_notional': config.get('execution.order.default_min_notional', 5.0),
+                'tick_size': config.get('execution.order.default_tick_size'),
+                'step_size': config.get('execution.order.default_step_size'),
+                'min_qty': config.get('execution.order.default_min_qty'),
+                'min_notional': config.get('execution.order.default_min_notional'),
             }
+            if default_info['tick_size'] is None:
+                raise ValueError("Missing config key: execution.order.default_tick_size")
+            if default_info['step_size'] is None:
+                raise ValueError("Missing config key: execution.order.default_step_size")
+            if default_info['min_qty'] is None:
+                raise ValueError("Missing config key: execution.order.default_min_qty")
+            if default_info['min_notional'] is None:
+                raise ValueError("Missing config key: execution.order.default_min_notional")
             self._symbol_info_cache[symbol] = default_info
             return default_info
             
@@ -375,11 +484,19 @@ class OrderManager:
             
             default_info = {
                 'symbol': symbol,
-                'tick_size': config.get('execution.order.default_tick_size', 0.01),
-                'step_size': config.get('execution.order.default_step_size', 0.01),
-                'min_qty': config.get('execution.order.default_min_qty', 0.001),
-                'min_notional': config.get('execution.order.default_min_notional', 5.0),
+                'tick_size': config.get('execution.order.default_tick_size'),
+                'step_size': config.get('execution.order.default_step_size'),
+                'min_qty': config.get('execution.order.default_min_qty'),
+                'min_notional': config.get('execution.order.default_min_notional'),
             }
+            if default_info['tick_size'] is None:
+                raise ValueError("Missing config key: execution.order.default_tick_size")
+            if default_info['step_size'] is None:
+                raise ValueError("Missing config key: execution.order.default_step_size")
+            if default_info['min_qty'] is None:
+                raise ValueError("Missing config key: execution.order.default_min_qty")
+            if default_info['min_notional'] is None:
+                raise ValueError("Missing config key: execution.order.default_min_notional")
             if not hasattr(self, '_symbol_info_cache'):
                 self._symbol_info_cache = {}
             self._symbol_info_cache[symbol] = default_info
@@ -403,9 +520,11 @@ class OrderManager:
             try:
                 # 获取symbol精度信息
                 symbol_info = await self.get_symbol_info(symbol)
-                step_size = symbol_info.get('step_size', 0.01)
-                min_qty = symbol_info.get('min_qty', 0.001)
-                min_notional = symbol_info.get('min_notional', 5.0)
+                step_size = symbol_info.get('step_size')
+                min_qty = symbol_info.get('min_qty')
+                min_notional = symbol_info.get('min_notional')
+                if step_size is None or min_qty is None or min_notional is None:
+                    raise ValueError(f"Symbol info missing required fields for {symbol}: {symbol_info}")
                 
                 # 调整数量精度（向下取整）
                 quantity = round_qty(order['quantity'], step_size)
@@ -451,6 +570,318 @@ class OrderManager:
                 continue
         
         return normalized_orders
+
+    async def _apply_execution_method_selection(
+        self,
+        normalized_orders: List[Dict],
+        performance_snapshot: Optional[PerformanceSnapshot]
+    ) -> None:
+        """
+        根据配置/特征动态选择执行方式，并将选择结果写回 order dict：
+        - order['order_type'] ∈ {MARKET, LIMIT, TWAP, VWAP}
+        - LIMIT 会增加 order['price']
+        """
+        if not normalized_orders:
+            return
+
+        # 账户快照
+        account_snapshot = await self._get_account_snapshot()
+
+        # 特征：按 symbol 批量计算（减少重复IO）
+        symbols = sorted({format_symbol(o.get('symbol', '')) for o in normalized_orders if o.get('symbol')})
+        features_map = await self._get_symbol_features(symbols)
+
+        # 价格缓存
+        price_cache: Dict[str, Optional[float]] = {}
+
+        for order in normalized_orders:
+            symbol = format_symbol(order.get('symbol', ''))
+            side = order.get('side', '')
+            reduce_only = bool(order.get('reduce_only', False))
+
+            if symbol not in price_cache:
+                try:
+                    price_cache[symbol] = await self.client.get_symbol_price(symbol)
+                except Exception:
+                    price_cache[symbol] = None
+            px = price_cache.get(symbol)
+
+            notional = None
+            if px is not None and px > 0:
+                notional = float(order.get('normalized_quantity', 0) or 0) * float(px)
+
+            total_equity = account_snapshot.total_wallet_balance
+            notional_pct_equity = None
+            if notional is not None and total_equity and total_equity > 0:
+                notional_pct_equity = float(notional) / float(total_equity)
+
+            feats = features_map.get(symbol)
+            impact_pct = None
+            if notional is not None and feats and feats.avg_dolvol and feats.avg_dolvol > 0:
+                impact_pct = float(notional) / float(feats.avg_dolvol)
+
+            decision = self.method_selector.select_for_order(
+                symbol=symbol,
+                side=side,
+                reduce_only=reduce_only,
+                order_notional=notional,
+                order_notional_pct_equity=notional_pct_equity,
+                liquidity_impact_pct=impact_pct,
+                features=feats,
+                account=account_snapshot,
+            )
+
+            # 写回选择结果
+            method = decision.method.upper()
+            order['execution_method_reason'] = decision.reason
+
+            if method == METHOD_LIMIT:
+                # limit 定价需要当前价；若拿不到价则降级为 MARKET
+                if px is None or px <= 0:
+                    order['order_type'] = METHOD_MARKET
+                    order.pop('price', None)
+                    order['execution_method_reason'] = f"{decision.reason}; no_price -> MARKET"
+                    continue
+
+                limit_cfg = config.get('execution.method_selection.limit')
+                if not limit_cfg or not isinstance(limit_cfg, dict):
+                    raise ValueError("Missing config section: execution.method_selection.limit")
+                offset_pct = limit_cfg.get('price_offset_pct')
+                if offset_pct is None:
+                    raise ValueError("Missing config key: execution.method_selection.limit.price_offset_pct")
+
+                px_f = float(px)
+                off = float(offset_pct)
+                raw_price = px_f * (1.0 - off) if str(side).upper() == 'BUY' else px_f * (1.0 + off)
+
+                # 价格按 tick_size 处理：BUY 向下取整、SELL 向上取整，避免意外吃单
+                symbol_info = await self.get_symbol_info(symbol)
+                if symbol_info.get('tick_size') is None:
+                    raise ValueError(f"Symbol info missing tick_size for {symbol}: {symbol_info}")
+                tick = float(symbol_info.get('tick_size'))
+                limit_price = self._round_limit_price(raw_price, tick_size=tick, side=str(side).upper())
+
+                order['order_type'] = METHOD_LIMIT
+                order['price'] = limit_price
+            elif method in [METHOD_TWAP, METHOD_VWAP, METHOD_MARKET]:
+                order['order_type'] = method
+                order.pop('price', None)
+            else:
+                # 未知方法：降级
+                order['order_type'] = METHOD_MARKET
+                order.pop('price', None)
+                order['execution_method_reason'] = f"unknown_method({method}) -> MARKET"
+
+    async def _get_account_snapshot(self) -> AccountSnapshot:
+        """
+        获取账户快照（用于执行方式选择）
+        """
+        try:
+            info = await self.client.get_account_info()
+            total = info.get('totalWalletBalance', info.get('totalMarginBalance'))
+            avail = info.get('availableBalance')
+            return AccountSnapshot(
+                total_wallet_balance=float(total) if total is not None else None,
+                available_balance=float(avail) if avail is not None else None,
+            )
+        except Exception as e:
+            # dry-run 或临时失败：返回空快照（选择器会自然降级）
+            logger.debug(f"Failed to get account snapshot: {e}")
+            return AccountSnapshot()
+
+    async def _get_symbol_features(self, symbols: List[str]) -> Dict[str, SymbolFeatures]:
+        """
+        从 data 层 K 线计算历史特征。
+        返回 key 使用交易所格式（BTCUSDT，大写无连字符）。
+        """
+        if not symbols:
+            return {}
+
+        ms_cfg = config.get('execution.method_selection')
+        if not ms_cfg or not isinstance(ms_cfg, dict):
+            return {}
+        features_cfg = ms_cfg.get('features')
+        if not features_cfg or not isinstance(features_cfg, dict):
+            raise ValueError("Missing config section: execution.method_selection.features")
+        lookback_days = features_cfg.get('lookback_days')
+        if lookback_days is None:
+            raise ValueError("Missing config key: execution.method_selection.features.lookback_days")
+        min_bars = features_cfg.get('min_bars')
+        if min_bars is None:
+            raise ValueError("Missing config key: execution.method_selection.features.min_bars")
+
+        try:
+            from ..data.api import get_data_api
+            data_api = get_data_api()
+            bars_map = data_api.get_klines(symbols=symbols, days=int(lookback_days))
+
+            out: Dict[str, SymbolFeatures] = {}
+            for sym in symbols:
+                sys_key = to_system_symbol(sym)
+                df = bars_map.get(sys_key)
+                if df is None or getattr(df, "empty", True):
+                    out[format_symbol(sym)] = SymbolFeatures()
+                    continue
+                if len(df) < int(min_bars):
+                    out[format_symbol(sym)] = SymbolFeatures()
+                    continue
+
+                # volatility: std of close returns
+                try:
+                    close = df['close'] if 'close' in df.columns else None
+                    if close is None:
+                        vol = None
+                    else:
+                        ret = close.pct_change().dropna()
+                        vol = float(ret.std()) if len(ret) > 0 else None
+                except Exception:
+                    vol = None
+
+                # avg dollar volume
+                avg_dolvol = None
+                for col in ['dolvol', 'quote_volume', 'quoteVolume']:
+                    if col in df.columns:
+                        try:
+                            avg_dolvol = float(df[col].dropna().astype(float).mean())
+                        except Exception:
+                            avg_dolvol = None
+                        break
+
+                # vwap deviation
+                vwap_dev = None
+                try:
+                    if 'vwap' in df.columns and 'close' in df.columns:
+                        v = df['vwap'].astype(float)
+                        c = df['close'].astype(float)
+                        valid = (c > 0) & v.notna()
+                        if valid.any():
+                            vwap_dev = float(((c[valid] - v[valid]).abs() / c[valid]).mean())
+                except Exception:
+                    vwap_dev = None
+
+                out[format_symbol(sym)] = SymbolFeatures(
+                    volatility_pct=vol,
+                    avg_dolvol=avg_dolvol,
+                    vwap_deviation_pct=vwap_dev,
+                )
+
+            return out
+        except Exception as e:
+            logger.warning(f"Failed to compute symbol features, falling back: {e}")
+            return {format_symbol(s): SymbolFeatures() for s in symbols}
+
+    def _round_limit_price(self, price: float, tick_size: float, side: str) -> float:
+        """
+        LIMIT 价格对齐 tick。
+        - BUY：向下取整（更偏 maker）
+        - SELL：向上取整（更偏 maker）
+        """
+        if tick_size <= 0:
+            return float(price)
+        p = float(price)
+        t = float(tick_size)
+        steps = p / t
+        if side == 'SELL':
+            import math
+            return math.ceil(steps) * t
+        else:
+            import math
+            return math.floor(steps) * t
+
+    async def _handle_limit_timeout_and_fallback(self, order_id: int, order: Dict, order_info: Dict) -> None:
+        """
+        LIMIT 订单短等待 + 超时撤单 + fallback 执行剩余数量。
+        """
+        limit_cfg = config.get('execution.method_selection.limit')
+        if not limit_cfg or not isinstance(limit_cfg, dict):
+            return
+        max_wait = limit_cfg.get('max_wait_seconds')
+        if max_wait is None:
+            raise ValueError("Missing config key: execution.method_selection.limit.max_wait_seconds")
+        fallback = limit_cfg.get('fallback_method')
+        if not fallback:
+            raise ValueError("Missing config key: execution.method_selection.limit.fallback_method")
+        fallback = str(fallback).upper()
+
+        symbol = order_info.get('symbol')
+        if not symbol:
+            return
+
+        start = time.time()
+        while time.time() - start < float(max_wait):
+            try:
+                status_result = await self.client.get_order_status(symbol, int(order_id))
+                status = status_result.get('status')
+                if status == 'FILLED':
+                    # 更新 pending -> completed
+                    self.pending_orders.pop(str(order_id), None)
+                    order_info['status'] = 'FILLED'
+                    self.completed_orders.append(order_info)
+                    return
+                if status in ['CANCELED', 'EXPIRED', 'REJECTED']:
+                    self.pending_orders.pop(str(order_id), None)
+                    order_info['status'] = status
+                    return
+            except Exception:
+                pass
+            monitor_interval = config.get('execution.order.monitor_interval')
+            if monitor_interval is None:
+                raise ValueError("Missing config key: execution.order.monitor_interval")
+            await asyncio.sleep(monitor_interval)
+
+        # 超时：撤单
+        try:
+            await self.client.cancel_order(symbol, int(order_id))
+        except Exception as e:
+            logger.warning(f"Failed to cancel LIMIT order {order_id} for {symbol} on timeout: {e}")
+
+        # 查询一次状态，计算剩余数量
+        remaining_qty = None
+        try:
+            status_result = await self.client.get_order_status(symbol, int(order_id))
+            orig = float(status_result.get('origQty', 0) or 0)
+            executed = float(status_result.get('executedQty', 0) or 0)
+            remaining_qty = max(0.0, orig - executed)
+        except Exception:
+            # 无法获取就用原订单数量做保守 fallback
+            remaining_qty = float(order.get('normalized_quantity', 0) or 0)
+
+        # 清理 pending
+        self.pending_orders.pop(str(order_id), None)
+        order_info['status'] = 'CANCELED_TIMEOUT'
+
+        if remaining_qty is None or remaining_qty <= 0:
+            return
+
+        # 精度对齐
+        try:
+            sym_info = await self.get_symbol_info(symbol)
+            if sym_info.get('step_size') is None:
+                raise ValueError(f"Symbol info missing step_size for {symbol}: {sym_info}")
+            step = float(sym_info.get('step_size'))
+            remaining_qty = round_qty(remaining_qty, step)
+        except Exception:
+            pass
+
+        if remaining_qty <= 0:
+            return
+
+        # fallback 执行剩余数量
+        side = order.get('side')
+        reduce_only = bool(order.get('reduce_only', False))
+        if fallback == METHOD_TWAP:
+            kline_interval = config.get('data.kline_interval')
+            if not kline_interval:
+                raise ValueError("Missing config key: data.kline_interval")
+            await self.place_twap_order(
+                symbol=symbol,
+                side=side,
+                total_quantity=remaining_qty,
+                interval=kline_interval,
+                reduce_only=reduce_only
+            )
+        else:
+            await self.place_market_order(symbol=symbol, side=side, quantity=remaining_qty, reduce_only=reduce_only)
     
     async def _convert_weights_to_quantities(self, target_positions: Dict[str, float]) -> Dict[str, float]:
         """

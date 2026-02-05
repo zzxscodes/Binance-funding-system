@@ -21,7 +21,9 @@ from ..execution.dry_run_client import DryRunBinanceClient
 from ..execution.order_manager import OrderManager
 from ..strategy.position_generator import get_position_generator
 from ..monitoring.strategy_report import get_strategy_report_generator
+from ..monitoring.equity_curve import get_equity_curve_tracker
 from ..data.api import get_data_api
+from ..execution.execution_method_selector import PerformanceSnapshot, AccountSnapshot, METHOD_CANCEL_ALL_ORDERS
 
 logger = get_logger('execution_process')
 
@@ -172,6 +174,9 @@ class ExecutionProcess:
         
         # 状态
         self.running = False
+
+        # Equity curve tracker（用于风险控制：止盈止损 -> cancel_all_orders + stop）
+        self.equity_curve_tracker = get_equity_curve_tracker()
         
         # 信号文件路径
         signals_dir = config.get('data.signals_directory', 'data/signals')
@@ -359,11 +364,26 @@ class ExecutionProcess:
             logger.info(
                 f"Target positions loaded: {len(target_positions)} symbols for account {self.account_id}"
             )
+
+            # 2.5 风险控制：根据策略表现状态触发 CANCEL_ALL_ORDERS 并关闭执行进程
+            try:
+                perf = self._get_performance_snapshot()
+                acct = await self._get_account_snapshot()
+                decision = self.order_manager.method_selector.select_global_action(acct, perf)
+                if decision and decision.method == METHOD_CANCEL_ALL_ORDERS:
+                    await self._cancel_all_orders_and_shutdown(reason=decision.reason or "risk_control")
+                    return
+            except Exception as e:
+                logger.error(f"Risk control evaluation failed: {e}", exc_info=True)
             
             # 3. 执行目标持仓（带错误恢复）
             executed_orders = []
             try:
-                executed_orders = await self.order_manager.execute_target_positions(target_positions)
+                perf = self._get_performance_snapshot()
+                executed_orders = await self.order_manager.execute_target_positions(
+                    target_positions,
+                    performance_snapshot=perf
+                )
                 
                 # 4. 监控订单（等待订单完成）
                 if executed_orders:
@@ -510,6 +530,87 @@ class ExecutionProcess:
                 f"Failed to execute target positions for account {self.account_id}: {e}",
                 exc_info=True
             )
+
+    def _get_performance_snapshot(self) -> PerformanceSnapshot:
+        """
+        从 EquityCurveTracker summary 获取 performance snapshot。
+        注意：EquityCurveTracker 的 *_pct 字段是“百分比数值”（例如 5 表示 5%），
+        这里统一转换为小数形式（0.05 表示 5%）。
+        """
+        try:
+            summary = self.equity_curve_tracker.get_summary(self.account_id) or {}
+            tr = summary.get('total_return_pct')
+            dd = summary.get('max_drawdown_pct')
+            pts = summary.get('data_points', 0) or 0
+            total_return = float(tr) / 100.0 if tr is not None else None
+            max_dd = abs(float(dd)) / 100.0 if dd is not None else None
+            return PerformanceSnapshot(
+                total_return_pct=total_return,
+                max_drawdown_pct=max_dd,
+                data_points=int(pts)
+            )
+        except Exception:
+            return PerformanceSnapshot()
+
+    async def _get_account_snapshot(self) -> AccountSnapshot:
+        """
+        获取账户快照（用于风险控制决策）
+        """
+        try:
+            info = await self.binance_client.get_account_info()
+            total = info.get('totalWalletBalance', info.get('totalMarginBalance'))
+            avail = info.get('availableBalance')
+            return AccountSnapshot(
+                total_wallet_balance=float(total) if total is not None else None,
+                available_balance=float(avail) if avail is not None else None,
+            )
+        except Exception:
+            return AccountSnapshot()
+
+    async def _cancel_all_orders_and_shutdown(self, reason: str) -> None:
+        """
+        执行 CANCEL_ALL_ORDERS：
+        1) 撤销账户下所有活跃订单（按 symbol 批量调用交易所 allOpenOrders）
+        2) 等待确认没有活跃订单
+        3) 关闭 execution 进程（stop）
+        """
+        logger.warning(f"CANCEL_ALL_ORDERS triggered for account {self.account_id}: {reason}")
+
+        timeout = config.get('execution.method_selection.risk_control.cancel_timeout_seconds')
+        if timeout is None:
+            raise ValueError("Missing config key: execution.method_selection.risk_control.cancel_timeout_seconds")
+        poll = config.get('execution.order.monitor_interval')
+        if poll is None:
+            raise ValueError("Missing config key: execution.order.monitor_interval")
+
+        # 先拉取当前所有 open orders，按 symbol 进行 cancel_all
+        try:
+            open_orders = await self.binance_client.get_open_orders()
+        except Exception as e:
+            logger.error(f"Failed to fetch open orders before cancel_all: {e}", exc_info=True)
+            open_orders = []
+
+        symbols = sorted({format_symbol(o.get('symbol', '')) for o in open_orders if o.get('symbol')})
+        for sym in symbols:
+            try:
+                await self.binance_client.cancel_all_orders(sym)
+            except Exception as e:
+                logger.error(f"Failed to cancel_all_orders for {sym}: {e}", exc_info=True)
+
+        # 等待 open orders 清空（避免撤单异步延迟）
+        start = time.time()
+        while time.time() - start < float(timeout):
+            try:
+                remaining = await self.binance_client.get_open_orders()
+                if not remaining:
+                    break
+            except Exception:
+                # 网络/限流等临时错误：继续等待直到超时
+                pass
+            await asyncio.sleep(float(poll))
+
+        # 最终停止进程（stop 会额外 cancel pending_orders 并关闭 client）
+        await self.stop()
     
     async def start(self):
         """启动订单执行进程"""
