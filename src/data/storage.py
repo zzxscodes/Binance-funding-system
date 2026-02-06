@@ -567,6 +567,12 @@ class DataStorage:
                 return pl.read_csv(file_path)
         except PanicException as e:
             logger.error(f"Polars panic when loading {file_path}: {e}")
+            # Polars panic通常表示文件损坏，尝试删除损坏的文件
+            try:
+                logger.warning(f"Corrupted parquet file detected (Polars panic), removing: {file_path}")
+                file_path.unlink()
+            except Exception as del_err:
+                logger.error(f"Failed to remove corrupted file: {del_err}")
             return pl.DataFrame()
         except Exception as e:
             logger.error(f"Failed to load {file_path}: {e}")
