@@ -98,74 +98,76 @@ class DataAPI:
                 f"{days} days ({start_time.date()} to {end_time.date()})"
             )
             
-            result = {}
+            # 使用性能监控包裹整个方法
+            with self.performance_monitor.measure('data_api', 'get_klines', {'symbols_count': len(symbols), 'days': days}):
+                result = {}
 
-            # 1) 批量并发加载本地存储（主要瓶颈）
-            with self.performance_monitor.measure('data_api', 'load_klines_bulk', {'symbols_count': len(symbols), 'days': days}):
-                storage_map = self.storage.load_klines_bulk(
-                    symbols=[to_exchange_symbol(s) for s in symbols],
-                    start_date=start_time,
-                    end_date=end_time,
+                # 1) 批量并发加载本地存储（主要瓶颈）
+                with self.performance_monitor.measure('data_api', 'load_klines_bulk', {'symbols_count': len(symbols), 'days': days}):
+                    storage_map = self.storage.load_klines_bulk(
+                        symbols=[to_exchange_symbol(s) for s in symbols],
+                        start_date=start_time,
+                        end_date=end_time,
+                    )
+
+                # 2) 合并实时聚合器数据（如有）
+                for raw_symbol in symbols:
+                    try:
+                        ex_symbol = to_exchange_symbol(raw_symbol)
+                        df_storage = storage_map.get(ex_symbol, pd.DataFrame())
+
+                        if self.kline_aggregator:
+                            df_realtime = self.kline_aggregator.get_klines(ex_symbol, start_time, end_time)
+                        else:
+                            df_realtime = pd.DataFrame()
+
+                        if not df_realtime.empty:
+                            if not df_storage.empty:
+                                combined_df = pd.concat([df_storage, df_realtime], ignore_index=True)
+                                combined_df = combined_df.drop_duplicates(subset=['open_time'], keep='last')
+                                combined_df = combined_df.sort_values('open_time').reset_index(drop=True)
+                                combined_df = combined_df[
+                                    (combined_df['open_time'] >= start_time) &
+                                    (combined_df['close_time'] <= end_time)
+                                ]
+                                df = combined_df
+                            else:
+                                df = df_realtime[
+                                    (df_realtime['open_time'] >= start_time) &
+                                    (df_realtime['close_time'] <= end_time)
+                                ]
+                        else:
+                            df = df_storage
+
+                        # 返回key：系统格式 btc-usdt（策略侧更友好）
+                        key = to_system_symbol(ex_symbol)
+                        result[key] = df
+
+                        if not df.empty and 'open_time' in df.columns:
+                            logger.debug(
+                                f"{key}: loaded {len(df)} klines "
+                                f"({df['open_time'].min()} to {df['open_time'].max()})"
+                            )
+                        elif df.empty:
+                            # 大规模 universe 下逐币种 warning 会刷屏；这里降级为 debug，仅保留汇总日志
+                            if len(symbols) <= 50:
+                                logger.warning(f"{key}: no kline data found")
+                            else:
+                                logger.debug(f"{key}: no kline data found")
+                    except Exception as e:
+                        logger.error(f"Failed to get klines for {raw_symbol}: {e}", exc_info=True)
+                        result[to_system_symbol(raw_symbol)] = pd.DataFrame()
+                
+                # 统计
+                total_klines = sum(len(df) for df in result.values())
+                symbols_with_data = sum(1 for df in result.values() if not df.empty)
+                # 降级为debug（策略计算路径，可能频繁调用）
+                logger.debug(
+                    f"Kline fetch completed: {symbols_with_data}/{len(symbols)} symbols have data, "
+                    f"total {total_klines} klines"
                 )
-
-            # 2) 合并实时聚合器数据（如有）
-            for raw_symbol in symbols:
-                try:
-                    ex_symbol = to_exchange_symbol(raw_symbol)
-                    df_storage = storage_map.get(ex_symbol, pd.DataFrame())
-
-                    if self.kline_aggregator:
-                        df_realtime = self.kline_aggregator.get_klines(ex_symbol, start_time, end_time)
-                    else:
-                        df_realtime = pd.DataFrame()
-
-                    if not df_realtime.empty:
-                        if not df_storage.empty:
-                            combined_df = pd.concat([df_storage, df_realtime], ignore_index=True)
-                            combined_df = combined_df.drop_duplicates(subset=['open_time'], keep='last')
-                            combined_df = combined_df.sort_values('open_time').reset_index(drop=True)
-                            combined_df = combined_df[
-                                (combined_df['open_time'] >= start_time) &
-                                (combined_df['close_time'] <= end_time)
-                            ]
-                            df = combined_df
-                        else:
-                            df = df_realtime[
-                                (df_realtime['open_time'] >= start_time) &
-                                (df_realtime['close_time'] <= end_time)
-                            ]
-                    else:
-                        df = df_storage
-
-                    # 返回key：系统格式 btc-usdt（策略侧更友好）
-                    key = to_system_symbol(ex_symbol)
-                    result[key] = df
-
-                    if not df.empty and 'open_time' in df.columns:
-                        logger.debug(
-                            f"{key}: loaded {len(df)} klines "
-                            f"({df['open_time'].min()} to {df['open_time'].max()})"
-                        )
-                    elif df.empty:
-                        # 大规模 universe 下逐币种 warning 会刷屏；这里降级为 debug，仅保留汇总日志
-                        if len(symbols) <= 50:
-                            logger.warning(f"{key}: no kline data found")
-                        else:
-                            logger.debug(f"{key}: no kline data found")
-                except Exception as e:
-                    logger.error(f"Failed to get klines for {raw_symbol}: {e}", exc_info=True)
-                    result[to_system_symbol(raw_symbol)] = pd.DataFrame()
-            
-            # 统计
-            total_klines = sum(len(df) for df in result.values())
-            symbols_with_data = sum(1 for df in result.values() if not df.empty)
-            # 降级为debug（策略计算路径，可能频繁调用）
-            logger.debug(
-                f"Kline fetch completed: {symbols_with_data}/{len(symbols)} symbols have data, "
-                f"total {total_klines} klines"
-            )
-            
-            return result
+                
+                return result
             
         except Exception as e:
             logger.error(f"Error in get_klines: {e}", exc_info=True)
@@ -579,39 +581,39 @@ class DataAPI:
                             last, vwap, dolvol, buydolvol, selldolvol, buyvolume, sellvolume,
                             buytradecount, selltradecount, time_lable
         """
-        try:
-            begin_time = self._parse_date_time_label(begin_date_time_label)
-            end_time = self._parse_date_time_label(end_date_time_label)
-            
-            if begin_time >= end_time:
-                logger.warning(f"Invalid time range: begin >= end ({begin_date_time_label} >= {end_date_time_label})")
-                return {}
-            
-            # 如果缓存未初始化，尝试初始化
-            if not self._cache_initialized:
-                self.initialize_memory_cache()
-            
-            # 获取所有缓存的symbol
-            with self._cache_lock:
-                cached_symbols = list(self._memory_cache.keys())
-            
-            # 如果缓存为空，不自动加载所有universe（避免内存泄漏）
-            # 改为按需加载：只处理请求时间范围内的数据，不预加载所有symbol
-            # 这样可以避免一次性加载530个symbol导致内存爆炸
-            if not cached_symbols:
-                logger.debug("Memory cache is empty, will load data on-demand without pre-caching all symbols")
-                # 不预加载，直接返回空结果或按需加载
-                # 如果需要数据，应该先调用initialize_memory_cache()或使用get_klines()方法
-                return {}
-            
-            result = {}
-            
-            # 如果mode不是5min，需要从5min数据聚合
-            if mode != '5min':
-                from .multi_interval_aggregator import get_multi_interval_aggregator
-                aggregator = get_multi_interval_aggregator()
-            
-            with self.performance_monitor.measure('data_api', 'get_bar_between', {'mode': mode, 'symbols_count': len(cached_symbols)}):
+        # 使用性能监控包裹整个方法
+        with self.performance_monitor.measure('data_api', 'get_bar_between', {'mode': mode}):
+            try:
+                begin_time = self._parse_date_time_label(begin_date_time_label)
+                end_time = self._parse_date_time_label(end_date_time_label)
+                
+                if begin_time >= end_time:
+                    logger.warning(f"Invalid time range: begin >= end ({begin_date_time_label} >= {end_date_time_label})")
+                    return {}
+                
+                # 如果缓存未初始化，尝试初始化
+                if not self._cache_initialized:
+                    self.initialize_memory_cache()
+                
+                # 获取所有缓存的symbol
+                with self._cache_lock:
+                    cached_symbols = list(self._memory_cache.keys())
+                
+                # 如果缓存为空，不自动加载所有universe（避免内存泄漏）
+                # 改为按需加载：只处理请求时间范围内的数据，不预加载所有symbol
+                # 这样可以避免一次性加载530个symbol导致内存爆炸
+                if not cached_symbols:
+                    logger.debug("Memory cache is empty, will load data on-demand without pre-caching all symbols")
+                    # 不预加载，直接返回空结果或按需加载
+                    # 如果需要数据，应该先调用initialize_memory_cache()或使用get_klines()方法
+                    return {}
+                
+                result = {}
+                
+                # 如果mode不是5min，需要从5min数据聚合
+                if mode != '5min':
+                    from .multi_interval_aggregator import get_multi_interval_aggregator
+                    aggregator = get_multi_interval_aggregator()
                 import time
                 current_time = time.time()
                 
@@ -679,13 +681,13 @@ class DataAPI:
                     except Exception as e:
                         logger.error(f"Failed to get bar data for {sys_symbol}: {e}", exc_info=True)
                         continue
-            
-            logger.debug(f"get_bar_between (mode={mode}): {len(result)} symbols with data")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error in get_bar_between: {e}", exc_info=True)
-            raise
+                
+                logger.debug(f"get_bar_between (mode={mode}): {len(result)} symbols with data")
+                return result
+                
+            except Exception as e:
+                logger.error(f"Error in get_bar_between: {e}", exc_info=True)
+                raise
     
     def get_tran_stats_between(
         self, 
@@ -711,39 +713,38 @@ class DataAPI:
               buy_volume1-4, buy_dolvol1-4, buy_trade_count1-4,
               sell_volume1-4, sell_dolvol1-4, sell_trade_count1-4
         """
-        try:
-            begin_time = self._parse_date_time_label(begin_date_time_label)
-            end_time = self._parse_date_time_label(end_date_time_label)
-            
-            if begin_time >= end_time:
-                logger.warning(f"Invalid time range: begin >= end ({begin_date_time_label} >= {end_date_time_label})")
-                return {}
-            
-            # 如果缓存未初始化，尝试初始化
-            if not self._cache_initialized:
-                self.initialize_memory_cache()
-            
-            # 获取所有缓存的symbol
-            with self._cache_lock:
-                cached_symbols = list(self._memory_cache.keys())
-            
-            # 如果缓存为空，不自动加载所有universe（避免内存泄漏）
-            # 改为按需加载：只处理请求时间范围内的数据，不预加载所有symbol
-            # 这样可以避免一次性加载530个symbol导致内存爆炸
-            if not cached_symbols:
-                logger.debug("Memory cache is empty, will load data on-demand without pre-caching all symbols")
-                # 不预加载，直接返回空结果或按需加载
-                # 如果需要数据，应该先调用initialize_memory_cache()或使用get_klines()方法
-                return {}
-            
-            result = {}
-            
-            # 如果mode不是5min，需要从5min数据聚合
-            if mode != '5min':
-                from .multi_interval_aggregator import get_multi_interval_aggregator
-                aggregator = get_multi_interval_aggregator()
-            
-            with self.performance_monitor.measure('data_api', 'get_tran_stats_between', {'mode': mode, 'symbols_count': len(cached_symbols)}):
+        # 使用性能监控包裹整个方法
+        with self.performance_monitor.measure('data_api', 'get_tran_stats_between', {'mode': mode}):
+            try:
+                begin_time = self._parse_date_time_label(begin_date_time_label)
+                end_time = self._parse_date_time_label(end_date_time_label)
+                
+                if begin_time >= end_time:
+                    logger.warning(f"Invalid time range: begin >= end ({begin_date_time_label} >= {end_date_time_label})")
+                    return {}
+                
+                # 如果缓存未初始化，尝试初始化
+                if not self._cache_initialized:
+                    self.initialize_memory_cache()
+                
+                # 获取所有缓存的symbol
+                with self._cache_lock:
+                    cached_symbols = list(self._memory_cache.keys())
+                # 如果缓存为空，不自动加载所有universe（避免内存泄漏）
+                # 改为按需加载：只处理请求时间范围内的数据，不预加载所有symbol
+                # 这样可以避免一次性加载530个symbol导致内存爆炸
+                if not cached_symbols:
+                    logger.debug("Memory cache is empty, will load data on-demand without pre-caching all symbols")
+                    # 不预加载，直接返回空结果或按需加载
+                    # 如果需要数据，应该先调用initialize_memory_cache()或使用get_klines()方法
+                    return {}
+                
+                result = {}
+                
+                # 如果mode不是5min，需要从5min数据聚合
+                if mode != '5min':
+                    from .multi_interval_aggregator import get_multi_interval_aggregator
+                    aggregator = get_multi_interval_aggregator()
                 import time
                 current_time = time.time()
                 
@@ -815,13 +816,13 @@ class DataAPI:
                     except Exception as e:
                         logger.error(f"Failed to get tran_stats data for {sys_symbol}: {e}", exc_info=True)
                         continue
-            
-            logger.debug(f"get_tran_stats_between: {len(result)} symbols with data")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error in get_tran_stats_between: {e}", exc_info=True)
-            raise
+                
+                logger.debug(f"get_tran_stats_between: {len(result)} symbols with data")
+                return result
+                
+            except Exception as e:
+                logger.error(f"Error in get_tran_stats_between: {e}", exc_info=True)
+                raise
     
     def get_funding_rate_between(self, begin_date_time_label: str, end_date_time_label: str) -> Dict[str, pd.DataFrame]:
         """
