@@ -54,6 +54,11 @@ class KlineAggregator:
         self.max_klines_per_symbol = config.get(
             "data.kline_aggregator_max_klines", 2000
         )
+        
+        # Pending trades窗口数限制：每个symbol最多保留的pending窗口数，防止内存无限增长
+        self.max_pending_windows_per_symbol = config.get(
+            "data.kline_aggregator_max_pending_windows", 100
+        )
 
         # 统计信息
         self.stats = {
@@ -181,6 +186,19 @@ class KlineAggregator:
             # 聚合已关闭的窗口
             for window_start_ms in windows_to_close:
                 await self._aggregate_window(symbol, window_start_ms)
+            
+            # 检查pending_trades窗口数，如果超过限制则清理最旧的窗口
+            if len(self.pending_trades[symbol]) > self.max_pending_windows_per_symbol:
+                # 按窗口时间排序，删除最旧的
+                sorted_windows = sorted(self.pending_trades[symbol].keys())
+                to_remove = len(sorted_windows) - self.max_pending_windows_per_symbol
+                for window_start in sorted_windows[:to_remove]:
+                    # 先尝试聚合，如果失败则直接删除
+                    try:
+                        await self._aggregate_window(symbol, window_start)
+                    except Exception:
+                        # 如果聚合失败，直接删除
+                        self.pending_trades[symbol].pop(window_start, None)
 
         except Exception as e:
             logger.error(f"Error adding trade for {symbol}: {e}", exc_info=True)

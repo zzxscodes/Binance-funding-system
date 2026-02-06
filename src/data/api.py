@@ -46,7 +46,10 @@ class DataAPI:
         self._memory_cache: Dict[str, pl.DataFrame] = {}
         self._cache_lock = threading.Lock()
         self._cache_max_klines = config.get('data.cache_max_klines', 8640)  # 默认8640根K线
+        self._cache_max_symbols = config.get('data.cache_max_symbols', 100)  # 默认最多缓存100个symbol，防止内存无限增长
         self._cache_initialized = False
+        # 缓存访问时间戳（用于LRU清理）
+        self._cache_access_time: Dict[str, float] = {}
         
         # 性能监控
         self.performance_monitor = get_performance_monitor()
@@ -339,9 +342,22 @@ class DataAPI:
                 end_date=end_time,
             )
             
-            # 填充内存缓存
+            # 填充内存缓存（限制symbol数量，防止内存爆炸）
+            import time
+            current_time = time.time()
+            
             with self._cache_lock:
-                for raw_symbol in symbols:
+                # 限制初始化的symbol数量，避免一次性加载太多
+                max_init_symbols = min(len(symbols), self._cache_max_symbols)
+                symbols_to_init = symbols[:max_init_symbols]
+                
+                if len(symbols) > max_init_symbols:
+                    logger.warning(
+                        f"Limiting cache initialization to {max_init_symbols} symbols "
+                        f"(requested {len(symbols)}, max allowed: {self._cache_max_symbols})"
+                    )
+                
+                for raw_symbol in symbols_to_init:
                     try:
                         ex_symbol = to_exchange_symbol(raw_symbol)
                         sys_symbol = to_system_symbol(ex_symbol)
@@ -360,6 +376,7 @@ class DataAPI:
                                 df_pl = df_pl.tail(self._cache_max_klines)
                             
                             self._memory_cache[sys_symbol] = df_pl
+                            self._cache_access_time[sys_symbol] = current_time
                             
                     except Exception as e:
                         logger.error(f"Failed to initialize cache for {raw_symbol}: {e}", exc_info=True)
@@ -368,7 +385,7 @@ class DataAPI:
                 self._cache_initialized = True
             
             cached_count = sum(1 for df in self._memory_cache.values() if not df.is_empty())
-            logger.info(f"Memory cache initialized: {cached_count}/{len(symbols)} symbols have data")
+            logger.info(f"Memory cache initialized: {cached_count}/{len(symbols_to_init)} symbols have data (limited to {self._cache_max_symbols} max symbols)")
             
         except Exception as e:
             logger.error(f"Failed to initialize memory cache: {e}", exc_info=True)
@@ -394,6 +411,40 @@ class DataAPI:
         # 设置新的回调
         self.kline_aggregator.on_kline_callback = cache_update_callback
         logger.debug("Kline aggregator callback set for memory cache updates")
+    
+    def _cleanup_cache_if_needed(self):
+        """
+        清理缓存：如果symbol数量超过限制，删除最久未访问的symbol
+        """
+        with self._cache_lock:
+            if len(self._memory_cache) <= self._cache_max_symbols:
+                return
+            
+            # 按访问时间排序，删除最久未访问的
+            import time
+            current_time = time.time()
+            
+            # 更新当前访问时间
+            for symbol in list(self._memory_cache.keys()):
+                if symbol not in self._cache_access_time:
+                    self._cache_access_time[symbol] = current_time
+            
+            # 按访问时间排序，删除最久未访问的
+            sorted_symbols = sorted(
+                self._cache_access_time.items(),
+                key=lambda x: x[1]
+            )
+            
+            # 删除最久未访问的symbol，直到满足限制
+            to_remove = len(self._memory_cache) - self._cache_max_symbols
+            for symbol, _ in sorted_symbols[:to_remove]:
+                if symbol in self._memory_cache:
+                    del self._memory_cache[symbol]
+                if symbol in self._cache_access_time:
+                    del self._cache_access_time[symbol]
+            
+            if to_remove > 0:
+                logger.debug(f"Cleaned up {to_remove} symbols from memory cache (current: {len(self._memory_cache)}/{self._cache_max_symbols})")
     
     async def _update_memory_cache(self, symbol: str, kline_data: dict):
         """
@@ -421,6 +472,10 @@ class DataAPI:
                 # 获取系统格式的symbol作为key
                 sys_symbol = to_system_symbol(symbol)
                 
+                # 更新访问时间
+                import time
+                self._cache_access_time[sys_symbol] = time.time()
+                
                 # 获取当前缓存（如果不存在则创建空DataFrame）
                 cached_df = self._memory_cache.get(sys_symbol, pl.DataFrame())
                 
@@ -441,6 +496,9 @@ class DataAPI:
                         combined_df = combined_df.tail(self._cache_max_klines)
                     
                     self._memory_cache[sys_symbol] = combined_df
+                
+                # 检查并清理缓存
+                self._cleanup_cache_if_needed()
                     
         except Exception as e:
             logger.error(f"Failed to update memory cache for {symbol}: {e}", exc_info=True)
@@ -537,26 +595,14 @@ class DataAPI:
             with self._cache_lock:
                 cached_symbols = list(self._memory_cache.keys())
             
-            # 如果缓存为空，尝试从存储加载
+            # 如果缓存为空，不自动加载所有universe（避免内存泄漏）
+            # 改为按需加载：只处理请求时间范围内的数据，不预加载所有symbol
+            # 这样可以避免一次性加载530个symbol导致内存爆炸
             if not cached_symbols:
-                # 从Universe获取所有symbol
-                universe = self.get_universe()
-                if universe:
-                    # 从存储加载数据
-                    storage_map = self.storage.load_klines_bulk(
-                        symbols=[to_exchange_symbol(s) for s in universe],
-                        start_date=begin_time - timedelta(days=1),  # 多加载1天以确保覆盖
-                        end_date=end_time + timedelta(days=1),
-                    )
-                    # 填充缓存
-                    with self._cache_lock:
-                        for raw_symbol in universe:
-                            ex_symbol = to_exchange_symbol(raw_symbol)
-                            sys_symbol = to_system_symbol(ex_symbol)
-                            df = storage_map.get(ex_symbol, pd.DataFrame())
-                            if not df.empty:
-                                self._memory_cache[sys_symbol] = df
-                        cached_symbols = list(self._memory_cache.keys())
+                logger.debug("Memory cache is empty, will load data on-demand without pre-caching all symbols")
+                # 不预加载，直接返回空结果或按需加载
+                # 如果需要数据，应该先调用initialize_memory_cache()或使用get_klines()方法
+                return {}
             
             result = {}
             
@@ -566,6 +612,9 @@ class DataAPI:
                 aggregator = get_multi_interval_aggregator()
             
             with self.performance_monitor.measure('data_api', 'get_bar_between', {'mode': mode, 'symbols_count': len(cached_symbols)}):
+                import time
+                current_time = time.time()
+                
                 for sys_symbol in cached_symbols:
                     try:
                         # 在锁内快速获取数据引用（polars DataFrame是immutable的，可以安全共享）
@@ -573,6 +622,8 @@ class DataAPI:
                             if sys_symbol not in self._memory_cache:
                                 continue
                             cached_df_pl = self._memory_cache[sys_symbol]
+                            # 更新访问时间
+                            self._cache_access_time[sys_symbol] = current_time
                         
                         if cached_df_pl.is_empty():
                             continue
@@ -676,28 +727,14 @@ class DataAPI:
             with self._cache_lock:
                 cached_symbols = list(self._memory_cache.keys())
             
-            # 如果缓存为空，尝试从存储加载
+            # 如果缓存为空，不自动加载所有universe（避免内存泄漏）
+            # 改为按需加载：只处理请求时间范围内的数据，不预加载所有symbol
+            # 这样可以避免一次性加载530个symbol导致内存爆炸
             if not cached_symbols:
-                # 从Universe获取所有symbol
-                universe = self.get_universe()
-                if universe:
-                    # 从存储加载数据
-                    storage_map = self.storage.load_klines_bulk(
-                        symbols=[to_exchange_symbol(s) for s in universe],
-                        start_date=begin_time - timedelta(days=1),  # 多加载1天以确保覆盖
-                        end_date=end_time + timedelta(days=1),
-                    )
-                    # 填充缓存
-                    with self._cache_lock:
-                        for raw_symbol in universe:
-                            ex_symbol = to_exchange_symbol(raw_symbol)
-                            sys_symbol = to_system_symbol(ex_symbol)
-                            df_pd = storage_map.get(ex_symbol, pd.DataFrame())
-                            if not df_pd.empty:
-                                # 转换为polars DataFrame
-                                df_pl = pl.from_pandas(df_pd)
-                                self._memory_cache[sys_symbol] = df_pl
-                        cached_symbols = list(self._memory_cache.keys())
+                logger.debug("Memory cache is empty, will load data on-demand without pre-caching all symbols")
+                # 不预加载，直接返回空结果或按需加载
+                # 如果需要数据，应该先调用initialize_memory_cache()或使用get_klines()方法
+                return {}
             
             result = {}
             
@@ -707,6 +744,9 @@ class DataAPI:
                 aggregator = get_multi_interval_aggregator()
             
             with self.performance_monitor.measure('data_api', 'get_tran_stats_between', {'mode': mode, 'symbols_count': len(cached_symbols)}):
+                import time
+                current_time = time.time()
+                
                 for sys_symbol in cached_symbols:
                     try:
                         # 在锁内快速获取数据引用（polars DataFrame是immutable的，可以安全共享）
@@ -714,6 +754,8 @@ class DataAPI:
                             if sys_symbol not in self._memory_cache:
                                 continue
                             cached_df_pl = self._memory_cache[sys_symbol]
+                            # 更新访问时间
+                            self._cache_access_time[sys_symbol] = current_time
                         
                         if cached_df_pl.is_empty():
                             continue

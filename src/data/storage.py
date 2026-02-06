@@ -52,6 +52,7 @@ class DataStorage:
         # Schema缓存：缓存每个symbol的schema，避免重复检查
         # 格式: {symbol: schema_dict}，schema_dict包含schema和最后更新时间
         self._schema_cache: Dict[str, Dict] = {}
+        self._schema_cache_max_size = config.get('data.storage_schema_cache_max_size', 1000)
 
     def _get_kline_file_path(self, symbol: str, date: datetime) -> Path:
         """
@@ -304,6 +305,19 @@ class DataStorage:
             if len(dfs_pl) > 1:
                 # 尝试使用缓存的schema
                 cache_key = f"{symbol}_klines"
+                # 检查缓存大小，如果超过限制则清理最旧的
+                if len(self._schema_cache) >= self._schema_cache_max_size:
+                    # 删除最旧的缓存（按时间戳，如果没有时间戳则删除第一个），直到满足限制
+                    sorted_items = sorted(
+                        self._schema_cache.items(),
+                        key=lambda x: x[1].get('timestamp', 0)
+                    )
+                    # 删除最旧的，直到满足限制（保留最新的N个）
+                    to_remove = len(sorted_items) - self._schema_cache_max_size + 1
+                    to_remove = max(1, to_remove)  # 至少删除1个
+                    for key, _ in sorted_items[:to_remove]:
+                        self._schema_cache.pop(key, None)
+                
                 cached_schema = self._schema_cache.get(cache_key)
 
                 try:

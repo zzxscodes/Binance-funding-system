@@ -38,16 +38,37 @@ class BinanceClient:
         self._time_offset: Optional[int] = None  # 服务器时间偏移量（毫秒）
         
         # 合约配置缓存：记录每个symbol的margin_type和leverage
-        # 格式: {symbol: {'margin_type': 'CROSSED', 'leverage': 20, 'verified': True}}
+        # 格式: {symbol: {'margin_type': 'CROSSED', 'leverage': 20, 'verified': True, 'timestamp': time.time()}}
         self._contract_settings_cache: Dict[str, Dict[str, Any]] = {}
-        
-        # 从配置读取目标合约设置
-        contract_settings = config.get('execution.contract_settings', {})
-        self._target_margin_type = contract_settings.get('margin_type', 'CROSSED')
-        self._target_leverage = contract_settings.get('leverage', 20)
+        self._contract_settings_cache_max_size = config.get('execution.binance_client.contract_settings_cache_max_size', 500)
+        self._contract_settings_cache_ttl = config.get('execution.binance_client.contract_settings_cache_ttl', 3600)  # 1小时过期
         
         if self.dry_run:
             logger.info("BinanceClient initialized in DRY-RUN mode (using test_order endpoint)")
+    
+    def _cleanup_contract_settings_cache(self):
+        """清理过期的合约设置缓存"""
+        import time
+        current_time = time.time()
+        
+        # 删除过期的缓存
+        expired_symbols = [
+            sym for sym, cache in self._contract_settings_cache.items()
+            if current_time - cache.get('timestamp', 0) > self._contract_settings_cache_ttl
+        ]
+        for sym in expired_symbols:
+            self._contract_settings_cache.pop(sym, None)
+        
+        # 如果缓存大小超过限制，删除最旧的直到满足限制
+        if len(self._contract_settings_cache) >= self._contract_settings_cache_max_size:
+            sorted_items = sorted(
+                self._contract_settings_cache.items(),
+                key=lambda x: x[1].get('timestamp', 0)
+            )
+            # 删除最旧的，直到满足限制
+            to_remove = len(sorted_items) - self._contract_settings_cache_max_size + 1  # +1确保删除后小于限制
+            for sym, _ in sorted_items[:to_remove]:
+                self._contract_settings_cache.pop(sym, None)
     
     async def _sync_server_time(self):
         """同步Binance服务器时间"""
@@ -521,29 +542,40 @@ class BinanceClient:
             target_margin_type = margin_type if margin_type is not None else self._target_margin_type
             target_leverage = leverage if leverage is not None else self._target_leverage
             
+            # 清理过期缓存
+            self._cleanup_contract_settings_cache()
+            
             # 检查缓存，如果已验证过且正确，则跳过
             cached = self._contract_settings_cache.get(symbol)
             if cached and cached.get('verified', False):
-                # 检查缓存中的配置是否与目标配置一致
-                cached_margin_type = cached.get('margin_type')
-                cached_leverage = cached.get('leverage')
-                
-                if cached_margin_type == target_margin_type and cached_leverage == target_leverage:
-                    # 验证当前设置是否仍然正确
-                    verification = await self.verify_contract_settings(
-                        symbol, target_margin_type, target_leverage
-                    )
-                    if verification.get('margin_type_ok') and verification.get('leverage_ok'):
-                        # 配置仍然正确，无需重新设置
-                        return True
-                    else:
-                        # 配置已改变，需要重新设置
-                        logger.debug(f"{symbol}: Contract settings changed, re-applying...")
-                        cached['verified'] = False
+                # 检查缓存是否过期
+                import time
+                cache_time = cached.get('timestamp', 0)
+                if time.time() - cache_time > self._contract_settings_cache_ttl:
+                    # 缓存过期，删除
+                    self._contract_settings_cache.pop(symbol, None)
+                    cached = None
                 else:
-                    # 目标配置已改变，需要重新设置
-                    logger.debug(f"{symbol}: Target contract settings changed, re-applying...")
-                    cached['verified'] = False
+                    # 检查缓存中的配置是否与目标配置一致
+                    cached_margin_type = cached.get('margin_type')
+                    cached_leverage = cached.get('leverage')
+                    
+                    if cached_margin_type == target_margin_type and cached_leverage == target_leverage:
+                        # 验证当前设置是否仍然正确
+                        verification = await self.verify_contract_settings(
+                            symbol, target_margin_type, target_leverage
+                        )
+                        if verification.get('margin_type_ok') and verification.get('leverage_ok'):
+                            # 配置仍然正确，无需重新设置
+                            return True
+                        else:
+                            # 配置已改变，需要重新设置
+                            logger.debug(f"{symbol}: Contract settings changed, re-applying...")
+                            cached['verified'] = False
+                    else:
+                        # 目标配置已改变，需要重新设置
+                        logger.debug(f"{symbol}: Target contract settings changed, re-applying...")
+                        cached['verified'] = False
             
             # 如果缓存中没有或未验证，则设置合约配置
             if not cached or not cached.get('verified', False):
@@ -578,10 +610,16 @@ class BinanceClient:
                     
                     if is_margin_ok and leverage_ok:
                         # 设置成功，更新缓存
+                        import time
+                        # 检查缓存大小，如果超过限制则清理最旧的
+                        if len(self._contract_settings_cache) >= self._contract_settings_cache_max_size:
+                            self._cleanup_contract_settings_cache()
+                        
                         self._contract_settings_cache[symbol] = {
                             'margin_type': target_margin_type,
                             'leverage': target_leverage,
-                            'verified': True
+                            'verified': True,
+                            'timestamp': time.time(),
                         }
                         # 如果 API 返回的是 CROSS 而不是 CROSSED，记录为 debug 级别（不是警告）
                         if expected_margin_upper == 'CROSSED' and current_margin == 'CROSS':
@@ -633,10 +671,16 @@ class BinanceClient:
                             leverage_ok = (current_leverage == target_leverage)
                             
                             if is_margin_ok and leverage_ok:
+                                import time
+                                # 检查缓存大小，如果超过限制则清理最旧的
+                                if len(self._contract_settings_cache) >= self._contract_settings_cache_max_size:
+                                    self._cleanup_contract_settings_cache()
+                                
                                 self._contract_settings_cache[symbol] = {
                                     'margin_type': target_margin_type,
                                     'leverage': target_leverage,
-                                    'verified': True
+                                    'verified': True,
+                                    'timestamp': time.time(),
                                 }
                                 return True
                         except Exception as lev_e:

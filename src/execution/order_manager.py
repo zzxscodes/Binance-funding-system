@@ -45,6 +45,7 @@ class OrderManager:
         # 订单状态跟踪
         self.pending_orders: Dict[str, Dict] = {}  # order_id -> order_info
         self.completed_orders: List[Dict] = []
+        self.completed_orders_max_size = config.get('execution.order_manager.completed_orders_max_size', 1000)
         
         # 并发控制：限制同时执行的订单数量，避免API限流
         # Binance API限制：每分钟最多1200个请求，每个订单需要多个请求
@@ -214,6 +215,9 @@ class OrderManager:
                     }
                     if child_status == 'FILLED':
                         self.completed_orders.append(info)
+                        # 限制completed_orders大小，防止内存无限增长
+                        if len(self.completed_orders) > self.completed_orders_max_size:
+                            self.completed_orders = self.completed_orders[-self.completed_orders_max_size:]
                     else:
                         self.pending_orders[str(child_order_id)] = info
                     tracked.append(info)
@@ -409,8 +413,13 @@ class OrderManager:
         # 使用简单的缓存（可以扩展为更复杂的缓存机制）
         if not hasattr(self, '_symbol_info_cache'):
             self._symbol_info_cache: Dict[str, Dict] = {}
+            self._symbol_info_cache_max_size = config.get('execution.order_manager.symbol_info_cache_max_size', 500)
+            self._symbol_info_cache_access_time: Dict[str, float] = {}
         
         if symbol in self._symbol_info_cache:
+            # 更新访问时间
+            import time
+            self._symbol_info_cache_access_time[symbol] = time.time()
             return self._symbol_info_cache[symbol]
         
         try:
@@ -454,7 +463,26 @@ class OrderManager:
                         'min_notional': min_notional,
                     }
                     
+                    # 检查缓存大小，如果超过限制则清理最久未访问的
+                    import time
+                    current_time = time.time()
+                    if len(self._symbol_info_cache) >= self._symbol_info_cache_max_size:
+                        # LRU清理：删除最久未访问的，直到满足限制
+                        sorted_symbols = sorted(
+                            self._symbol_info_cache_access_time.items(),
+                            key=lambda x: x[1]
+                        )
+                        # 删除最旧的，直到满足限制（保留最新的N个）
+                        to_remove = len(sorted_symbols) - self._symbol_info_cache_max_size + 1
+                        to_remove = max(1, to_remove)  # 至少删除1个
+                        for sym, _ in sorted_symbols[:to_remove]:
+                            if sym in self._symbol_info_cache:
+                                del self._symbol_info_cache[sym]
+                            if sym in self._symbol_info_cache_access_time:
+                                del self._symbol_info_cache_access_time[sym]
+                    
                     self._symbol_info_cache[symbol] = info
+                    self._symbol_info_cache_access_time[symbol] = current_time
                     return info
             
             # 如果没有找到，返回默认值
@@ -499,7 +527,29 @@ class OrderManager:
                 raise ValueError("Missing config key: execution.order.default_min_notional")
             if not hasattr(self, '_symbol_info_cache'):
                 self._symbol_info_cache = {}
+                self._symbol_info_cache_max_size = config.get('execution.order_manager.symbol_info_cache_max_size', 500)
+                self._symbol_info_cache_access_time = {}
+            
+            # 检查缓存大小，如果超过限制则清理最久未访问的
+            import time
+            current_time = time.time()
+            if len(self._symbol_info_cache) >= self._symbol_info_cache_max_size:
+                # LRU清理：删除最久未访问的，直到满足限制
+                sorted_symbols = sorted(
+                    self._symbol_info_cache_access_time.items(),
+                    key=lambda x: x[1]
+                )
+                # 删除最旧的，直到满足限制（保留最新的N个）
+                to_remove = len(sorted_symbols) - self._symbol_info_cache_max_size + 1
+                to_remove = max(1, to_remove)  # 至少删除1个
+                for sym, _ in sorted_symbols[:to_remove]:
+                    if sym in self._symbol_info_cache:
+                        del self._symbol_info_cache[sym]
+                    if sym in self._symbol_info_cache_access_time:
+                        del self._symbol_info_cache_access_time[sym]
+            
             self._symbol_info_cache[symbol] = default_info
+            self._symbol_info_cache_access_time[symbol] = current_time
             return default_info
     
     async def normalize_orders(self, orders: List[Dict]) -> List[Dict]:
