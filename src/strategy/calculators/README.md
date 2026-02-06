@@ -63,6 +63,10 @@ CALCULATOR_INSTANCE = YourFactorCalculator()
 
 ### AlphaDataView API
 
+`AlphaDataView`提供了两种数据访问方式：
+
+#### 1. 访问已加载的快照数据（推荐）
+
 ```python
 # 遍历所有交易对
 for sym in view.iter_symbols():
@@ -74,6 +78,41 @@ for sym in view.iter_symbols():
     tran_df = view.get_tran_stats(sym, tail=100)  # 最近100根
     # 列包括：open_time, buy_dolvol4, sell_dolvol4, ...
 ```
+
+#### 2. 通过view访问数据API（获取指定时间范围的数据）
+
+`AlphaDataView`提供了与`StrategyAPI`相同的数据访问接口，可以直接通过`view`参数访问：
+
+```python
+def run(self, view: AlphaDataView) -> Dict[str, float]:
+    # 获取多周期bar数据
+    bars_5min = view.get_bar_between('2025-01-01-000', '2025-01-02-000', mode='5min')
+    bars_1h = view.get_bar_between('2025-01-01-000', '2025-01-02-000', mode='1h')
+    
+    # 获取多周期tran_stats数据
+    tran_stats_5min = view.get_tran_stats_between('2025-01-01-000', '2025-01-02-000', mode='5min')
+    
+    # 获取溢价指数K线
+    premium_index = view.get_premium_index_bar_between('2025-01-01-000', '2025-01-02-000', mode='5min')
+    
+    # 获取资金费率
+    funding_rates = view.get_funding_rate_between('2025-01-01-000', '2025-01-02-000')
+    
+    # 获取Universe（可交易资产列表）
+    universe = view.get_last_universe(version='v1')  # 获取最新的
+    universe_by_date = view.get_universe(date='2025-01-01', version='v1')  # 按日期获取
+    
+    # 处理数据...
+    return weights
+```
+
+**接口说明**：
+- **时间标签格式**：`'YYYY-MM-DD-HHH'`（例如：`'2025-12-22-004'`），其中HHH为1-288（每天288个5分钟窗口）
+- **周期模式**：`mode='5min'`（默认）、`'1h'`、`'4h'`、`'8h'`、`'12h'`、`'24h'`
+- **Universe版本**：`version='v1'`（默认）、`'v2'`等
+- **返回格式**：`{'btc-usdt': DataFrame, 'eth-usdt': DataFrame, ...}`
+
+这些接口与`StrategyAPI`完全一致，确保Calculator可以访问所有需要的数据。
 
 ### 数据格式
 

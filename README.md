@@ -180,9 +180,14 @@ class YourFactorCalculator(AlphaCalculatorBase):
         """实现你的因子逻辑"""
         weights = {}
         for sym in view.iter_symbols():
-            # 获取数据
+            # 获取数据（从view中已有的数据）
             bar_df = view.get_bar(sym, tail=100)  # 最近100根K线
             tran_df = view.get_tran_stats(sym, tail=100)
+            
+            # 或者通过view访问数据API（获取指定时间范围的数据）
+            # bar_data = view.get_bar_between('2025-01-01-000', '2025-01-02-000', mode='5min')
+            # funding_rates = view.get_funding_rate_between('2025-01-01-000', '2025-01-02-000')
+            # universe = view.get_universe()  # 获取可交易资产列表
             
             # 计算因子
             score = your_calculation(bar_df, tran_df)
@@ -206,6 +211,45 @@ CALCULATOR_INSTANCE = YourFactorCalculator()
 - **配置选项**: 可在`config/default.yaml`中配置并发模式（thread/process/none）
 
 详细开发指南请参考：`src/strategy/calculators/README.md`
+
+#### AlphaDataView数据访问接口
+
+`AlphaDataView`提供了与`StrategyAPI`相同的数据访问接口，Calculator可以通过`view`参数直接访问：
+
+```python
+def run(self, view: AlphaDataView) -> Dict[str, float]:
+    # 访问已加载的快照数据
+    bar_df = view.get_bar(sym, tail=100)
+    tran_df = view.get_tran_stats(sym, tail=100)
+    
+    # 或者通过view访问数据API（获取指定时间范围的数据）
+    # 获取多周期bar数据
+    bars_5min = view.get_bar_between('2025-01-01-000', '2025-01-02-000', mode='5min')
+    bars_1h = view.get_bar_between('2025-01-01-000', '2025-01-02-000', mode='1h')
+    
+    # 获取多周期tran_stats数据
+    tran_stats_5min = view.get_tran_stats_between('2025-01-01-000', '2025-01-02-000', mode='5min')
+    
+    # 获取溢价指数K线
+    premium_index = view.get_premium_index_bar_between('2025-01-01-000', '2025-01-02-000', mode='5min')
+    
+    # 获取资金费率
+    funding_rates = view.get_funding_rate_between('2025-01-01-000', '2025-01-02-000')
+    
+    # 获取Universe（支持版本）
+    universe = view.get_last_universe(version='v1')
+    universe_by_date = view.get_universe(date='2025-01-01', version='v1')
+    
+    return weights
+```
+
+**接口说明**：
+- 时间标签格式：`'YYYY-MM-DD-HHH'`（例如：`'2025-12-22-004'`），其中HHH为1-288（每天288个5分钟窗口）
+- 周期模式：`mode='5min'`（默认）、`'1h'`、`'4h'`、`'8h'`、`'12h'`、`'24h'`
+- Universe版本：`version='v1'`（默认）、`'v2'`等
+- 返回格式：`{'btc-usdt': DataFrame, 'eth-usdt': DataFrame, ...}`
+
+这些接口与`StrategyAPI`完全一致，确保Calculator可以访问所有需要的数据。
 
 ### 使用StrategyAPI（已废弃，推荐使用Calculators架构）
 
@@ -321,7 +365,7 @@ long-short-infra/
 │   │   └── api.py            # 数据查询API
 │   ├── strategy/             # 策略层：计算、持仓生成
 │   │   ├── alpha.py         # Alpha引擎：并发执行calculators
-│   │   ├── calculator.py     # Calculator基类和工具
+│   │   ├── calculator.py     # Calculator基类和AlphaDataView（提供数据访问接口）
 │   │   ├── calculators/      # Calculators（因子）目录
 │   │   │   ├── __init__.py  # 自动加载机制
 │   │   │   ├── template.py  # 开发模板
@@ -378,3 +422,4 @@ long-short-infra/
 - ✅ **Transtats阈值转换**: 人民币阈值自动转换为USD
 - ✅ **多因子架构**: 支持多研究员独立开发calculators（因子），系统自动发现、并发执行并求和
 - ✅ **因子并发执行**: 默认使用线程池并发执行所有calculators，提升计算性能
+- ✅ **AlphaDataView数据访问接口**: AlphaDataView现在提供与StrategyAPI相同的数据访问接口，Calculator可以通过view参数直接访问所有数据API，包括get_bar_between、get_tran_stats_between、get_funding_rate_between、get_premium_index_bar_between、get_universe等
