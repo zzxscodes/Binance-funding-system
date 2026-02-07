@@ -66,6 +66,25 @@ class DataLayerProcess:
         # 用于批量保存trades数据的缓冲区
         # 格式: {symbol: [trade1, trade2, ...]}
         self.trades_buffer: Dict[str, List[dict]] = {}
+    
+    def _add_task_with_error_handler(self, task: asyncio.Task, task_name: str):
+        """添加任务并设置异常处理回调"""
+        def task_done_callback(t: asyncio.Task):
+            try:
+                exception = t.exception()
+                if exception:
+                    logger.error(f"Task '{task_name}' failed with exception: {exception}", exc_info=exception)
+                    # 如果关键任务失败，记录错误但不终止进程
+                    if task_name in ['collector', 'kline_aggregator']:
+                        logger.critical(f"Critical task '{task_name}' failed, process may be unstable")
+            except asyncio.CancelledError:
+                # 任务被取消是正常的，不需要记录
+                pass
+            except Exception as e:
+                logger.error(f"Error in task done callback for '{task_name}': {e}", exc_info=True)
+        
+        task.add_done_callback(task_done_callback)
+        self.tasks.add(task)
         self.trades_buffer_max_size = config.get('data.trades_buffer_max_size', 1000)  # 每个symbol最多缓存条数
         self.trades_buffer_total_max_size = config.get('data.trades_buffer_total_max_size', 100000)  # 所有symbol的总缓冲区大小限制
         
@@ -487,7 +506,7 @@ class DataLayerProcess:
         # 2. 启动Universe管理器的定时更新（dry-run模式下MockUniverseManager不需要定时更新）
         if not self.is_mock_mode:
             universe_task = asyncio.create_task(self.universe_manager.start())
-            self.tasks.add(universe_task)
+            self._add_task_with_error_handler(universe_task, "universe_manager")
         else:
             # dry-run模式下，MockUniverseManager的start()只是设置标志
             await self.universe_manager.start()
@@ -529,18 +548,18 @@ class DataLayerProcess:
                 logger.info(f"Started trade collector for {len(symbols)} symbols (connecting to WebSocket)")
             
             collector_task = asyncio.create_task(self.collector.start())
-            self.tasks.add(collector_task)
+            self._add_task_with_error_handler(collector_task, "collector")
         else:
             logger.error("No symbols to collect")
             return
         
         # 7. 启动定期保存任务
         save_task = asyncio.create_task(self._periodic_save())
-        self.tasks.add(save_task)
+        self._add_task_with_error_handler(save_task, "periodic_save")
         
         # 8. 启动符号更新任务
         symbol_update_task = asyncio.create_task(self._update_symbols())
-        self.tasks.add(symbol_update_task)
+        self._add_task_with_error_handler(symbol_update_task, "update_symbols")
         
         # 9. 初始化资金费率采集器（非mock模式）
         if not self.is_mock_mode:
@@ -550,7 +569,7 @@ class DataLayerProcess:
             logger.info(f"Funding rate collector initialized with API: {api_base}")
             # 启动资金费率采集任务
             funding_rate_task = asyncio.create_task(self._periodic_collect_funding_rates())
-            self.tasks.add(funding_rate_task)
+            self._add_task_with_error_handler(funding_rate_task, "funding_rate_collector")
             # 立即执行一次初始采集
             asyncio.create_task(self._collect_funding_rates_initial())
         
@@ -559,14 +578,14 @@ class DataLayerProcess:
             self.premium_index_collector = get_premium_index_collector()
             # 启动溢价指数K线采集任务
             premium_index_task = asyncio.create_task(self._periodic_collect_premium_index())
-            self.tasks.add(premium_index_task)
+            self._add_task_with_error_handler(premium_index_task, "premium_index_collector")
             # 立即执行一次初始采集
             asyncio.create_task(self._collect_premium_index_initial())
         
         # 11. 启动数据完整性检查和自动补全任务（每1小时检查一次）
         if not self.is_mock_mode:
             data_integrity_task = asyncio.create_task(self._check_and_complete_data())
-            self.tasks.add(data_integrity_task)
+            self._add_task_with_error_handler(data_integrity_task, "data_integrity_check")
         
         logger.info("Data layer process started successfully")
     
@@ -1000,11 +1019,12 @@ class DataLayerProcess:
 async def main():
     """主函数"""
     process = DataLayerProcess()
+    shutdown_event = asyncio.Event()
     
-    # 信号处理
+    # 信号处理 - 使用事件而不是直接创建任务
     def signal_handler(sig, frame):
         logger.info(f"Received signal {sig}, shutting down...")
-        asyncio.create_task(process.stop())
+        shutdown_event.set()
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -1012,23 +1032,57 @@ async def main():
     try:
         await process.start()
         
-        # 保持运行
+        # 保持运行，同时监听关闭事件
         while process.running:
-            await asyncio.sleep(1)
-            # 定期打印统计（每5分钟）
-            if hasattr(process, 'last_stats_time'):
-                if asyncio.get_event_loop().time() - process.last_stats_time > 300:
-                    process.print_stats()
+            try:
+                # 使用wait_for来同时等待sleep和shutdown事件
+                done, pending = await asyncio.wait(
+                    [
+                        asyncio.create_task(asyncio.sleep(1)),
+                        asyncio.create_task(shutdown_event.wait())
+                    ],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # 取消未完成的任务
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                
+                # 如果收到关闭信号，退出循环
+                if shutdown_event.is_set():
+                    logger.info("Shutdown signal received, stopping...")
+                    break
+                
+                # 定期打印统计（每5分钟）
+                if hasattr(process, 'last_stats_time'):
+                    if asyncio.get_event_loop().time() - process.last_stats_time > 300:
+                        process.print_stats()
+                        process.last_stats_time = asyncio.get_event_loop().time()
+                else:
                     process.last_stats_time = asyncio.get_event_loop().time()
-            else:
-                process.last_stats_time = asyncio.get_event_loop().time()
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}", exc_info=True)
+                # 出错后等待1秒再继续，避免快速循环
+                await asyncio.sleep(1)
         
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt")
     except Exception as e:
         logger.error(f"Data layer process error: {e}", exc_info=True)
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
     finally:
-        await process.stop()
+        try:
+            await process.stop()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
