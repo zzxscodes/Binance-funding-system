@@ -76,7 +76,12 @@ class DataLayerProcess:
                     logger.error(f"Task '{task_name}' failed with exception: {exception}", exc_info=exception)
                     # 如果关键任务失败，记录错误但不终止进程
                     if task_name in ['collector', 'kline_aggregator']:
-                        logger.critical(f"Critical task '{task_name}' failed, process may be unstable")
+                        logger.critical(
+                            f"Critical task '{task_name}' failed, process may be unstable. "
+                            f"Exception: {exception}. This may cause data collection to stop."
+                        )
+                        # 记录进程状态以便调试
+                        logger.critical(f"Process running state: {self.running}, Active tasks count: {len(self.tasks)}")
             except asyncio.CancelledError:
                 # 任务被取消是正常的，不需要记录
                 pass
@@ -1033,7 +1038,9 @@ async def main():
         await process.start()
         
         # 保持运行，同时监听关闭事件
+        loop_iteration = 0
         while process.running:
+            loop_iteration += 1
             try:
                 # 使用wait_for来同时等待sleep和shutdown事件
                 done, pending = await asyncio.wait(
@@ -1044,6 +1051,18 @@ async def main():
                     return_when=asyncio.FIRST_COMPLETED
                 )
                 
+                # 处理已完成的任务（检查是否有异常）
+                for task in done:
+                    try:
+                        # 获取任务结果，如果有异常会在这里抛出
+                        task.result()
+                    except asyncio.CancelledError:
+                        # 任务被取消是正常的
+                        pass
+                    except Exception as e:
+                        # 记录任务中的异常，但不终止主循环
+                        logger.error(f"Error in main loop task: {e}", exc_info=True)
+                
                 # 取消未完成的任务
                 for task in pending:
                     task.cancel()
@@ -1051,6 +1070,9 @@ async def main():
                         await task
                     except asyncio.CancelledError:
                         pass
+                    except Exception as e:
+                        # 记录取消任务时的异常
+                        logger.error(f"Error cancelling task in main loop: {e}", exc_info=True)
                 
                 # 如果收到关闭信号，退出循环
                 if shutdown_event.is_set():
@@ -1066,11 +1088,27 @@ async def main():
                     process.last_stats_time = asyncio.get_event_loop().time()
                     
             except asyncio.CancelledError:
+                logger.info("Main loop cancelled")
                 break
             except Exception as e:
-                logger.error(f"Error in main loop: {e}", exc_info=True)
+                logger.error(f"Error in main loop (iteration {loop_iteration}): {e}", exc_info=True)
                 # 出错后等待1秒再继续，避免快速循环
                 await asyncio.sleep(1)
+        
+        # 如果循环退出，记录原因和详细信息
+        if not process.running:
+            logger.info("Main loop exited because process.running is False")
+        else:
+            logger.warning("Main loop exited but process.running is still True - this should not happen")
+            # 记录更多调试信息
+            logger.warning(f"Active tasks count: {len(process.tasks)}")
+            logger.warning(f"Shutdown event is set: {shutdown_event.is_set()}")
+            # 检查关键组件状态
+            if process.collector:
+                collector_running = getattr(process.collector, 'running', None)
+                logger.warning(f"Collector running state: {collector_running}")
+            if process.kline_aggregator:
+                logger.warning("Kline aggregator exists")
         
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt")
