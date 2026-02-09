@@ -107,7 +107,15 @@ class BacktestExecutor:
         self._slippage = config.slippage
 
         # Execution method selector (shared with live execution)
-        self.method_selector = ExecutionMethodSelector(config)
+        # 使用配置适配器，合并BacktestConfig和全局config
+        from .config_adapter import BacktestConfigAdapter
+        config_adapter = BacktestConfigAdapter(config)
+        self.method_selector = ExecutionMethodSelector(config_adapter)
+        
+        # 资金费率数据（从存储加载）
+        self._funding_rates_cache: Dict[str, pd.DataFrame] = {}
+        self._last_funding_rate_apply_time: Dict[str, datetime] = {}
+        self._load_funding_rates()
 
         # Scheduled child orders for TWAP/VWAP (executed across future bars)
         self._scheduled_orders: List[Dict] = []
@@ -173,6 +181,9 @@ class BacktestExecutor:
 
                 # Execute any scheduled child orders (TWAP/VWAP) due at this timestamp
                 self._execute_scheduled_orders(timestamp)
+                
+                # Apply funding rates (every 8 hours)
+                self._apply_funding_rates(timestamp)
 
                 portfolio_state = self._get_portfolio_state()
 
@@ -321,6 +332,8 @@ class BacktestExecutor:
             if price <= 0:
                 continue
 
+            # 应用杠杆：在计算notional时应用杠杆，使可用资金放大
+            # 例如：10000 USDT余额，20倍杠杆，可用资金 = 10000 * 20 = 200000 USDT
             target_notional = abs(weight) * available_balance * self.config.leverage
             quantity = target_notional / price
 
@@ -514,7 +527,8 @@ class BacktestExecutor:
             return SymbolFeatures()
         features_cfg = ms_cfg.get('features')
         if not features_cfg or not isinstance(features_cfg, dict):
-            raise ValueError("Missing config section: execution.method_selection.features")
+            # 如果配置缺失，返回空的SymbolFeatures（而不是抛出异常）
+            return SymbolFeatures()
         min_bars = features_cfg.get('min_bars')
         lookback_days = features_cfg.get('lookback_days')
         if min_bars is None or lookback_days is None:
@@ -754,6 +768,106 @@ class BacktestExecutor:
         pos = self.order_engine.positions.get(trade.symbol, {'quantity': 0.0})
         if pos:
             trade.pnl = pos.get('realized_pnl', 0.0)
+    
+    def _load_funding_rates(self):
+        """加载资金费率数据"""
+        try:
+            from ..data.storage import get_data_storage
+            storage = get_data_storage()
+            
+            for symbol in self.config.symbols:
+                try:
+                    funding_rates_df = storage.load_funding_rates(
+                        symbol=symbol,
+                        start_date=self.replay_engine.start_date,
+                        end_date=self.replay_engine.end_date
+                    )
+                    if not funding_rates_df.empty and 'fundingRate' in funding_rates_df.columns:
+                        self._funding_rates_cache[symbol] = funding_rates_df
+                        logger.debug(f"Loaded {len(funding_rates_df)} funding rate records for {symbol}")
+                except Exception as e:
+                    logger.warning(f"Failed to load funding rates for {symbol}: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to load funding rates: {e}")
+    
+    def _get_funding_rate(self, symbol: str, timestamp: datetime) -> Optional[float]:
+        """获取指定时间点的资金费率"""
+        if symbol not in self._funding_rates_cache:
+            return None
+        
+        df = self._funding_rates_cache[symbol]
+        if df.empty or 'fundingTime' not in df.columns or 'fundingRate' not in df.columns:
+            return None
+        
+        # 找到时间戳之前最近的一次资金费率
+        df['fundingTime'] = pd.to_datetime(df['fundingTime'])
+        before_timestamp = df[df['fundingTime'] <= timestamp]
+        
+        if not before_timestamp.empty:
+            latest = before_timestamp.sort_values('fundingTime').iloc[-1]
+            return float(latest['fundingRate'])
+        
+        # 如果没有之前的数据，使用之后最近的一次
+        after_timestamp = df[df['fundingTime'] > timestamp]
+        if not after_timestamp.empty:
+            earliest = after_timestamp.sort_values('fundingTime').iloc[0]
+            return float(earliest['fundingRate'])
+        
+        return None
+    
+    def _apply_funding_rates(self, timestamp: datetime):
+        """应用资金费率（每8小时一次）"""
+        # 资金费率每8小时收取一次（00:00, 08:00, 16:00 UTC）
+        funding_hours = [0, 8, 16]
+        current_hour = timestamp.hour
+        
+        # 检查是否是资金费率收取时间
+        if current_hour not in funding_hours:
+            return
+        
+        # 检查是否已经在这个小时应用过（避免重复应用）
+        for symbol in self.order_engine.positions.keys():
+            last_apply_time = self._last_funding_rate_apply_time.get(symbol)
+            if last_apply_time and last_apply_time.date() == timestamp.date() and last_apply_time.hour == current_hour:
+                continue
+            
+            pos_data = self.order_engine.positions.get(symbol)
+            if not pos_data or abs(pos_data['quantity']) < 1e-8:
+                continue
+            
+            # 获取资金费率
+            funding_rate = self._get_funding_rate(symbol, timestamp)
+            if funding_rate is None:
+                continue
+            
+            # 计算持仓市值
+            current_price = self._current_prices.get(symbol, pos_data.get('entry_price', 0))
+            if current_price <= 0:
+                continue
+            
+            position_value = abs(pos_data['quantity']) * current_price
+            
+            # 计算资金费率成本
+            # 资金费率：多仓支付费率，空仓收取费率（如果费率为正）
+            # 如果费率为正：多仓支付，空仓收取
+            # 如果费率为负：多仓收取，空仓支付
+            position_qty = pos_data['quantity']
+            if position_qty > 0:  # 多仓
+                funding_cost = position_value * funding_rate
+            else:  # 空仓
+                funding_cost = -position_value * funding_rate  # 空仓方向相反
+            
+            # 从余额中扣除资金费率成本
+            self.order_engine.balance -= funding_cost
+            
+            # 记录应用时间
+            self._last_funding_rate_apply_time[symbol] = timestamp
+            
+            logger.debug(
+                f"Applied funding rate for {symbol} at {timestamp}: "
+                f"rate={funding_rate:.6f}, cost={funding_cost:.4f} USDT, "
+                f"position_value={position_value:.2f} USDT"
+            )
 
     def _close_all_positions(self):
         """平仓所有持仓"""

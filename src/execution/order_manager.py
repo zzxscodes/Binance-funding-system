@@ -961,11 +961,10 @@ class OrderManager:
             # 获取杠杆倍数（从配置或账户信息）
             leverage = config.get('execution.contract_settings.leverage', 20)
             
-            # 计算可用于交易的金额（考虑杠杆）
-            # 注意：这里使用total_balance * leverage，但实际可用金额可能受保证金要求限制
-            # 为了安全，我们使用total_balance而不是total_balance * leverage
-            # 因为杠杆已经在下单时通过合约设置应用了
-            available_capital = total_balance
+            # 计算可用于交易的金额（应用杠杆）
+            # 例如：10000 USDT余额，20倍杠杆，可用资金 = 10000 * 20 = 200000 USDT
+            # 这样可以用更少的资金持有更大的仓位
+            available_capital = total_balance * leverage
             
             # 归一化权重：计算总权重（绝对值之和），然后归一化
             total_weight = sum(abs(w) for w in target_positions.values())
