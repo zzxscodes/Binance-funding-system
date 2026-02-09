@@ -206,11 +206,12 @@ class OrderEngine:
     - 市场冲击模拟
     """
 
-    def __init__(self, initial_balance: float = 100000.0, taker_fee: float = 0.0004, maker_fee: float = 0.0002):
+    def __init__(self, initial_balance: float = 100000.0, taker_fee: float = 0.0004, maker_fee: float = 0.0002, leverage: float = 1.0):
         self.initial_balance = initial_balance
         self.balance = initial_balance
         self.taker_fee = taker_fee
         self.maker_fee = maker_fee
+        self.leverage = leverage  # 杠杆倍数，用于计算保证金要求
 
         self.orders: Dict[str, Order] = {}
         self.trades: List[Trade] = []
@@ -387,12 +388,28 @@ class OrderEngine:
             order.status = OrderStatus.FILLED if remaining == 0 else OrderStatus.PARTIALLY_FILLED
             order.filled_at = self._current_time
 
+            # 在更新持仓之前，检查是开仓还是平仓
+            pos = self.positions[order.symbol]
+            existing_qty = pos.get('quantity', 0.0)
+            is_opening = (existing_qty == 0) or \
+                        (existing_qty > 0 and order.side == OrderSide.BUY) or \
+                        (existing_qty < 0 and order.side == OrderSide.SELL)
+            
             self._update_position(order, avg_price, filled_qty)
-
-            if order.side == OrderSide.BUY:
-                self.balance -= total_cost
+            
+            # 在杠杆交易中，扣除的是保证金（margin = notional / leverage），而不是全额
+            notional = filled_qty * avg_price
+            margin_amount = notional / max(self.leverage, 1.0)
+            
+            if is_opening:
+                # 开仓：扣除保证金
+                self.balance -= (margin_amount + commission)
             else:
-                self.balance += total_cost
+                # 平仓：释放之前占用的保证金，盈亏已在_update_position中计算
+                # 释放的保证金 = 平仓数量对应的保证金
+                released_margin = margin_amount
+                # 平仓时，盈亏已经反映在realized_pnl中，这里只需要释放保证金
+                self.balance += released_margin - commission
 
             logger.debug(f"Market order filled: {order.symbol} {order.side} {filled_qty} @ {avg_price}")
         else:
@@ -455,14 +472,26 @@ class OrderEngine:
         )
         self.trades.append(trade)
 
+        # 在更新持仓之前，检查是开仓还是平仓
+        pos = self.positions[order.symbol]
+        existing_qty = pos.get('quantity', 0.0)
+        is_opening = (existing_qty == 0) or \
+                    (existing_qty > 0 and order.side == OrderSide.BUY) or \
+                    (existing_qty < 0 and order.side == OrderSide.SELL)
+        
         self._update_position(order, exec_price, remaining)
-
-        if order.side == OrderSide.BUY:
-            cost = remaining * exec_price + commission
-            self.balance -= cost
+        
+        # 在杠杆交易中，扣除的是保证金（margin = notional / leverage），而不是全额
+        notional = remaining * exec_price
+        margin_amount = notional / max(self.leverage, 1.0)
+        
+        if is_opening:
+            # 开仓：扣除保证金
+            self.balance -= (margin_amount + commission)
         else:
-            revenue = remaining * exec_price - commission
-            self.balance += revenue
+            # 平仓：释放之前占用的保证金，盈亏已在_update_position中计算
+            released_margin = margin_amount
+            self.balance += released_margin - commission
 
         logger.debug(f"Limit order filled: {order.symbol} {order.side} {remaining} @ {exec_price}")
 

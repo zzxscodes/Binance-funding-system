@@ -92,6 +92,7 @@ class BacktestExecutor:
         self.order_engine = OrderEngine(
             initial_balance=config.initial_balance,
             taker_fee=config.taker_fee,
+            leverage=config.leverage,
             maker_fee=config.maker_fee
         )
 
