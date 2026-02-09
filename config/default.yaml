@@ -108,12 +108,13 @@ strategy:
     #   - "模块名" (如 "mean_buy_dolvol4_over_dolvol_rank")
     #   - "完整模块路径" (如 "src.strategy.calculators.researcher1_factor1")
     enabled:
+      - "mock_test_calculator"
     #  - "mean_buy_dolvol4_over_dolvol_rank"
 
 
 execution:
   # 执行模式: 'testnet' (测试网), 'mock' (模拟), 'live' (实盘)
-  mode: live  # 可选: testnet, mock, live
+  mode: mock  # 可选: testnet, mock, live
   
   # dry-run开关：所有模式都可以启用dry-run
   # 启用后，即使使用真实API，也不会产生真实订单（使用test_order endpoint）
@@ -186,6 +187,11 @@ execution:
       enabled: true  # 启用VWAP（适合大订单，利用成交量分布）
     twap:
       enabled: true  # 启用TWAP（适合大订单，分散执行时间）
+    
+    # 特征计算配置（用于动态选择执行方式）
+    features:
+      lookback_days: 5  # 回看天数（用于计算历史特征）
+      min_bars: 288  # 最小K线数量（用于计算波动率等特征，288 = 1天的5分钟K线）
     
     # 风险控制：达到阈值时取消所有订单并停止
     risk_control:
@@ -328,8 +334,3 @@ storage:
   max_retries: 3  # 存储操作最大重试次数
   retry_delay: 0.5  # 存储重试延迟（秒）
   retry_delay_multiplier: 2.0  # 重试延迟倍数（指数退避）
-
-
-
-
-

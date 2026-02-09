@@ -538,15 +538,34 @@ class DataStorage:
         self._save_dataframe_polars(df, file_path)
 
     def _save_dataframe_polars(self, df: pl.DataFrame, file_path: Path):
-        """使用Polars保存DataFrame到文件（比pandas快3-5倍）"""
+        """使用Polars保存DataFrame到文件（比pandas快3-5倍）
+        
+        使用临时文件+原子替换的方式，避免文件写入过程中被中断导致文件损坏
+        """
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 使用临时文件，写入完成后再原子替换，避免文件损坏
+        tmp_path = file_path.with_suffix(file_path.suffix + f".{os.getpid()}.tmp")
 
-        if self.storage_format == "parquet":
-            # Polars直接写入Parquet，比pandas快
-            df.write_parquet(file_path, compression="snappy")
-        else:
-            # CSV格式
-            df.write_csv(file_path)
+        try:
+            if self.storage_format == "parquet":
+                # 写入临时文件
+                df.write_parquet(tmp_path, compression="snappy")
+                # 原子替换（Windows上使用os.replace，Linux上也是原子操作）
+                # os.replace是原子操作，可以避免文件写入过程中被中断导致文件损坏
+                os.replace(str(tmp_path), str(file_path))
+            else:
+                # CSV格式也使用临时文件
+                df.write_csv(tmp_path)
+                os.replace(str(tmp_path), str(file_path))
+        except Exception as e:
+            # 如果写入失败，清理临时文件
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            raise
 
     def _load_dataframe_polars(self, file_path: Path) -> pl.DataFrame:
         """使用Polars从文件加载DataFrame（比pandas快）"""

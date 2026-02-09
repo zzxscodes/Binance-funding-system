@@ -95,6 +95,12 @@ class AlphaEngine:
         with self.performance_monitor.measure('alpha_engine', 'fetch_bar_data', {'mode': mode, 'symbols_count': len(symbols) if symbols else 0}):
             bar_data = self.data_api.get_bar_between(begin_label, end_label, mode=mode)
         
+        logger.debug(f"AlphaEngine: get_bar_between returned {len(bar_data)} symbols: {list(bar_data.keys())[:5]}")
+        if bar_data:
+            sample_symbol = list(bar_data.keys())[0]
+            sample_df = bar_data[sample_symbol]
+            logger.debug(f"AlphaEngine: Sample symbol {sample_symbol} has {len(sample_df)} rows")
+        
         with self.performance_monitor.measure('alpha_engine', 'fetch_tran_stats_data', {'mode': mode, 'symbols_count': len(symbols) if symbols else 0}):
             tran_stats_data = self.data_api.get_tran_stats_between(begin_label, end_label, mode=mode)
 
@@ -103,8 +109,10 @@ class AlphaEngine:
             # DataAPI返回的键是系统交易对格式（例如 btc-usdt）。
             # 触发符号可能是 BTCUSDT / btc-usdt 等。
             symbol_set = {to_system_symbol(s) for s in symbols}
+            logger.debug(f"AlphaEngine: Filtering data for {len(symbol_set)} symbols: {list(symbol_set)[:5]}")
             bar_data = {k: v for k, v in bar_data.items() if k in symbol_set}
             tran_stats_data = {k: v for k, v in tran_stats_data.items() if k in symbol_set}
+            logger.debug(f"AlphaEngine: After filtering - {len(bar_data)} symbols in bar_data, {len(tran_stats_data)} in tran_stats")
 
         # 基础共享视图：默认不复制
         return AlphaDataView(bar_data=bar_data, tran_stats=tran_stats_data, symbols=symbol_set, copy_on_read=False)

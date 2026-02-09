@@ -41,6 +41,7 @@ class MockKlineGenerator:
     ) -> pd.DataFrame:
         """
         生成模拟K线数据（使用几何布朗运动）
+        生成与系统期望一致的51列K线数据
         
         Args:
             symbol: 交易对
@@ -52,17 +53,19 @@ class MockKlineGenerator:
             trend: 趋势系数（日收益率）
         
         Returns:
-            包含K线数据的DataFrame
+            包含K线数据的DataFrame（51列，与系统期望格式一致）
         """
+        from ..common.utils import format_symbol
+        
+        # 格式化symbol为大写格式（与storage和kline_aggregator一致）
+        formatted_symbol = format_symbol(symbol)
+        
         # 计算时间步数
         interval_seconds = interval_minutes * 60
         start_ts = start_date.timestamp()
         end_ts = end_date.timestamp()
         total_seconds = end_ts - start_ts
         num_klines = int(total_seconds / interval_seconds) + 1
-        
-        # 生成时间戳
-        timestamps = [start_date + timedelta(seconds=i * interval_seconds) for i in range(num_klines)]
         
         # 使用几何布朗运动生成价格
         # dS = μS*dt + σS*dW
@@ -78,10 +81,16 @@ class MockKlineGenerator:
             new_price = max(prices[-1] + dS, initial_price * 0.5)  # 防止价格过低
             prices.append(new_price)
         
-        # 为每根K线生成OHLCV数据
+        # 为每根K线生成完整的OHLCV数据（51列）
         kline_data = []
         
         for i in range(num_klines):
+            # 计算时间窗口
+            window_start = start_date + timedelta(seconds=i * interval_seconds)
+            window_end = window_start + timedelta(seconds=interval_seconds)
+            window_start_ms = int(window_start.timestamp() * 1000)
+            window_end_ms = int(window_end.timestamp() * 1000)
+            
             # Open：周期开始价格
             open_price = prices[i]
             
@@ -96,32 +105,143 @@ class MockKlineGenerator:
                 close_price = open_price
             
             # High/Low
-            high = max(open_price, close_price, intra_high)
-            low = min(open_price, close_price, intra_low)
+            high_price = max(open_price, close_price, intra_high)
+            low_price = min(open_price, close_price, intra_low)
             
             # Volume（模拟成交量，与波动率相关）
             base_volume = 100 * initial_price  # 基础成交量
             volatility_factor = 1 + abs(np.random.normal(0, 0.5))
             volume = base_volume * volatility_factor
             
-            # Quote asset volume（USDT成交额）
-            quote_asset_volume = close_price * volume
+            # Quote volume（USDT成交额）
+            quote_volume = close_price * volume
             
+            # Trade count（模拟交易笔数）
+            trade_count = max(1, int(volume / 1000))
+            
+            # Buy/Sell volume（模拟买卖量，假设买卖比例在40%-60%之间）
+            buy_ratio = np.random.uniform(0.4, 0.6)
+            buy_volume = volume * buy_ratio
+            sell_volume = volume * (1 - buy_ratio)
+            buy_dolvol = quote_volume * buy_ratio
+            sell_dolvol = quote_volume * (1 - buy_ratio)
+            buy_trade_count = max(1, int(trade_count * buy_ratio))
+            sell_trade_count = max(1, trade_count - buy_trade_count)
+            
+            # VWAP（成交量加权平均价）
+            vwap = quote_volume / volume if volume > 0 else float('nan')
+            
+            # span_status: 如果有交易则为空字符串，无交易则为"NoTrade"
+            span_status = "" if trade_count > 0 else "NoTrade"
+            
+            # time_lable: 每天的第几个5分钟窗口（1-288）
+            day_start = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
+            minutes_since_midnight = (window_start - day_start).total_seconds() / 60
+            time_lable = int(minutes_since_midnight // interval_minutes) + 1
+            
+            # tran_stats字段：按金额分档统计（模拟数据，使用随机分布）
+            # 假设交易金额分布：tier1(40k以下), tier2(40k-200k), tier3(200k-1M), tier4(1M以上)
+            # 为简化，我们将总成交量按比例分配到各个档位
+            tier1_ratio = np.random.uniform(0.3, 0.5)  # 小额交易占30-50%
+            tier2_ratio = np.random.uniform(0.2, 0.3)  # 中额交易占20-30%
+            tier3_ratio = np.random.uniform(0.15, 0.25)  # 大额交易占15-25%
+            tier4_ratio = 1.0 - tier1_ratio - tier2_ratio - tier3_ratio  # 超大额交易占剩余部分
+            
+            # 归一化比例
+            total_ratio = tier1_ratio + tier2_ratio + tier3_ratio + tier4_ratio
+            tier1_ratio /= total_ratio
+            tier2_ratio /= total_ratio
+            tier3_ratio /= total_ratio
+            tier4_ratio /= total_ratio
+            
+            # Buy档位统计
+            buy_volume1 = buy_volume * tier1_ratio
+            buy_volume2 = buy_volume * tier2_ratio
+            buy_volume3 = buy_volume * tier3_ratio
+            buy_volume4 = buy_volume * tier4_ratio
+            buy_dolvol1 = buy_dolvol * tier1_ratio
+            buy_dolvol2 = buy_dolvol * tier2_ratio
+            buy_dolvol3 = buy_dolvol * tier3_ratio
+            buy_dolvol4 = buy_dolvol * tier4_ratio
+            buy_trade_count1 = max(0, int(buy_trade_count * tier1_ratio))
+            buy_trade_count2 = max(0, int(buy_trade_count * tier2_ratio))
+            buy_trade_count3 = max(0, int(buy_trade_count * tier3_ratio))
+            buy_trade_count4 = max(0, buy_trade_count - buy_trade_count1 - buy_trade_count2 - buy_trade_count3)
+            
+            # Sell档位统计
+            sell_volume1 = sell_volume * tier1_ratio
+            sell_volume2 = sell_volume * tier2_ratio
+            sell_volume3 = sell_volume * tier3_ratio
+            sell_volume4 = sell_volume * tier4_ratio
+            sell_dolvol1 = sell_dolvol * tier1_ratio
+            sell_dolvol2 = sell_dolvol * tier2_ratio
+            sell_dolvol3 = sell_dolvol * tier3_ratio
+            sell_dolvol4 = sell_dolvol * tier4_ratio
+            sell_trade_count1 = max(0, int(sell_trade_count * tier1_ratio))
+            sell_trade_count2 = max(0, int(sell_trade_count * tier2_ratio))
+            sell_trade_count3 = max(0, int(sell_trade_count * tier3_ratio))
+            sell_trade_count4 = max(0, sell_trade_count - sell_trade_count1 - sell_trade_count2 - sell_trade_count3)
+            
+            # 构建完整的K线数据（51列，与kline_aggregator生成的格式一致）
             kline_data.append({
-                'open_time': timestamps[i],
-                'open': open_price,
-                'high': high,
-                'low': low,
-                'close': close_price,
-                'volume': volume,
-                'quote_asset_volume': quote_asset_volume,
-                'number_of_trades': int(volume / 1000),
-                'taker_buy_base_asset_volume': volume * np.random.uniform(0.4, 0.6),
-                'taker_buy_quote_asset_volume': quote_asset_volume * np.random.uniform(0.4, 0.6),
+                # 基础字段
+                "symbol": formatted_symbol,
+                "open_time": window_start,
+                "close_time": window_end,
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": close_price,
+                "volume": volume,
+                "quote_volume": quote_volume,
+                "trade_count": trade_count,
+                "buy_volume": buy_volume,
+                "sell_volume": sell_volume,
+                "interval_minutes": interval_minutes,
+                # bar表字段
+                "microsecond_since_trad": window_end_ms,
+                "span_begin_datetime": window_start_ms,
+                "span_end_datetime": window_end_ms,
+                "span_status": span_status,
+                "last": close_price,
+                "vwap": vwap,
+                "dolvol": quote_volume,
+                "buydolvol": buy_dolvol,
+                "selldolvol": sell_dolvol,
+                "buyvolume": buy_volume,
+                "sellvolume": sell_volume,
+                "buytradecount": buy_trade_count,
+                "selltradecount": sell_trade_count,
+                "time_lable": time_lable,
+                # tran_stats表字段（按金额分档统计）
+                "buy_volume1": buy_volume1,
+                "buy_volume2": buy_volume2,
+                "buy_volume3": buy_volume3,
+                "buy_volume4": buy_volume4,
+                "buy_dolvol1": buy_dolvol1,
+                "buy_dolvol2": buy_dolvol2,
+                "buy_dolvol3": buy_dolvol3,
+                "buy_dolvol4": buy_dolvol4,
+                "buy_trade_count1": buy_trade_count1,
+                "buy_trade_count2": buy_trade_count2,
+                "buy_trade_count3": buy_trade_count3,
+                "buy_trade_count4": buy_trade_count4,
+                "sell_volume1": sell_volume1,
+                "sell_volume2": sell_volume2,
+                "sell_volume3": sell_volume3,
+                "sell_volume4": sell_volume4,
+                "sell_dolvol1": sell_dolvol1,
+                "sell_dolvol2": sell_dolvol2,
+                "sell_dolvol3": sell_dolvol3,
+                "sell_dolvol4": sell_dolvol4,
+                "sell_trade_count1": sell_trade_count1,
+                "sell_trade_count2": sell_trade_count2,
+                "sell_trade_count3": sell_trade_count3,
+                "sell_trade_count4": sell_trade_count4,
             })
         
         df = pd.DataFrame(kline_data)
-        logger.info(f"Generated {len(df)} klines for {symbol}")
+        logger.info(f"Generated {len(df)} klines for {symbol} with {len(df.columns)} columns")
         
         return df
     
@@ -336,10 +456,10 @@ class MockDataManager:
                 # 保存到存储
                 self.storage.save_klines(symbol=symbol, df=klines_df)
                 
-                logger.info(f"✓ Saved {len(klines_df)} klines for {symbol}")
+                logger.info(f"[OK] Saved {len(klines_df)} klines for {symbol}")
                 
             except Exception as e:
-                logger.error(f"✗ Failed to generate/save klines for {symbol}: {e}", exc_info=True)
+                logger.error(f"[ERROR] Failed to generate/save klines for {symbol}: {e}", exc_info=True)
                 raise
         
-        logger.info(f"✓ All mock data generated and saved successfully")
+        logger.info(f"[OK] All mock data generated and saved successfully")

@@ -54,6 +54,53 @@ class DataAPI:
         # 性能监控
         self.performance_monitor = get_performance_monitor()
     
+    def _ensure_cache_loaded(self, begin_time: datetime, end_time: datetime) -> bool:
+        """
+        确保缓存已加载数据，如果缓存为空则按需加载
+        
+        Args:
+            begin_time: 开始时间
+            end_time: 结束时间
+            
+        Returns:
+            bool: 如果成功加载数据返回True，否则返回False
+        """
+        # 如果缓存未初始化，尝试初始化
+        if not self._cache_initialized:
+            self.initialize_memory_cache()
+        
+        # 获取所有缓存的symbol
+        with self._cache_lock:
+            cached_symbols = list(self._memory_cache.keys())
+        
+        # 如果缓存为空，尝试按需加载数据
+        # 在mock模式下，数据可能还没有被加载到缓存中，需要从存储直接加载
+        if not cached_symbols:
+            logger.debug("Memory cache is empty, attempting to load data on-demand from storage")
+            # 尝试从universe获取symbol列表
+            try:
+                universe = self.get_universe()
+                if universe:
+                    # 计算需要加载的天数（基于时间范围）
+                    time_diff = end_time - begin_time
+                    days = max(1, int(time_diff.total_seconds() / 86400) + 1)  # 至少1天
+                    days = min(days, self.max_history_days)  # 不超过最大限制
+                    
+                    # 使用get_klines按需加载数据（这会填充缓存）
+                    logger.info(f"Loading {len(universe)} symbols from storage for {days} days (on-demand)")
+                    self.get_klines(universe, days=days, interval_minutes=5)
+                    
+                    # 重新获取缓存
+                    with self._cache_lock:
+                        cached_symbols = list(self._memory_cache.keys())
+                    logger.debug(f"Loaded {len(cached_symbols)} symbols into cache")
+                    return len(cached_symbols) > 0
+            except Exception as e:
+                logger.warning(f"Failed to load data on-demand: {e}", exc_info=True)
+                return False
+        
+        return len(cached_symbols) > 0
+    
     def get_klines(self, symbols: List[str], days: int, 
                    interval_minutes: int = 5) -> Dict[str, pd.DataFrame]:
         """
@@ -256,11 +303,22 @@ class DataAPI:
             交易对列表
         """
         try:
-            from .universe_manager import get_universe_manager
-            universe_manager = get_universe_manager()
-            symbols = list(universe_manager.load_universe(date, version))
-            logger.debug(f"Loaded universe: {len(symbols)} symbols (version: {version})")
-            return symbols
+            # 检查是否为mock模式
+            execution_mode = config.get('execution.mode', 'mock')
+            if execution_mode == 'mock':
+                # 在mock模式下使用MockUniverseManager
+                from .mock_universe_manager import MockUniverseManager
+                universe_manager = MockUniverseManager()
+                symbols = list(universe_manager.load_universe())
+                logger.debug(f"Loaded universe from MockUniverseManager: {len(symbols)} symbols")
+                return symbols
+            else:
+                # 在正常模式下使用UniverseManager
+                from .universe_manager import get_universe_manager
+                universe_manager = get_universe_manager()
+                symbols = list(universe_manager.load_universe(date, version))
+                logger.debug(f"Loaded universe: {len(symbols)} symbols (version: {version})")
+                return symbols
         except Exception as e:
             logger.error(f"Failed to get universe: {e}", exc_info=True)
             return []
@@ -591,22 +649,14 @@ class DataAPI:
                     logger.warning(f"Invalid time range: begin >= end ({begin_date_time_label} >= {end_date_time_label})")
                     return {}
                 
-                # 如果缓存未初始化，尝试初始化
-                if not self._cache_initialized:
-                    self.initialize_memory_cache()
+                # 确保缓存已加载数据
+                if not self._ensure_cache_loaded(begin_time, end_time):
+                    logger.warning("Failed to load data into cache, returning empty result")
+                    return {}
                 
                 # 获取所有缓存的symbol
                 with self._cache_lock:
                     cached_symbols = list(self._memory_cache.keys())
-                
-                # 如果缓存为空，不自动加载所有universe（避免内存泄漏）
-                # 改为按需加载：只处理请求时间范围内的数据，不预加载所有symbol
-                # 这样可以避免一次性加载530个symbol导致内存爆炸
-                if not cached_symbols:
-                    logger.debug("Memory cache is empty, will load data on-demand without pre-caching all symbols")
-                    # 不预加载，直接返回空结果或按需加载
-                    # 如果需要数据，应该先调用initialize_memory_cache()或使用get_klines()方法
-                    return {}
                 
                 result = {}
                 
@@ -723,21 +773,14 @@ class DataAPI:
                     logger.warning(f"Invalid time range: begin >= end ({begin_date_time_label} >= {end_date_time_label})")
                     return {}
                 
-                # 如果缓存未初始化，尝试初始化
-                if not self._cache_initialized:
-                    self.initialize_memory_cache()
+                # 确保缓存已加载数据
+                if not self._ensure_cache_loaded(begin_time, end_time):
+                    logger.warning("Failed to load data into cache, returning empty result")
+                    return {}
                 
                 # 获取所有缓存的symbol
                 with self._cache_lock:
                     cached_symbols = list(self._memory_cache.keys())
-                # 如果缓存为空，不自动加载所有universe（避免内存泄漏）
-                # 改为按需加载：只处理请求时间范围内的数据，不预加载所有symbol
-                # 这样可以避免一次性加载530个symbol导致内存爆炸
-                if not cached_symbols:
-                    logger.debug("Memory cache is empty, will load data on-demand without pre-caching all symbols")
-                    # 不预加载，直接返回空结果或按需加载
-                    # 如果需要数据，应该先调用initialize_memory_cache()或使用get_klines()方法
-                    return {}
                 
                 result = {}
                 
