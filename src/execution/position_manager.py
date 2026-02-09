@@ -86,32 +86,67 @@ class PositionManager:
                 if abs(diff) < 0.00001:
                     continue
                 
-                # 确定方向
-                if diff > 0:
-                    side = 'BUY'
-                    quantity = abs(diff)
+                # 检测反向开仓：当前持仓和目标持仓方向相反
+                # 在单向持仓模式下，反向开仓需要先平仓，再开仓（两个订单）
+                is_reverse = (current_pos > 0 and target_pos < 0) or (current_pos < 0 and target_pos > 0)
+                
+                if is_reverse:
+                    # 反向开仓：需要先平仓，再开仓（两个订单）
+                    # 订单1：平掉当前持仓
+                    close_quantity = abs(current_pos)
+                    close_side = 'SELL' if current_pos > 0 else 'BUY'
+                    
+                    orders.append({
+                        'symbol': format_symbol(symbol),
+                        'side': close_side,
+                        'quantity': close_quantity,
+                        'reduce_only': True,  # 平仓订单必须是reduce_only
+                        'current_position': current_pos,
+                        'target_position': 0.0,  # 平仓后目标为0
+                        'diff': -current_pos,  # 平仓的差值
+                    })
+                    
+                    # 订单2：开新方向持仓（如果目标持仓不为0）
+                    if abs(target_pos) > 1e-8:
+                        open_quantity = abs(target_pos)
+                        open_side = 'BUY' if target_pos > 0 else 'SELL'
+                        
+                        orders.append({
+                            'symbol': format_symbol(symbol),
+                            'side': open_side,
+                            'quantity': open_quantity,
+                            'reduce_only': False,  # 开仓订单不能是reduce_only
+                            'current_position': 0.0,  # 平仓后当前持仓为0
+                            'target_position': target_pos,
+                            'diff': target_pos,  # 开仓的差值
+                        })
                 else:
-                    side = 'SELL'
-                    quantity = abs(diff)
-                
-                # 判断是开仓还是平仓
-                reduce_only = False
-                if current_pos > 0 and diff < 0:
-                    # 当前多仓，目标减少 -> 平多仓
-                    reduce_only = True
-                elif current_pos < 0 and diff > 0:
-                    # 当前空仓，目标增加 -> 平空仓
-                    reduce_only = True
-                
-                orders.append({
-                    'symbol': format_symbol(symbol),
-                    'side': side,
-                    'quantity': quantity,
-                    'reduce_only': reduce_only,
-                    'current_position': current_pos,
-                    'target_position': target_pos,
-                    'diff': diff,
-                })
+                    # 正常情况：同方向调整（现有逻辑）
+                    if diff > 0:
+                        side = 'BUY'
+                        quantity = abs(diff)
+                    else:
+                        side = 'SELL'
+                        quantity = abs(diff)
+                    
+                    # 判断是开仓还是平仓
+                    reduce_only = False
+                    if current_pos > 0 and diff < 0:
+                        # 当前多仓，目标减少 -> 平多仓
+                        reduce_only = True
+                    elif current_pos < 0 and diff > 0:
+                        # 当前空仓，目标增加 -> 平空仓
+                        reduce_only = True
+                    
+                    orders.append({
+                        'symbol': format_symbol(symbol),
+                        'side': side,
+                        'quantity': quantity,
+                        'reduce_only': reduce_only,
+                        'current_position': current_pos,
+                        'target_position': target_pos,
+                        'diff': diff,
+                    })
             
             logger.info(f"Calculated {len(orders)} orders from position differences")
             return orders

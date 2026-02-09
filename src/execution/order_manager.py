@@ -950,21 +950,29 @@ class OrderManager:
                 logger.warning("Could not get account info, using target positions as quantities")
                 return target_positions
             
-            # 获取账户权益（使用totalWalletBalance或totalMarginBalance）
+            # 获取账户权益（用于日志和监控）
             total_balance = float(account_info.get('totalWalletBalance', 0) or 
                                  account_info.get('totalMarginBalance', 0) or 0)
             
-            if total_balance <= 0:
-                logger.warning(f"Invalid account balance: {total_balance}, using target positions as quantities")
+            # 获取可用余额（关键：应该使用可用余额，而不是总余额）
+            # 可用余额 = 总余额 - 已用保证金 - 未实现盈亏
+            # 新开仓时，只能使用可用余额，不能使用总余额
+            available_balance = float(account_info.get('availableBalance', 0))
+            
+            if available_balance <= 0:
+                logger.warning(
+                    f"Invalid available balance: {available_balance}, "
+                    f"total_balance: {total_balance}, using target positions as quantities"
+                )
                 return target_positions
             
             # 获取杠杆倍数（从配置或账户信息）
             leverage = config.get('execution.contract_settings.leverage', 20)
             
             # 计算可用于交易的金额（应用杠杆）
-            # 例如：10000 USDT余额，20倍杠杆，可用资金 = 10000 * 20 = 200000 USDT
-            # 这样可以用更少的资金持有更大的仓位
-            available_capital = total_balance * leverage
+            # 例如：10000 USDT可用余额，20倍杠杆，可用资金 = 10000 * 20 = 200000 USDT
+            # 注意：使用可用余额，而不是总余额，确保不会超过实际可用资金
+            available_capital = available_balance * leverage
             
             # 归一化权重：计算总权重（绝对值之和），然后归一化
             total_weight = sum(abs(w) for w in target_positions.values())
@@ -1006,6 +1014,8 @@ class OrderManager:
             logger.info(
                 f"Converted weights to quantities: {len(target_positions_quantity)} symbols, "
                 f"total_balance={total_balance:.2f} USDT, "
+                f"available_balance={available_balance:.2f} USDT, "
+                f"available_capital={available_capital:.2f} USDT (leverage={leverage}x), "
                 f"total_weight={total_weight:.4f} (normalized to 1.0)"
             )
             
