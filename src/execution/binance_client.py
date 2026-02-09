@@ -96,29 +96,57 @@ class BinanceClient:
                 self._contract_settings_cache.pop(sym, None)
     
     async def _sync_server_time(self):
-        """同步Binance服务器时间"""
+        """同步Binance服务器时间（考虑网络延迟）"""
         try:
             url = f"{self.api_base}/fapi/v1/time"
             session = await self._get_session()
-            # 使用safe_http_request，自动处理限流和错误
-            data = await safe_http_request(
-                session,
-                'GET',
-                url,
-                max_retries=3,
-                timeout=10.0,
-                return_json=True,
-                use_rate_limit=True  # 启用请求限流
-            )
-            if data:
-                server_time = data.get('serverTime', 0)
-                local_time = int(time.time() * 1000)
-                self._time_offset = server_time - local_time
-                logger.debug(f"Server time synced, offset: {self._time_offset}ms")
+            
+            # 多次测量取平均值，减少网络延迟影响
+            offsets = []
+            for _ in range(3):
+                try:
+                    request_start = time.time()
+                    # 使用safe_http_request，自动处理限流和错误
+                    data = await safe_http_request(
+                        session,
+                        'GET',
+                        url,
+                        max_retries=2,
+                        timeout=10.0,
+                        return_json=True,
+                        use_rate_limit=True  # 启用请求限流
+                    )
+                    request_end = time.time()
+                    
+                    if data:
+                        server_time = data.get('serverTime', 0)
+                        # 计算网络延迟（往返时间的一半）
+                        rtt_ms = (request_end - request_start) * 1000
+                        network_delay_ms = rtt_ms / 2
+                        
+                        # 本地时间（请求发送时的中间时间点）
+                        local_time = int((request_start + request_end) / 2 * 1000)
+                        
+                        # 计算时间偏移（考虑网络延迟）
+                        offset = server_time - local_time - network_delay_ms
+                        offsets.append(offset)
+                except Exception as e:
+                    logger.debug(f"Time sync attempt failed: {e}")
+                    continue
+            
+            if offsets:
+                # 使用中位数而不是平均值，更抗异常值
+                offsets.sort()
+                median_offset = offsets[len(offsets) // 2]
+                self._time_offset = int(median_offset)
+                logger.debug(f"Server time synced, offset: {self._time_offset}ms (from {len(offsets)} measurements)")
                 return True
+            else:
+                logger.warning("All time sync attempts failed")
+                return False
         except Exception as e:
             logger.warning(f"Failed to sync server time: {e}")
-        return False
+            return False
     
     def _get_timestamp(self) -> int:
         """获取同步后的时间戳"""
@@ -181,11 +209,14 @@ class BinanceClient:
         if signed:
             # 首次请求时同步服务器时间
             if self._time_offset is None:
-                await self._sync_server_time()
+                sync_success = await self._sync_server_time()
+                if not sync_success:
+                    logger.warning("Time sync failed, using local time (may cause timestamp errors)")
             
             # 使用同步后的时间戳
             timestamp = self._get_timestamp()
             params['timestamp'] = timestamp
+            # 增加recvWindow到60秒，给网络延迟留出更多缓冲
             params['recvWindow'] = 60000  # 60秒接收窗口，避免时间同步问题
             # 注意：签名必须在添加所有参数后生成
             params['signature'] = self._generate_signature(params)
@@ -229,8 +260,11 @@ class BinanceClient:
                     if '-1021' in error_str or 'Timestamp' in error_str or 'recvWindow' in error_str:
                         # 时间戳错误，重新同步并重试
                         logger.warning(f"Timestamp error detected, re-syncing server time and retrying: {error_str}")
-                        # 重新同步服务器时间
-                        await self._sync_server_time()
+                        # 重新同步服务器时间（强制同步）
+                        sync_success = await self._sync_server_time()
+                        if not sync_success:
+                            logger.error("Time re-sync failed, retry may still fail")
+                        
                         # 重新生成时间戳和签名
                         timestamp = self._get_timestamp()
                         params['timestamp'] = timestamp
@@ -256,9 +290,15 @@ class BinanceClient:
                                 use_rate_limit=True,
                                 **request_kwargs
                             )
+                            # 重试成功，返回数据
+                            return data
                         except Exception as retry_e:
-                            # 重试也失败，抛出原始错误
-                            raise e
+                            # 重试也失败，检查是否仍然是时间戳错误
+                            retry_error_str = str(retry_e)
+                            if '-1021' in retry_error_str or 'Timestamp' in retry_error_str or 'recvWindow' in retry_error_str:
+                                logger.error(f"Timestamp error persists after re-sync: {retry_error_str}")
+                            # 抛出重试错误
+                            raise retry_e
                     else:
                         # 其他NetworkError，直接抛出
                         raise
@@ -274,8 +314,11 @@ class BinanceClient:
                 # 如果是时间戳错误（-1021），重新同步时间并重试一次
                 if error_code == -1021 and signed:
                     logger.warning(f"Timestamp error detected, re-syncing server time and retrying: {error_msg}")
-                    # 重新同步服务器时间
-                    await self._sync_server_time()
+                    # 重新同步服务器时间（强制同步）
+                    sync_success = await self._sync_server_time()
+                    if not sync_success:
+                        logger.error("Time re-sync failed, retry may still fail")
+                    
                     # 重新生成时间戳和签名
                     timestamp = self._get_timestamp()
                     params['timestamp'] = timestamp
@@ -290,24 +333,35 @@ class BinanceClient:
                         request_kwargs['data'] = params
                     
                     # 重试请求
-                    data = await safe_http_request(
-                        session,
-                        method,
-                        url,
-                        max_retries=1,  # 只重试一次
-                        timeout=30.0,
-                        return_json=True,
-                        use_rate_limit=True,
-                        **request_kwargs
-                    )
-                    
-                    # 检查重试后的结果
-                    if 'code' in data and data['code'] != 200:
-                        error_code = data['code']
-                        error_msg = data.get('msg', 'Unknown error')
-                    else:
-                        # 重试成功，返回数据
-                        return data
+                    try:
+                        data = await safe_http_request(
+                            session,
+                            method,
+                            url,
+                            max_retries=1,  # 只重试一次
+                            timeout=30.0,
+                            return_json=True,
+                            use_rate_limit=True,
+                            **request_kwargs
+                        )
+                        
+                        # 检查重试后的结果
+                        if 'code' in data and data['code'] != 200:
+                            error_code = data['code']
+                            error_msg = data.get('msg', 'Unknown error')
+                            # 如果仍然是时间戳错误，记录详细日志
+                            if error_code == -1021:
+                                logger.error(f"Timestamp error persists after re-sync: {error_msg}")
+                        else:
+                            # 重试成功，返回数据
+                            return data
+                    except Exception as retry_e:
+                        # 重试请求本身失败，检查是否是时间戳错误
+                        retry_error_str = str(retry_e)
+                        if '-1021' in retry_error_str or 'Timestamp' in retry_error_str or 'recvWindow' in retry_error_str:
+                            logger.error(f"Timestamp error persists after re-sync: {retry_error_str}")
+                        # 继续处理，让后续的错误处理逻辑处理
+                        raise
                 
                 # 检查是否是"无需更改"的错误（这些应该被视为成功）
                 if error_code == -4059 or 'No need to change position side' in error_msg:
