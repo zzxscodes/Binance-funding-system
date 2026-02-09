@@ -966,8 +966,17 @@ class OrderManager:
                 )
                 return target_positions
             
-            # 获取杠杆倍数（从配置或账户信息）
-            leverage = config.get('execution.contract_settings.leverage', 20)
+            # 获取杠杆倍数（从配置读取，灵活适配配置）
+            contract_settings = config.get('execution.contract_settings', {})
+            leverage = contract_settings.get('leverage', 20)
+            try:
+                leverage = int(leverage)
+                if leverage < 1 or leverage > 125:
+                    logger.warning(f"Invalid leverage in config: {leverage}, using default 20")
+                    leverage = 20
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid leverage type in config: {leverage}, using default 20")
+                leverage = 20
             
             # 计算可用于交易的金额（应用杠杆）
             # 例如：10000 USDT可用余额，20倍杠杆，可用资金 = 10000 * 20 = 200000 USDT

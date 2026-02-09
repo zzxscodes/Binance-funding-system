@@ -37,6 +37,30 @@ class BinanceClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self._time_offset: Optional[int] = None  # 服务器时间偏移量（毫秒）
         
+        # 从配置读取合约设置（灵活适配配置）
+        contract_settings = config.get('execution.contract_settings', {})
+        
+        # 目标保证金模式（CROSSED 或 ISOLATED）
+        margin_type = contract_settings.get('margin_type', 'CROSSED')
+        if isinstance(margin_type, str):
+            margin_type = margin_type.upper()
+        if margin_type not in ['CROSSED', 'ISOLATED']:
+            logger.warning(f"Invalid margin_type in config: {margin_type}, using default CROSSED")
+            margin_type = 'CROSSED'
+        self._target_margin_type = margin_type
+        
+        # 目标杠杆倍数（1-125）
+        leverage = contract_settings.get('leverage', 20)
+        try:
+            leverage = int(leverage)
+            if leverage < 1 or leverage > 125:
+                logger.warning(f"Invalid leverage in config: {leverage}, using default 20")
+                leverage = 20
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid leverage type in config: {leverage}, using default 20")
+            leverage = 20
+        self._target_leverage = leverage
+        
         # 合约配置缓存：记录每个symbol的margin_type和leverage
         # 格式: {symbol: {'margin_type': 'CROSSED', 'leverage': 20, 'verified': True, 'timestamp': time.time()}}
         self._contract_settings_cache: Dict[str, Dict[str, Any]] = {}
@@ -45,6 +69,7 @@ class BinanceClient:
         
         if self.dry_run:
             logger.info("BinanceClient initialized in DRY-RUN mode (using test_order endpoint)")
+        logger.debug(f"BinanceClient target contract settings: margin_type={self._target_margin_type}, leverage={self._target_leverage}x")
     
     def _cleanup_contract_settings_cache(self):
         """清理过期的合约设置缓存"""
@@ -538,9 +563,33 @@ class BinanceClient:
         try:
             symbol = format_symbol(symbol)
             
-            # 使用提供的参数或默认值
-            target_margin_type = margin_type if margin_type is not None else self._target_margin_type
-            target_leverage = leverage if leverage is not None else self._target_leverage
+            # 使用提供的参数或从配置读取（灵活适配配置）
+            if margin_type is not None:
+                target_margin_type = margin_type.upper() if isinstance(margin_type, str) else margin_type
+            else:
+                # 从配置读取
+                contract_settings = config.get('execution.contract_settings', {})
+                target_margin_type = contract_settings.get('margin_type', 'CROSSED')
+                if isinstance(target_margin_type, str):
+                    target_margin_type = target_margin_type.upper()
+                if target_margin_type not in ['CROSSED', 'ISOLATED']:
+                    target_margin_type = 'CROSSED'
+            
+            if leverage is not None:
+                try:
+                    target_leverage = int(leverage)
+                except (ValueError, TypeError):
+                    target_leverage = 20
+            else:
+                # 从配置读取
+                contract_settings = config.get('execution.contract_settings', {})
+                target_leverage = contract_settings.get('leverage', 20)
+                try:
+                    target_leverage = int(target_leverage)
+                    if target_leverage < 1 or target_leverage > 125:
+                        target_leverage = 20
+                except (ValueError, TypeError):
+                    target_leverage = 20
             
             # 清理过期缓存
             self._cleanup_contract_settings_cache()
@@ -736,16 +785,8 @@ class BinanceClient:
             # 自动确保合约配置（对策略透明）
             # 在订单执行前，自动检查并设置保证金模式和杠杆倍数
             if not self.dry_run:
-                # 如果提供了margin_type或leverage参数，使用这些值；否则使用默认值
-                target_margin_type = margin_type if margin_type is not None else self._target_margin_type
-                target_leverage = leverage if leverage is not None else self._target_leverage
-                
-                # 如果提供了自定义参数，需要确保设置
-                if margin_type is not None or leverage is not None:
-                    await self._ensure_contract_settings(symbol, target_margin_type, target_leverage)
-                else:
-                    # 使用默认配置（从配置文件读取）
-                    await self._ensure_contract_settings(symbol)
+                # _ensure_contract_settings 会从配置读取默认值（灵活适配配置）
+                await self._ensure_contract_settings(symbol, margin_type, leverage)
             
             params = {
                 'symbol': symbol,

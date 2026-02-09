@@ -189,21 +189,32 @@ class ExecutionProcess:
         """
         try:
             contract_settings = config.get('execution.contract_settings', {})
-            margin_type = contract_settings.get('margin_type', 'CROSSED').upper()
-            position_mode = contract_settings.get('position_mode', 'one_way')
-            leverage = contract_settings.get('leverage', 20)
             
-            # 验证配置
+            # 读取并验证保证金模式（灵活适配配置）
+            margin_type = contract_settings.get('margin_type', 'CROSSED')
+            if isinstance(margin_type, str):
+                margin_type = margin_type.upper()
             if margin_type not in ['CROSSED', 'ISOLATED']:
                 logger.warning(f"Invalid margin_type: {margin_type}, using default CROSSED")
                 margin_type = 'CROSSED'
             
+            # 读取并验证持仓模式（灵活适配配置）
+            position_mode = contract_settings.get('position_mode', 'one_way')
+            if isinstance(position_mode, str):
+                position_mode = position_mode.lower()
             if position_mode not in ['one_way', 'dual_side']:
                 logger.warning(f"Invalid position_mode: {position_mode}, using default one_way")
                 position_mode = 'one_way'
             
-            if not isinstance(leverage, int) or leverage < 1 or leverage > 125:
-                logger.warning(f"Invalid leverage: {leverage}, using default 20")
+            # 读取并验证杠杆倍数（灵活适配配置，支持字符串和整数）
+            leverage = contract_settings.get('leverage', 20)
+            try:
+                leverage = int(leverage)
+                if leverage < 1 or leverage > 125:
+                    logger.warning(f"Invalid leverage: {leverage}, using default 20")
+                    leverage = 20
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid leverage type: {leverage}, using default 20")
                 leverage = 20
             
             logger.info(
