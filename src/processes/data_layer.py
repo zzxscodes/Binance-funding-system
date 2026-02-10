@@ -82,11 +82,18 @@ class DataLayerProcess:
                         )
                         # 记录进程状态以便调试
                         logger.critical(f"Process running state: {self.running}, Active tasks count: {len(self.tasks)}")
+                        # 对于关键任务失败，不设置running=False，让进程继续运行以便诊断
             except asyncio.CancelledError:
                 # 任务被取消是正常的，不需要记录
                 pass
             except Exception as e:
                 logger.error(f"Error in task done callback for '{task_name}': {e}", exc_info=True)
+            finally:
+                # 确保任务从集合中移除（如果已完成）
+                try:
+                    self.tasks.discard(t)
+                except Exception:
+                    pass
         
         task.add_done_callback(task_done_callback)
         self.tasks.add(task)
@@ -600,11 +607,18 @@ class DataLayerProcess:
         self.running = False
         
         # 停止所有任务
-        for task in self.tasks:
-            task.cancel()
+        tasks_to_cancel = list(self.tasks)  # 创建副本，避免在迭代时修改集合
+        for task in tasks_to_cancel:
+            try:
+                task.cancel()
+            except Exception as e:
+                logger.error(f"Error cancelling task during stop: {e}", exc_info=True)
         
-        if self.tasks:
-            await asyncio.gather(*self.tasks, return_exceptions=True)
+        if tasks_to_cancel:
+            try:
+                await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+            except Exception as e:
+                logger.error(f"Error gathering tasks during stop: {e}", exc_info=True)
         
         # 停止采集器
         if self.collector:
@@ -1043,6 +1057,13 @@ async def main():
             loop_iteration += 1
             try:
                 # 使用wait_for来同时等待sleep和shutdown事件
+                # 检查事件循环是否已关闭
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError as e:
+                    logger.critical(f"Event loop is closed or not running: {e}")
+                    break
+                
                 done, pending = await asyncio.wait(
                     [
                         asyncio.create_task(asyncio.sleep(1)),
@@ -1125,4 +1146,14 @@ async def main():
 
 if __name__ == "__main__":
     import pandas as pd
-    asyncio.run(main())
+    try:
+        # 使用asyncio.run，但添加全局异常处理
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Process interrupted by user")
+    except Exception as e:
+        # 捕获asyncio.run可能抛出的未处理异常
+        logger.critical(f"Unhandled exception in asyncio.run: {e}", exc_info=True)
+        import traceback
+        logger.critical(f"Full traceback: {traceback.format_exc()}")
+        raise  # 重新抛出以便系统可以检测到进程异常退出
