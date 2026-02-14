@@ -936,6 +936,7 @@ class OrderManager:
     async def _convert_weights_to_quantities(self, target_positions: Dict[str, float]) -> Dict[str, float]:
         """
         将权重转换为实际数量
+        支持 CROSSED（全仓）和 ISOLATED（逐仓）两种保证金模式
         
         Args:
             target_positions: Dict[symbol, weight]，目标持仓权重（如0.5表示50%的账户权益）
@@ -966,8 +967,15 @@ class OrderManager:
                 )
                 return target_positions
             
-            # 获取杠杆倍数（从配置读取，灵活适配配置）
+            # 获取保证金模式和杠杆倍数（从配置读取，灵活适配配置）
             contract_settings = config.get('execution.contract_settings', {})
+            margin_type = contract_settings.get('margin_type', 'CROSSED')
+            if isinstance(margin_type, str):
+                margin_type = margin_type.upper()
+            if margin_type not in ['CROSSED', 'ISOLATED']:
+                logger.warning(f"Invalid margin_type in config: {margin_type}, using default CROSSED")
+                margin_type = 'CROSSED'
+            
             leverage = contract_settings.get('leverage', 20)
             try:
                 leverage = int(leverage)
@@ -978,57 +986,151 @@ class OrderManager:
                 logger.warning(f"Invalid leverage type in config: {leverage}, using default 20")
                 leverage = 20
             
-            # 计算可用于交易的金额（应用杠杆）
-            # 例如：10000 USDT可用余额，20倍杠杆，可用资金 = 10000 * 20 = 200000 USDT
-            # 注意：使用可用余额，而不是总余额，确保不会超过实际可用资金
-            available_capital = available_balance * leverage
-            
-            # 归一化权重：计算总权重（绝对值之和），然后归一化
-            total_weight = sum(abs(w) for w in target_positions.values())
-            if total_weight > 1e-8:
-                # 归一化权重，使总权重为1.0（100%）
-                normalized_weights = {symbol: w / total_weight for symbol, w in target_positions.items()}
-            else:
-                # 如果总权重为0，使用原始权重
-                normalized_weights = target_positions
-                logger.warning("Total weight is 0, using original weights")
-            
-            # 转换权重为数量
-            target_positions_quantity = {}
-            
-            for symbol, weight in normalized_weights.items():
-                if abs(weight) < 1e-8:  # 权重为0，跳过
-                    continue
-                
-                # 计算该交易对应该分配的USDT金额（使用归一化后的权重）
-                target_notional = abs(weight) * available_capital
-                
-                # 获取当前价格
+            # 根据保证金模式计算可用资金
+            if margin_type == 'ISOLATED':
+                # ISOLATED（逐仓）模式：每个交易对的保证金是独立的
+                # 需要获取每个交易对的持仓信息，计算每个交易对的独立可用资金
                 try:
-                    current_price = await self.client.get_symbol_price(symbol)
-                    if current_price and current_price > 0:
-                        # 计算数量
-                        quantity = target_notional / current_price
-                        # 根据方向设置正负（使用归一化后的权重）
-                        quantity = quantity if weight > 0 else -quantity
-                        target_positions_quantity[symbol] = quantity
+                    # 获取所有交易对的持仓风险信息
+                    position_risk_list = await self.client.get_position_risk()
+                    # 转换为字典，方便查找：symbol -> position_risk
+                    position_risk_dict = {}
+                    for pos_risk in position_risk_list:
+                        symbol_key = format_symbol(pos_risk.get('symbol', ''))
+                        if symbol_key:
+                            position_risk_dict[symbol_key] = pos_risk
+                    
+                    # 计算每个交易对的可用资金
+                    symbol_available_capital = {}
+                    for symbol in target_positions.keys():
+                        symbol_formatted = format_symbol(symbol)
+                        pos_risk = position_risk_dict.get(symbol_formatted)
+                        
+                        if pos_risk:
+                            # 获取该交易对的杠杆倍数（可能每个交易对不同）
+                            symbol_leverage = int(pos_risk.get('leverage', leverage) or leverage)
+                            
+                            # ISOLATED模式下，每个交易对的可用资金计算：
+                            # - 已用保证金已从账户余额中扣除，所以可用余额就是可以用于新开仓的资金
+                            # - 每个交易对可以使用账户可用余额（因为保证金是独立的）
+                            # - 应用该交易对的杠杆倍数计算可开仓价值
+                            symbol_available_capital[symbol] = available_balance * symbol_leverage
+                        else:
+                            # 如果没有持仓信息，使用账户可用余额和配置的杠杆
+                            symbol_available_capital[symbol] = available_balance * leverage
+                    
+                    # 在ISOLATED模式下，需要为每个交易对独立分配资金
+                    # 但为了保持权重分配的合理性，我们仍然使用归一化权重
+                    # 然后根据每个交易对的可用资金进行限制
+                    
+                    # 归一化权重：计算总权重（绝对值之和），然后归一化
+                    total_weight = sum(abs(w) for w in target_positions.values())
+                    if total_weight > 1e-8:
+                        normalized_weights = {symbol: w / total_weight for symbol, w in target_positions.items()}
                     else:
-                        logger.warning(f"Could not get price for {symbol}, skipping weight conversion")
-                        # 如果无法获取价格，使用原始权重（可能是数量而不是权重）
-                        target_positions_quantity[symbol] = weight
+                        normalized_weights = target_positions
+                        logger.warning("Total weight is 0, using original weights")
+                    
+                    # 转换权重为数量（ISOLATED模式）
+                    target_positions_quantity = {}
+                    
+                    for symbol, weight in normalized_weights.items():
+                        if abs(weight) < 1e-8:  # 权重为0，跳过
+                            continue
+                        
+                        # 获取该交易对的可用资金
+                        symbol_capital = symbol_available_capital.get(symbol, available_balance * leverage)
+                        
+                        # 计算该交易对应该分配的USDT金额（使用归一化后的权重）
+                        target_notional = abs(weight) * symbol_capital
+                        
+                        # 获取当前价格
+                        try:
+                            current_price = await self.client.get_symbol_price(symbol)
+                            if current_price and current_price > 0:
+                                # 计算数量
+                                quantity = target_notional / current_price
+                                # 根据方向设置正负（使用归一化后的权重）
+                                quantity = quantity if weight > 0 else -quantity
+                                target_positions_quantity[symbol] = quantity
+                            else:
+                                logger.warning(f"Could not get price for {symbol}, skipping weight conversion")
+                                target_positions_quantity[symbol] = weight
+                        except Exception as e:
+                            logger.warning(f"Failed to convert weight to quantity for {symbol}: {e}, using original value")
+                            target_positions_quantity[symbol] = weight
+                    
+                    # 计算总可用资金（用于日志）
+                    total_available_capital = sum(symbol_available_capital.values())
+                    
+                    logger.info(
+                        f"Converted weights to quantities (ISOLATED mode): {len(target_positions_quantity)} symbols, "
+                        f"total_balance={total_balance:.2f} USDT, "
+                        f"available_balance={available_balance:.2f} USDT, "
+                        f"total_available_capital={total_available_capital:.2f} USDT (leverage={leverage}x), "
+                        f"total_weight={total_weight:.4f} (normalized to 1.0)"
+                    )
+                    
+                    return target_positions_quantity
+                    
                 except Exception as e:
-                    logger.warning(f"Failed to convert weight to quantity for {symbol}: {e}, using original value")
-                    target_positions_quantity[symbol] = weight
+                    logger.warning(f"Failed to get position risk for ISOLATED mode: {e}, falling back to CROSSED mode calculation")
+                    # 如果获取持仓信息失败，回退到CROSSED模式的计算方式
+                    margin_type = 'CROSSED'
             
-            logger.info(
-                f"Converted weights to quantities: {len(target_positions_quantity)} symbols, "
-                f"total_balance={total_balance:.2f} USDT, "
-                f"available_balance={available_balance:.2f} USDT, "
-                f"available_capital={available_capital:.2f} USDT (leverage={leverage}x), "
-                f"total_weight={total_weight:.4f} (normalized to 1.0)"
-            )
-            
-            return target_positions_quantity
+            # CROSSED（全仓）模式：所有交易对共享账户余额
+            if margin_type == 'CROSSED':
+                # 计算可用于交易的金额（应用杠杆）
+                # 例如：10000 USDT可用余额，20倍杠杆，可用资金 = 10000 * 20 = 200000 USDT
+                # 注意：使用可用余额，而不是总余额，确保不会超过实际可用资金
+                available_capital = available_balance * leverage
+                
+                # 归一化权重：计算总权重（绝对值之和），然后归一化
+                total_weight = sum(abs(w) for w in target_positions.values())
+                if total_weight > 1e-8:
+                    # 归一化权重，使总权重为1.0（100%）
+                    normalized_weights = {symbol: w / total_weight for symbol, w in target_positions.items()}
+                else:
+                    # 如果总权重为0，使用原始权重
+                    normalized_weights = target_positions
+                    logger.warning("Total weight is 0, using original weights")
+                
+                # 转换权重为数量
+                target_positions_quantity = {}
+                
+                for symbol, weight in normalized_weights.items():
+                    if abs(weight) < 1e-8:  # 权重为0，跳过
+                        continue
+                    
+                    # 计算该交易对应该分配的USDT金额（使用归一化后的权重）
+                    target_notional = abs(weight) * available_capital
+                    
+                    # 获取当前价格
+                    try:
+                        current_price = await self.client.get_symbol_price(symbol)
+                        if current_price and current_price > 0:
+                            # 计算数量
+                            quantity = target_notional / current_price
+                            # 根据方向设置正负（使用归一化后的权重）
+                            quantity = quantity if weight > 0 else -quantity
+                            target_positions_quantity[symbol] = quantity
+                        else:
+                            logger.warning(f"Could not get price for {symbol}, skipping weight conversion")
+                            # 如果无法获取价格，使用原始权重（可能是数量而不是权重）
+                            target_positions_quantity[symbol] = weight
+                    except Exception as e:
+                        logger.warning(f"Failed to convert weight to quantity for {symbol}: {e}, using original value")
+                        target_positions_quantity[symbol] = weight
+                
+                logger.info(
+                    f"Converted weights to quantities (CROSSED mode): {len(target_positions_quantity)} symbols, "
+                    f"total_balance={total_balance:.2f} USDT, "
+                    f"available_balance={available_balance:.2f} USDT, "
+                    f"available_capital={available_capital:.2f} USDT (leverage={leverage}x), "
+                    f"total_weight={total_weight:.4f} (normalized to 1.0)"
+                )
+                
+                return target_positions_quantity
             
         except Exception as e:
             logger.error(f"Failed to convert weights to quantities: {e}", exc_info=True)

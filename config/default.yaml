@@ -59,7 +59,7 @@ data:
   
   # 溢价指数K线采集配置
   premium_index_collect_interval: 300  # 5分钟
-  premium_index_collect_days: 7  # 采集最近N天的历史数据
+  premium_index_collect_days: 30  # 采集最近N天的历史数据
   
   # 数据完整性检查配置
   completeness_threshold: 0.95  # 数据完整性阈值（95%）
@@ -114,7 +114,7 @@ strategy:
 
 execution:
   # 执行模式: 'testnet' (测试网), 'mock' (模拟), 'live' (实盘)
-  mode: mock  # 可选: testnet, mock, live
+  mode: live  # 可选: testnet, mock, live
   
   # dry-run开关：所有模式都可以启用dry-run
   # 启用后，即使使用真实API，也不会产生真实订单（使用test_order endpoint）
