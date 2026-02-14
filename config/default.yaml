@@ -108,7 +108,6 @@ strategy:
     #   - "模块名" (如 "mean_buy_dolvol4_over_dolvol_rank")
     #   - "完整模块路径" (如 "src.strategy.calculators.researcher1_factor1")
     enabled:
-      - "mock_test_calculator"
     #  - "mean_buy_dolvol4_over_dolvol_rank"
 
 
