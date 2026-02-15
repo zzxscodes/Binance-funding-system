@@ -129,8 +129,9 @@ def example_charts():
     import numpy as np
     from datetime import timedelta
     
-    output_dir = Path("backtest_results")
-    output_dir.mkdir(exist_ok=True)
+    # 使用配置的默认输出目录（data/backtest_results）
+    from src.backtest.config import BacktestConfigManager
+    output_dir = BacktestConfigManager.get_result_dir()
     
     print("\n3.1 生成因子评估图表...")
     
@@ -244,7 +245,9 @@ def run_all_examples():
     
     print("\n" + "#" * 60)
     print("# 所有示例运行完成")
-    print(f"# 图表保存在: backtest_results/")
+    from src.backtest.config import BacktestConfigManager
+    result_dir = BacktestConfigManager.get_result_dir()
+    print(f"# 图表保存在: {result_dir}/")
     print("#" * 60 + "\n")
 
 

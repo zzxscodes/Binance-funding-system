@@ -10,6 +10,7 @@ import polars as pl
 from collections import defaultdict
 
 from ..common.logger import get_logger
+from .utils import get_default_interval
 from ..common.config import config
 from ..data.storage import get_data_storage
 from .models import HistoricalKline, KlineSnapshot, ReplayEvent
@@ -24,7 +25,7 @@ class DataReplayEngine:
                  symbols: List[str],
                  start_date: datetime,
                  end_date: datetime,
-                 interval: str = "5m"):
+                 interval: Optional[str] = None):
         """
         初始化数据重放引擎
         
@@ -37,7 +38,7 @@ class DataReplayEngine:
         self.symbols = symbols
         self.start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
         self.end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=0)
-        self.interval = interval
+        self.interval = interval if interval is not None else get_default_interval()
         self.storage = get_data_storage()
         
         # 转换为UTC（如果输入是本地时间）
@@ -254,7 +255,8 @@ class MultiIntervalReplayEngine:
             intervals: K线周期列表 (e.g., ["5m", "1h", "4h"])
         """
         if intervals is None:
-            intervals = ["5m"]
+            default_interval = get_default_interval()
+            intervals = [default_interval]
         
         self.symbols = symbols
         self.start_date = start_date

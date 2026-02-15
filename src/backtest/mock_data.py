@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 
 from ..common.logger import get_logger
+from .utils import get_trading_days_per_year
 from ..data.storage import get_data_storage
 
 logger = get_logger('mock_data_generator')
@@ -95,8 +96,9 @@ class MockKlineGenerator:
             open_price = prices[i]
             
             # 周期内的价格变动（模拟）
-            intra_high = open_price * (1 + abs(np.random.normal(0, volatility / (252 ** 0.5))))
-            intra_low = open_price * (1 - abs(np.random.normal(0, volatility / (252 ** 0.5))))
+            trading_days = get_trading_days_per_year()
+            intra_high = open_price * (1 + abs(np.random.normal(0, volatility / (trading_days ** 0.5))))
+            intra_low = open_price * (1 - abs(np.random.normal(0, volatility / (trading_days ** 0.5))))
             
             # Close：周期结束价格
             if i + 1 < len(prices):

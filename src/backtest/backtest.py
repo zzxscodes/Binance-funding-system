@@ -42,6 +42,7 @@ from .models import (
     OrderSide,
     create_backtest_result,
 )
+from .result_saver import BacktestResultSaver
 
 logger = logging.getLogger('backtest')
 
@@ -52,9 +53,9 @@ class FactorBacktestConfig:
     name: str
     start_date: datetime
     end_date: datetime
-    initial_balance: float = 10000.0
-    interval: str = "5m"
-    leverage: float = 1.0
+    initial_balance: Optional[float] = None
+    interval: Optional[str] = None
+    leverage: Optional[float] = None
     
     capital_allocation: str = "equal_weight"
     long_count: int = 10
@@ -361,7 +362,14 @@ class MultiFactorBacktest:
             factor_weights=getattr(self, 'factor_weights', {}),
             next_returns=getattr(self, 'next_returns', {}),
         )
-
+        
+        # 自动保存结果到data目录
+        try:
+            output_dir = BacktestResultSaver.save_result_auto(result)
+            logger.info(f"回测结果已自动保存到: {output_dir}")
+        except Exception as e:
+            logger.warning(f"保存回测结果失败: {e}", exc_info=True)
+        
         return result
     
     def _process_weights(self, raw_weights: Dict[str, float]) -> WeightVector:
@@ -417,7 +425,8 @@ class MultiFactorBacktest:
         trades = []
         
         current_weight_sum = sum(abs(w) for w in self.current_weights.values())
-        available_balance = self.portfolio_value * 0.5
+        available_balance_ratio = get_available_balance_ratio()
+        available_balance = self.portfolio_value * available_balance_ratio
         
         for sym, target_w in target.weights.items():
             current_w = self.current_weights.get(sym, 0.0)
@@ -477,10 +486,11 @@ class MultiFactorBacktest:
         
         self.portfolio_value = total_value + unrealized_pnl
         
+        available_balance_ratio = get_available_balance_ratio()
         return {
             'timestamp': timestamp,
             'total_balance': self.portfolio_value,
-            'available_balance': self.portfolio_value * 0.5,
+            'available_balance': self.portfolio_value * available_balance_ratio,
             'total_pnl': self.portfolio_value - self.config.initial_balance,
             'unrealized_pnl': unrealized_pnl,
             'positions_count': len([s for s, w in self.current_weights.items() if w != 0]),
@@ -689,12 +699,20 @@ def run_single_calculator_backtest(
     calculator: AlphaCalculatorBase,
     start_date: datetime,
     end_date: datetime,
-    initial_balance: float = 10000.0,
+    initial_balance: Optional[float] = None,
     symbols: Optional[List[str]] = None,
     verbose: bool = True,
 ) -> Dict:
     """
     便捷函数：对单个Calculator进行回测
+    
+    Args:
+        calculator: 因子计算器
+        start_date: 开始日期
+        end_date: 结束日期
+        initial_balance: 初始余额，如果为None则从配置读取
+        symbols: 交易对列表
+        verbose: 是否输出详细信息
     
     Example:
         >>> from src.strategy.calculators import MeanBuyDolvol4OverDolvolRankCalculator
@@ -718,6 +736,34 @@ def run_single_calculator_backtest(
     backtest = SingleCalculatorBacktest(config)
     metrics, portfolio_df, factor_analysis = backtest.run(calculator, verbose=verbose)
     
+    # 创建BacktestResult并自动保存
+    from .models import create_backtest_result, BacktestConfig as ModelBacktestConfig
+    result_config = ModelBacktestConfig(
+        name=config.name,
+        start_date=config.start_date,
+        end_date=config.end_date,
+        initial_balance=config.initial_balance,
+        symbols=config.symbols or [],
+        leverage=config.leverage,
+        capital_allocation=config.capital_allocation,
+        long_count=config.long_count,
+        short_count=config.short_count,
+        interval=config.interval,
+    )
+    result = create_backtest_result(
+        config=result_config,
+        metrics=metrics,
+        portfolio_history=backtest.portfolio_history,
+        trades=backtest.trades,
+    )
+    
+    # 自动保存结果到data目录
+    try:
+        output_dir = BacktestResultSaver.save_result_auto(result)
+        logger.info(f"回测结果已自动保存到: {output_dir}")
+    except Exception as e:
+        logger.warning(f"保存回测结果失败: {e}", exc_info=True)
+    
     return {
         'metrics': metrics.to_dict(),
         'portfolio_df': portfolio_df,
@@ -730,13 +776,14 @@ def run_single_calculator_backtest(
         'win_rate': metrics.win_rate,
         'ic_mean': getattr(metrics, 'ic_mean', 0),
         'selection_accuracy': getattr(metrics, 'selection_accuracy', 0),
+        'result': result,  # 包含完整的BacktestResult对象
     }
 
 
 def run_alpha_backtest(
     start_date: datetime,
     end_date: datetime,
-    initial_balance: float = 10000.0,
+    initial_balance: Optional[float] = None,
     calculator_names: Optional[List[str]] = None,
     symbols: Optional[List[str]] = None,
     verbose: bool = True,
@@ -784,7 +831,7 @@ def compare_calculators(
     calculators: List[AlphaCalculatorBase],
     start_date: datetime,
     end_date: datetime,
-    initial_balance: float = 10000.0,
+    initial_balance: Optional[float] = None,
     verbose: bool = True,
 ) -> Dict:
     """
@@ -843,7 +890,7 @@ def run_backtest(
     calculator: AlphaCalculatorBase,
     start_date: datetime,
     end_date: datetime,
-    initial_balance: float = 10000.0,
+    initial_balance: Optional[float] = None,
     symbols: Optional[List[str]] = None,
     capital_allocation: str = "rank_weight",
     long_count: int = 5,

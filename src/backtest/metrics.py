@@ -527,7 +527,7 @@ class AlphaEvaluator:
         name: str,
         portfolio_values: List[float],
         trades: List[Dict] = None,
-        initial_balance: float = 10000.0,
+        initial_balance: Optional[float] = None,
         period: str = "daily",
     ) -> AlphaMetrics:
         """

@@ -12,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 
 from ..common.logger import get_logger
+from .utils import get_annualization_factor
 from .models import BacktestResult, Trade, OrderSide
 
 logger = get_logger('analysis')
@@ -96,11 +97,13 @@ class BacktestAnalyzer:
         mean_return = statistics.mean(daily_returns)
         std_return = statistics.stdev(daily_returns) if len(daily_returns) > 1 else 0.0
         
-        sharpe = (mean_return / std_return * (252 ** 0.5)) if std_return > 0 else 0.0
+        annualization_factor = get_annualization_factor()
+        sharpe = (mean_return / std_return * annualization_factor) if std_return > 0 else 0.0
         
         negative_returns = [r for r in daily_returns if r < 0]
         downside_std = statistics.stdev(negative_returns) if len(negative_returns) > 1 else 0.0
-        sortino = (mean_return / downside_std * (252 ** 0.5)) if downside_std > 0 else 0.0
+        annualization_factor = get_annualization_factor()
+        sortino = (mean_return / downside_std * annualization_factor) if downside_std > 0 else 0.0
         
         return {
             'mean_daily_return': mean_return,

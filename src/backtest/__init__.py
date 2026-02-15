@@ -46,6 +46,7 @@ from .metrics import (
     evaluate_factor_ic,
     evaluate_factor_group_return,
 )
+from .result_saver import BacktestResultSaver
 
 __all__ = [
     'BacktestConfig',
@@ -81,4 +82,5 @@ __all__ = [
     'AlphaEvaluator',
     'evaluate_factor_ic',
     'evaluate_factor_group_return',
+    'BacktestResultSaver',
 ]

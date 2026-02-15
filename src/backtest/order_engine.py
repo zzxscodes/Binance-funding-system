@@ -206,12 +206,12 @@ class OrderEngine:
     - 市场冲击模拟
     """
 
-    def __init__(self, initial_balance: float = 100000.0, taker_fee: float = 0.0004, maker_fee: float = 0.0002, leverage: float = 1.0):
-        self.initial_balance = initial_balance
-        self.balance = initial_balance
-        self.taker_fee = taker_fee
-        self.maker_fee = maker_fee
-        self.leverage = leverage  # 杠杆倍数，用于计算保证金要求
+    def __init__(self, initial_balance: Optional[float] = None, taker_fee: Optional[float] = None, maker_fee: Optional[float] = None, leverage: Optional[float] = None):
+        self.initial_balance = initial_balance if initial_balance is not None else get_default_initial_balance()
+        self.balance = self.initial_balance
+        self.taker_fee = taker_fee if taker_fee is not None else get_default_taker_fee()
+        self.maker_fee = maker_fee if maker_fee is not None else get_default_maker_fee()
+        self.leverage = leverage if leverage is not None else get_default_leverage()  # 杠杆倍数，用于计算保证金要求
 
         self.orders: Dict[str, Order] = {}
         self.trades: List[Trade] = []

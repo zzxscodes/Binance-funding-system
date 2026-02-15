@@ -9,6 +9,7 @@ from pathlib import Path
 import logging
 
 from ..common.logger import get_logger
+from .utils import get_default_initial_balance, get_default_interval
 from .models import BacktestConfig, PortfolioState, KlineSnapshot, BacktestResult
 from .replay import DataReplayEngine, MultiIntervalReplayEngine
 from .executor import BacktestExecutor
@@ -24,7 +25,7 @@ class BacktestAPI:
     def run_backtest(
         config: BacktestConfig,
         strategy_func: Callable[[PortfolioState, Dict[str, KlineSnapshot]], Dict[str, float]],
-        interval: str = "5m",
+        interval: Optional[str] = None,
     ) -> BacktestResult:
         """
         运行单周期回测
@@ -32,11 +33,14 @@ class BacktestAPI:
         Args:
             config: 回测配置
             strategy_func: 策略函数，接收(portfolio_state, klines)，返回目标持仓权重
-            interval: K线周期 (e.g., "5m", "1h", "4h")
+            interval: K线周期，如果为None则从配置读取
         
         Returns:
             BacktestResult 回测结果
         """
+        if interval is None:
+            interval = get_default_interval()
+        
         try:
             logger.info(f"Creating replay engine for {len(config.symbols)} symbols")
             replay_engine = DataReplayEngine(
@@ -112,7 +116,7 @@ class BacktestAPI:
         calculator: Any,
         start_date: datetime,
         end_date: datetime,
-        initial_balance: float = 10000.0,
+        initial_balance: Optional[float] = None,
         symbols: Optional[List[str]] = None,
         capital_allocation: str = "rank_weight",
         long_count: int = 5,
@@ -203,7 +207,7 @@ class BacktestAPI:
     def batch_run(
         configs: List[BacktestConfig],
         strategy_func: Callable,
-        interval: str = "5m",
+        interval: Optional[str] = None,
         compare: bool = True
     ) -> Dict[str, BacktestResult]:
         """
@@ -249,7 +253,7 @@ def create_backtest_config(
     name: str,
     start_date: datetime,
     end_date: datetime,
-    initial_balance: float = 10000.0,
+    initial_balance: Optional[float] = None,
     symbols: Optional[List[str]] = None,
     **kwargs
 ) -> BacktestConfig:
@@ -263,6 +267,9 @@ def create_backtest_config(
         start_date = start_date.replace(tzinfo=timezone.utc)
     if end_date.tzinfo is None:
         end_date = end_date.replace(tzinfo=timezone.utc)
+    
+    if initial_balance is None:
+        initial_balance = get_default_initial_balance()
     
     return BacktestConfig(
         name=name,

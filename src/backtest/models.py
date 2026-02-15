@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
 import pandas as pd
 
+from .utils import get_default_initial_balance, get_default_interval, get_default_leverage, get_default_maker_fee, get_default_taker_fee
+
 
 class OrderSide(Enum):
     """订单方向"""
@@ -37,11 +39,11 @@ class BacktestConfig:
     name: str
     start_date: datetime
     end_date: datetime
-    initial_balance: float = 10000.0
+    initial_balance: float = field(default_factory=get_default_initial_balance)
     symbols: List[str] = field(default_factory=list)
-    leverage: float = 1.0
-    maker_fee: float = 0.0002
-    taker_fee: float = 0.0004
+    leverage: float = field(default_factory=get_default_leverage)
+    maker_fee: float = field(default_factory=get_default_maker_fee)
+    taker_fee: float = field(default_factory=get_default_taker_fee)
     slippage: float = 0.0
     commission_type: str = "fixed"
     funding_rate_apply: bool = True
@@ -50,7 +52,7 @@ class BacktestConfig:
     short_count: int = 10
     min_weight: float = 0.02
     max_weight: float = 0.2
-    interval: str = "5m"
+    interval: str = field(default_factory=get_default_interval)
 
 
 @dataclass

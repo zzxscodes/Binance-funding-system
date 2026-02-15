@@ -15,6 +15,7 @@ import numpy as np
 
 from ..common.config import config
 from ..common.logger import get_logger
+from .utils import get_progress_log_interval, get_default_interval
 from ..common.utils import format_symbol, round_qty
 from ..data.storage import get_data_storage
 from ..data.api import get_data_api
@@ -217,7 +218,8 @@ class BacktestExecutor:
                     pass
 
                 step_count += 1
-                if verbose and step_count % 1000 == 0:
+                progress_interval = get_progress_log_interval()
+                if verbose and step_count % progress_interval == 0:
                     logger.info(f"Progress: {step_count} steps, {timestamp}")
 
         except Exception as e:
@@ -234,6 +236,14 @@ class BacktestExecutor:
             logger.info(f"Backtest completed in {execution_time:.2f}s, {len(self.backtest_trades)} trades")
 
         result = self._generate_backtest_result(start_datetime, end_datetime, execution_time)
+        
+        # 自动保存结果到data目录
+        try:
+            output_dir = BacktestResultSaver.save_result_auto(result)
+            logger.info(f"回测结果已自动保存到: {output_dir}")
+        except Exception as e:
+            logger.warning(f"保存回测结果失败: {e}", exc_info=True)
+        
         return result
 
     def _update_prices(self, klines_snapshot: Dict[str, KlineSnapshot]):
@@ -952,7 +962,7 @@ class FactorBacktestExecutor:
                 symbols=bt_config.symbols,
                 start_date=bt_config.start_date,
                 end_date=bt_config.end_date,
-                interval=getattr(bt_config, 'interval', '5m')
+                interval=getattr(bt_config, 'interval', None) or get_default_interval()
             )
 
         if replay_engine is None:
@@ -973,12 +983,12 @@ def run_backtest(
     calculator,
     start_date: datetime,
     end_date: datetime,
-    initial_balance: float = 10000.0,
+    initial_balance: Optional[float] = None,
     symbols: Optional[List[str]] = None,
     capital_allocation: str = "rank_weight",
     long_count: int = 5,
     short_count: int = 5,
-    leverage: float = 1.0,
+    leverage: Optional[float] = None,
     verbose: bool = True,
 ) -> BacktestResult:
     """
@@ -1013,7 +1023,7 @@ def run_backtest(
         symbols=config.symbols or ["BTCUSDT", "ETHUSDT"],
         start_date=config.start_date,
         end_date=config.end_date,
-        interval="5m"
+        interval=config.interval or get_default_interval()
     )
 
     executor = BacktestExecutor(
@@ -1024,7 +1034,7 @@ def run_backtest(
             initial_balance=config.initial_balance,
             symbols=config.symbols or ["BTCUSDT", "ETHUSDT"],
             leverage=config.leverage,
-            interval="5m",
+            interval=config.interval or get_default_interval(),
         ),
         replay_engine=replay_engine
     )

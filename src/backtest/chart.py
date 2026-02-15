@@ -147,7 +147,9 @@ def generate_alpha_charts(
     out.mkdir(parents=True, exist_ok=True)
     result_files = {}
     
-    initial = getattr(result.config, 'initial_balance', 10000)
+    initial = getattr(result.config, 'initial_balance', None)
+    if initial is None:
+        initial = get_default_initial_balance()
     
     values = []
     for state in result.portfolio_history:

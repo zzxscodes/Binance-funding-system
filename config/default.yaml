@@ -109,6 +109,56 @@ strategy:
     #   - "完整模块路径" (如 "src.strategy.calculators.researcher1_factor1")
     enabled:
     #  - "mean_buy_dolvol4_over_dolvol_rank"
+  
+  # 回测系统配置
+  backtest:
+    # 组合配置
+    portfolio:
+      available_balance_ratio: 0.5  # 可用余额比例（用于计算available_balance）
+    
+    # 指标计算配置
+    metrics:
+      trading_days_per_year: 252  # 每年交易日数（用于年化计算）
+    
+    # 执行配置
+    execution:
+      progress_log_interval: 1000  # 进度日志输出间隔（步数）
+    
+    # 输出配置
+    output:
+      result_dir: data/backtest_results  # 回测结果输出目录
+      save_json: true  # 是否保存JSON格式结果
+      save_csv: true  # 是否保存CSV格式结果（trades和portfolio）
+      save_report: true  # 是否保存文本报告
+      save_config: true  # 是否保存配置文件
+
+  # 因子挖掘系统配置
+  factor_mining:
+    # 因子评估配置
+    evaluation:
+      min_ic_ir: 0.5  # 最小IC IR
+      min_coverage: 0.5  # 最小覆盖率
+      min_sharpe_ratio: 0.5  # 最小Sharpe比率
+      default_interval: 5min  # 默认时间间隔
+      default_forward_periods: 1  # 默认未来收益周期数
+      default_history_days: 30  # 默认历史数据天数
+      default_initial_balance: 10000.0  # 默认初始余额
+      max_return_threshold: 10.0  # 总收益归一化阈值（用于评分计算）
+    
+    # 因子筛选配置
+    selection:
+      max_correlation: 0.8  # 最大允许相关性
+      top_n: 10  # 选择前N个因子
+      ranking_weights:  # 排名权重
+        ic_ir: 0.3
+        ic_positive_ratio: 0.2
+        sharpe_ratio: 0.3
+        total_return: 0.2
+    
+    # 因子生成配置
+    generation:
+      output_dir: data/factor_mining  # 因子输出目录
+      default_lookback_bars: 1000  # 默认回看K线数
 
 
 execution:
