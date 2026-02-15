@@ -236,6 +236,36 @@ class OrderManager:
                     'child_orders': tracked,
                 }
             
+            # 根据持仓模式和目标持仓确定positionSide
+            # 注意：place_order方法内部会根据持仓模式自动处理positionSide和reduceOnly
+            # 但我们需要根据目标持仓方向提供正确的positionSide
+            target_position = order.get('target_position', 0.0)
+            position_side = 'BOTH'  # 默认值
+            
+            # 尝试获取当前持仓模式（用于确定是否需要指定positionSide）
+            try:
+                if not (self.dry_run and hasattr(self.client, 'dry_run_mode') and self.client.dry_run_mode):
+                    dual_side_position = await self.client.get_position_mode()
+                    if dual_side_position:
+                        # 双向持仓模式：需要根据目标持仓方向设置positionSide
+                        if target_position > 0:
+                            position_side = 'LONG'
+                        elif target_position < 0:
+                            position_side = 'SHORT'
+                        else:
+                            # 平仓时，根据当前持仓方向或订单方向推断
+                            current_position = order.get('current_position', 0.0)
+                            if current_position > 0:
+                                position_side = 'LONG'
+                            elif current_position < 0:
+                                position_side = 'SHORT'
+                            else:
+                                # 无法确定时，根据订单方向推断
+                                position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            except Exception as e:
+                logger.debug(f"Could not get position mode, using default BOTH: {e}")
+                position_side = 'BOTH'
+            
             # 下单（dry-run模式下会自动使用test_order endpoint或完全离线模拟）
             if self.dry_run and hasattr(self.client, 'dry_run_mode') and self.client.dry_run_mode:
                 # 完全离线dry-run模式（使用DryRunBinanceClient）
@@ -245,7 +275,7 @@ class OrderManager:
                     order_type=order_type,
                     quantity=quantity,
                     price=order.get('price'),
-                    position_side='BOTH',
+                    position_side=position_side,
                     reduce_only=reduce_only
                 )
             else:
@@ -256,7 +286,7 @@ class OrderManager:
                     order_type=order_type,
                     quantity=quantity,
                     price=order.get('price'),
-                    position_side='BOTH',
+                    position_side=position_side,
                     reduce_only=reduce_only
                 )
             
@@ -300,14 +330,29 @@ class OrderManager:
             
         except Exception as e:
             error_str = str(e)
-            # 检查是否是Binance的最小订单金额错误（-4164）
+            # Binance错误码处理
             if '-4164' in error_str or 'notional must be no smaller' in error_str.lower():
                 logger.warning(
                     f"Order for {symbol} rejected due to insufficient notional value. "
                     f"Quantity: {quantity}, Error: {error_str[:200]}"
                 )
-                # 这不是致命错误，只是订单金额太小，记录警告即可
-            elif '-1111' in error_str or 'precision' in error_str.lower():
+            elif '-4046' in error_str or 'no need to change margin type' in error_str.lower():
+                # 保证金模式已设置，可以忽略
+                logger.debug(f"Margin type already set for {symbol}: {error_str[:200]}")
+            elif '-4047' in error_str or 'no need to change leverage' in error_str.lower():
+                # 杠杆已设置，可以忽略
+                logger.debug(f"Leverage already set for {symbol}: {error_str[:200]}")
+            elif '-4049' in error_str or 'open orders exist' in error_str.lower():
+                logger.warning(f"Cannot change margin type for {symbol}: open orders exist")
+            elif '-4050' in error_str or 'positions exist' in error_str.lower():
+                logger.warning(f"Cannot change margin type for {symbol}: positions exist")
+            elif '-4003' in error_str or 'reduce only' in error_str.lower():
+                logger.warning(f"Reduce only error for {symbol}: {error_str[:200]}")
+            elif '-4004' in error_str or 'position side' in error_str.lower():
+                logger.warning(f"Position side error for {symbol}: {error_str[:200]}")
+            elif '-4005' in error_str or 'close position' in error_str.lower():
+                logger.warning(f"Close position error for {symbol}: {error_str[:200]}")
+            elif '-1111' in error_str or 'precision' in error_str.lower() or 'step size' in error_str.lower():
                 # 精度错误：记录详细信息以便调试
                 logger.error(
                     f"Precision error for {symbol}: quantity={quantity} (type={type(quantity).__name__}), "
@@ -1151,12 +1196,26 @@ class OrderManager:
             订单结果
         """
         try:
+            # 根据持仓模式确定positionSide
+            # place_order方法内部会根据持仓模式自动处理，但我们需要提供合理的默认值
+            position_side = 'BOTH'  # 默认值，单向持仓模式
+            
+            # 尝试获取持仓模式
+            try:
+                if not self.dry_run:
+                    dual_side_position = await self.client.get_position_mode()
+                    if dual_side_position:
+                        # 双向持仓模式：根据订单方向设置
+                        position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            except Exception as e:
+                logger.debug(f"Could not get position mode for {symbol}, using default BOTH: {e}")
+            
             result = await self.client.place_order(
                 symbol=symbol,
                 side=side,
                 order_type='MARKET',
                 quantity=quantity,
-                position_side='BOTH',
+                position_side=position_side,
                 reduce_only=reduce_only
             )
             return result

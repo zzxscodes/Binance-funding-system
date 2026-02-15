@@ -307,7 +307,15 @@ class KlineAggregator:
                     # 获取最新的K线
                     latest_kline = self.klines[symbol].tail(1)
                     if not latest_kline.is_empty():
-                        prev_close = latest_kline["close"][0]
+                        # 根据图片要求，close字段是varchar类型，需要转换为float
+                        if "close" in latest_kline.columns:
+                            close_val = latest_kline["close"][0]
+                            try:
+                                prev_close = float(close_val)
+                            except (ValueError, TypeError):
+                                prev_close = 0.0
+                        else:
+                            prev_close = 0.0
 
                 # 如果没有上一个K线，使用0（这种情况应该很少见，通常至少有一个K线）
                 if prev_close is None:
@@ -467,6 +475,9 @@ class KlineAggregator:
             import math
 
             vwap = quote_volume / volume if volume > 0 else float("nan")
+            
+            # 注意：根据图片要求，aggtrade里面的时间是第一个交易的时间
+            # 但这对K线聚合没有影响，因为我们使用窗口起始时间作为span_begin_datetime
 
             # 构建K线数据（匹配数据库bar表结构）
             window_start_dt = datetime.fromtimestamp(
@@ -487,61 +498,91 @@ class KlineAggregator:
             # span_status: 如果有交易则为空字符串，无交易则为"NoTrade"
             span_status = "" if trade_count > 0 else "NoTrade"
 
+            # 根据图片要求，字段类型和命名需要调整：
+            # - low应该是int类型（但实际存储为float，转换为int）
+            # - dolvol应该是int类型（但实际存储为float，转换为int）
+            # - 所有价格和数量字段应该是varchar类型（字符串格式）
+            # - tradecount字段名需要添加（当前只有buytradecount和selltradecount）
+            
+            # 转换数据类型以匹配要求
+            low_int = int(low_price) if not math.isnan(low_price) else 0
+            dolvol_int = int(quote_volume) if not math.isnan(quote_volume) else 0
+            
+            # 将数值字段转换为字符串（varchar类型）
+            open_str = str(open_price) if not math.isnan(open_price) else "0"
+            high_str = str(high_price) if not math.isnan(high_price) else "0"
+            close_str = str(close_price) if not math.isnan(close_price) else "0"
+            last_str = str(close_price) if not math.isnan(close_price) else "0"
+            vwap_str = str(vwap) if not math.isnan(vwap) else "0"
+            dolvol_str = str(dolvol_int)
+            buydolvol_str = str(buy_dolvol) if not math.isnan(buy_dolvol) else "0"
+            selldolvol_str = str(sell_dolvol) if not math.isnan(sell_dolvol) else "0"
+            volume_str = str(volume) if not math.isnan(volume) else "0"
+            buyvolume_str = str(buy_volume) if not math.isnan(buy_volume) else "0"
+            sellvolume_str = str(sell_volume) if not math.isnan(sell_volume) else "0"
+
             kline_data = {
-                # 基础字段（兼容现有代码）
+                # 基础字段（兼容现有代码，保留原始数值类型用于计算）
                 "symbol": symbol,
                 "open_time": window_start_dt,
                 "close_time": window_end_dt,
-                "open": open_price,
-                "high": high_price,
-                "low": low_price,
-                "close": close_price,
-                "volume": volume,
-                "quote_volume": quote_volume,
+                "quote_volume": quote_volume,  # 保留原始float类型用于计算
                 "trade_count": trade_count,
-                "buy_volume": buy_volume,
-                "sell_volume": sell_volume,
                 "interval_minutes": self.interval_minutes,
-                # bar表字段
-                "microsecond_since_trad": window_end_ms,
-                "span_begin_datetime": window_start_ms,
-                "span_end_datetime": window_end_ms,
-                "span_status": span_status,
-                "last": close_price,
-                "vwap": vwap,
-                "dolvol": quote_volume,
-                "buydolvol": buy_dolvol,
-                "selldolvol": sell_dolvol,
-                "buyvolume": buy_volume,
-                "sellvolume": sell_volume,
-                "buytradecount": buy_trade_count,
-                "selltradecount": sell_trade_count,
-                "time_lable": time_lable,
-                # tran_stats表字段（按金额分档统计）
-                "buy_volume1": buy_volume1,
-                "buy_volume2": buy_volume2,
-                "buy_volume3": buy_volume3,
-                "buy_volume4": buy_volume4,
-                "buy_dolvol1": buy_dolvol1,
-                "buy_dolvol2": buy_dolvol2,
-                "buy_dolvol3": buy_dolvol3,
-                "buy_dolvol4": buy_dolvol4,
-                "buy_trade_count1": buy_trade_count1,
-                "buy_trade_count2": buy_trade_count2,
-                "buy_trade_count3": buy_trade_count3,
-                "buy_trade_count4": buy_trade_count4,
-                "sell_volume1": sell_volume1,
-                "sell_volume2": sell_volume2,
-                "sell_volume3": sell_volume3,
-                "sell_volume4": sell_volume4,
-                "sell_dolvol1": sell_dolvol1,
-                "sell_dolvol2": sell_dolvol2,
-                "sell_dolvol3": sell_dolvol3,
-                "sell_dolvol4": sell_dolvol4,
-                "sell_trade_count1": sell_trade_count1,
-                "sell_trade_count2": sell_trade_count2,
-                "sell_trade_count3": sell_trade_count3,
-                "sell_trade_count4": sell_trade_count4,
+                # bar表字段（按照图片要求，使用正确的类型）
+                "microsecond_since_trad": window_end_ms,  # bigint: 时间戳，即span_end_datetime的时间戳
+                "span_begin_datetime": window_start_ms,  # bigint: 交易数据开始的时间，分钟必须被5整除，秒
+                "span_end_datetime": window_end_ms,  # bigint: 交易数据结束时间 ✅ 已添加
+                "span_status": span_status,  # varchar(32): NoTrade - 无交易(过滤掉)
+                "last": last_str,  # varchar(32): 最新一笔交易
+                "high": high_str,  # varchar(32): 最高价
+                "low": low_int,  # int: 最低价
+                "open": open_str,  # varchar(32): 第一笔价格
+                "vwap": vwap_str,  # varchar(32): dolvol / volume
+                "dolvol": dolvol_int,  # int(32): 成交额
+                "buydolvol": buydolvol_str,  # varchar(32): 主动买成交额
+                "selldolvol": selldolvol_str,  # varchar(32): 主动卖成交额
+                "volume": volume_str,  # varchar(32): 成交量
+                "buyvolume": buyvolume_str,  # varchar(32): 主动买成交量
+                "sellvolume": sellvolume_str,  # varchar(32): 主动卖成交量
+                "tradecount": trade_count,  # 成交笔数（添加此字段）
+                "buytradecount": buy_trade_count,  # 主动买成交笔数
+                "selltradecount": sell_trade_count,  # 主动卖成交笔数
+                "time_lable": time_lable,  # short: 每天的第几个span
+                # 注意：根据图片要求，bar表字段使用varchar/int类型
+                # 如果需要数值类型进行计算，需要在使用时进行类型转换
+                # tran_stats表字段（总体统计，非分档）- 根据第二张图片要求
+                "buy_volume": buyvolume_str,  # varchar(32): 5分钟数据列表中，所有买方的总成交
+                "buy_dolvol": buydolvol_str,  # varchar(32): 5分钟数据列表中，所有买方的总成交额
+                "buy_trade_count": buy_trade_count,  # int: 5分钟数据列表中，所有买方的记录数
+                "sell_volume": sellvolume_str,  # varchar(32): 5分钟数据列表中，所有卖方的总成交
+                "sell_dolvol": selldolvol_str,  # varchar(32): 5分钟数据列表中，所有卖方的总成交额
+                "sell_trade_count": sell_trade_count,  # int(32): 5分钟数据列表中，所有卖方的记录数
+                # tran_stats表字段（按金额分档统计）- 根据图片要求，这些字段应该是varchar类型
+                "buy_volume1": str(buy_volume1) if not math.isnan(buy_volume1) else "0",
+                "buy_volume2": str(buy_volume2) if not math.isnan(buy_volume2) else "0",
+                "buy_volume3": str(buy_volume3) if not math.isnan(buy_volume3) else "0",
+                "buy_volume4": str(buy_volume4) if not math.isnan(buy_volume4) else "0",
+                "buy_dolvol1": str(buy_dolvol1) if not math.isnan(buy_dolvol1) else "0",
+                "buy_dolvol2": str(buy_dolvol2) if not math.isnan(buy_dolvol2) else "0",
+                "buy_dolvol3": str(buy_dolvol3) if not math.isnan(buy_dolvol3) else "0",
+                "buy_dolvol4": str(buy_dolvol4) if not math.isnan(buy_dolvol4) else "0",
+                "buy_trade_count1": buy_trade_count1,  # int类型
+                "buy_trade_count2": buy_trade_count2,  # int类型
+                "buy_trade_count3": buy_trade_count3,  # int类型
+                "buy_trade_count4": buy_trade_count4,  # int类型
+                "sell_volume1": str(sell_volume1) if not math.isnan(sell_volume1) else "0",
+                "sell_volume2": str(sell_volume2) if not math.isnan(sell_volume2) else "0",
+                "sell_volume3": str(sell_volume3) if not math.isnan(sell_volume3) else "0",
+                "sell_volume4": str(sell_volume4) if not math.isnan(sell_volume4) else "0",
+                "sell_dolvol1": str(sell_dolvol1) if not math.isnan(sell_dolvol1) else "0",
+                "sell_dolvol2": str(sell_dolvol2) if not math.isnan(sell_dolvol2) else "0",
+                "sell_dolvol3": str(sell_dolvol3) if not math.isnan(sell_dolvol3) else "0",
+                "sell_dolvol4": str(sell_dolvol4) if not math.isnan(sell_dolvol4) else "0",
+                "sell_trade_count1": sell_trade_count1,  # int类型
+                "sell_trade_count2": sell_trade_count2,  # int类型
+                "sell_trade_count3": sell_trade_count3,  # int类型
+                "sell_trade_count4": sell_trade_count4,  # int类型
             }
 
             # 使用Polars DataFrame存储（比pandas快）

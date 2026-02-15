@@ -83,15 +83,26 @@ class HistoricalKline:
         if idx < 0 or idx >= len(self.data):
             return None
         row = self.data.iloc[idx]
+        
+        # 根据图片要求，bar表字段使用varchar/int类型，需要转换为float
+        # 辅助函数：安全转换为float
+        def safe_float(val, default=0.0):
+            if pd.isna(val):
+                return default
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return default
+        
         return KlineSnapshot(
             symbol=self.symbol,
             timestamp=pd.to_datetime(row['open_time']),
-            open=float(row['open']),
-            high=float(row['high']),
-            low=float(row['low']),
-            close=float(row['close']),
-            volume=float(row.get('volume', 0)),
-            quote_asset_volume=float(row.get('quote_asset_volume', 0))
+            open=safe_float(row.get('open', 0)),
+            high=safe_float(row.get('high', 0)),
+            low=safe_float(row.get('low', 0)),
+            close=safe_float(row.get('close', 0)),
+            volume=safe_float(row.get('volume', 0)),
+            quote_asset_volume=safe_float(row.get('quote_asset_volume', 0))
         )
 
 

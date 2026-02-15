@@ -842,15 +842,58 @@ class BinanceClient:
                 # _ensure_contract_settings 会从配置读取默认值（灵活适配配置）
                 await self._ensure_contract_settings(symbol, margin_type, leverage)
             
+            # 获取当前持仓模式（用于正确处理positionSide和reduceOnly）
+            dual_side_position = False
+            if not self.dry_run:
+                try:
+                    dual_side_position = await self.get_position_mode()
+                except Exception as e:
+                    logger.warning(f"Failed to get position mode for {symbol}, assuming one-way mode: {e}")
+                    dual_side_position = False
+            
+            # 根据持仓模式处理positionSide和reduceOnly
             params = {
                 'symbol': symbol,
                 'side': side,
                 'type': order_type,
-                'positionSide': position_side,
-                'reduceOnly': reduce_only,
             }
             
-            if quantity is not None:
+            # 双向持仓模式：必须指定positionSide（LONG/SHORT），不支持reduceOnly
+            # 单向持仓模式：使用BOTH或不传递positionSide，支持reduceOnly
+            if dual_side_position:
+                # 双向持仓模式
+                if position_side not in ['LONG', 'SHORT']:
+                    # 如果未指定或为BOTH，根据目标持仓方向推断
+                    # 注意：这里需要根据实际持仓方向设置，如果无法推断则使用LONG作为默认
+                    if reduce_only:
+                        # 平仓时，需要根据当前持仓方向设置
+                        # 如果无法确定，使用LONG（更保守）
+                        logger.warning(f"reduceOnly in dual-side mode for {symbol}, position_side not specified, using LONG")
+                        position_side = 'LONG'
+                    else:
+                        # 开仓时，BUY对应LONG，SELL对应SHORT
+                        position_side = 'LONG' if side == 'BUY' else 'SHORT'
+                
+                params['positionSide'] = position_side
+                
+                # 双向持仓模式下，reduceOnly参数不被支持，需要使用closePosition
+                if reduce_only:
+                    # 使用closePosition代替reduceOnly
+                    # 注意：使用closePosition时，不能传递quantity参数
+                    params['closePosition'] = 'true'
+                    # 移除quantity参数（如果存在）
+                    if 'quantity' in params:
+                        del params['quantity']
+                    logger.debug(f"Dual-side mode: using closePosition instead of reduceOnly for {symbol}")
+                # 如果不使用closePosition，正常传递quantity
+            else:
+                # 单向持仓模式
+                params['positionSide'] = position_side  # 通常是'BOTH'
+                if reduce_only:
+                    params['reduceOnly'] = reduce_only
+            
+            # 注意：在双向持仓模式下，如果使用closePosition，不能传递quantity
+            if quantity is not None and 'closePosition' not in params:
                 # 确保数量格式化为字符串，避免浮点数精度问题
                 # Binance API要求数量必须符合step_size的精度
                 # 使用Decimal确保精度，然后转换为字符串
@@ -863,6 +906,9 @@ class BinanceClient:
                 if '.' not in qty_str:
                     qty_str = qty_str + '.0'
                 params['quantity'] = qty_str
+            elif quantity is not None and 'closePosition' in params:
+                # 双向持仓模式下使用closePosition时，不能传递quantity
+                logger.warning(f"Cannot use quantity with closePosition in dual-side mode for {symbol}, quantity will be ignored")
             
             if price is not None:
                 params['price'] = price

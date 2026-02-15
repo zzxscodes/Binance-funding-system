@@ -720,7 +720,7 @@ class DataAPI:
                                     'volume', 'quote_volume', 'trade_count',
                                     'microsecond_since_trad', 'span_begin_datetime', 'span_end_datetime',
                                     'span_status', 'last', 'vwap', 'dolvol', 'buydolvol', 'selldolvol',
-                                    'buyvolume', 'sellvolume', 'buytradecount', 'selltradecount', 'time_lable'
+                                    'buyvolume', 'sellvolume', 'tradecount', 'buytradecount', 'selltradecount', 'time_lable'
                                 ]
                                 
                                 # 只选择存在的字段（使用polars select）
