@@ -267,6 +267,7 @@ class TradeCollector:
                             logger.info(f"WebSocket batch {batch_index + 1} 连接被服务器关闭，将重连...")
                             break
                         except Exception as e:
+                            # 记录错误，但继续尝试重连而不是直接退出
                             log_network_error(
                                 f"WebSocket batch {batch_index + 1} 接收消息",
                                 e,
@@ -275,6 +276,18 @@ class TradeCollector:
                                     "batch_index": batch_index
                                 }
                             )
+                            # 对于底层传输错误（如 resume_reading），需要重新连接
+                            # 记录详细错误信息以便调试
+                            if isinstance(e, AttributeError) and 'resume_reading' in str(e):
+                                logger.warning(
+                                    f"WebSocket batch {batch_index + 1} 底层传输错误，"
+                                    f"连接可能已关闭，将重连..."
+                                )
+                            else:
+                                logger.warning(
+                                    f"WebSocket batch {batch_index + 1} 接收消息时出错，"
+                                    f"将重连... 错误: {type(e).__name__}: {e}"
+                                )
                             break
                             
             except WebSocketException as e:
@@ -406,8 +419,21 @@ class TradeCollector:
             await asyncio.sleep(0.5)
         
         # 等待所有连接任务完成
+        # 使用 return_exceptions=True 确保即使某个任务失败，也不会导致整个方法退出
         try:
-            await asyncio.gather(*self.ws_connections)
+            results = await asyncio.gather(*self.ws_connections, return_exceptions=True)
+            # 检查是否有任务因为异常而退出
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(
+                        f"WebSocket batch {i + 1} 任务异常退出: {type(result).__name__}: {result}",
+                        exc_info=result if isinstance(result, BaseException) else None
+                    )
+                    # 如果进程仍在运行，重新启动该批次的任务
+                    if self.running and i < len(batches):
+                        logger.info(f"重新启动 WebSocket batch {i + 1}...")
+                        task = asyncio.create_task(self._websocket_handler_single(batches[i], i))
+                        self.ws_connections[i] = task
         except Exception as e:
             logger.error(f"Error in WebSocket connections: {e}", exc_info=True)
         finally:
