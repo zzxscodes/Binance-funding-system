@@ -538,6 +538,7 @@ class KlineAggregator:
                 "high": high_str,  # varchar(32): 最高价
                 "low": low_int,  # int: 最低价
                 "open": open_str,  # varchar(32): 第一笔价格
+                "close": close_str,  # varchar(32): 最后一笔价格 ✅ 已添加
                 "vwap": vwap_str,  # varchar(32): dolvol / volume
                 "dolvol": dolvol_int,  # int(32): 成交额
                 "buydolvol": buydolvol_str,  # varchar(32): 主动买成交额
