@@ -133,38 +133,45 @@ class DataLayerProcess:
         if symbol not in self.trades_buffer:
             self.trades_buffer[symbol] = []
         
-        # 检查总缓冲区大小，防止内存溢出（更激进的清理策略）
+        self.trades_buffer[symbol].append(trade)
+        
+        # 检查总缓冲区大小，防止内存溢出（更激进的清理策略，目标2-2.5GB）
         total_buffer_size = sum(len(buf) for buf in self.trades_buffer.values())
-        if total_buffer_size >= self.trades_buffer_total_max_size:
+        
+        # 如果单个symbol的缓冲区达到阈值，立即保存
+        if len(self.trades_buffer[symbol]) >= self.trades_buffer_max_size:
+            await self._save_trades_batch(symbol)
+        # 如果总缓冲区接近限制（50%），提前清理
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.5):
+            # 保存最大的8个缓冲区，防止接近限制
+            sorted_symbols = sorted(
+                self.trades_buffer.items(),
+                key=lambda x: len(x[1]),
+                reverse=True
+            )
+            for sym, _ in sorted_symbols[:8]:
+                if len(self.trades_buffer[sym]) >= int(self.trades_buffer_max_size * 0.3):
+                    await self._save_trades_batch(sym)
+        # 如果总缓冲区超过限制（70%），强制保存更多
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.7):
             # 强制保存所有缓冲区中最大的几个symbol
-            logger.warning(f"Trades buffer total size ({total_buffer_size}) exceeds limit, forcing save...")
+            logger.warning(f"Trades buffer total size ({total_buffer_size}) exceeds 70% limit, forcing save...")
             # 按缓冲区大小排序，优先保存最大的
             sorted_symbols = sorted(
                 self.trades_buffer.items(),
                 key=lambda x: len(x[1]),
                 reverse=True
             )
-            # 保存前10个最大的缓冲区（增加保存数量，更及时清理）
-            for sym, _ in sorted_symbols[:10]:
+            # 保存前20个最大的缓冲区（增加保存数量，更及时清理）
+            for sym, _ in sorted_symbols[:20]:
                 if self.trades_buffer[sym]:
                     await self._save_trades_batch(sym)
-        
-        self.trades_buffer[symbol].append(trade)
-        
-        # 如果单个symbol的缓冲区达到阈值，立即保存
-        if len(self.trades_buffer[symbol]) >= self.trades_buffer_max_size:
-            await self._save_trades_batch(symbol)
-        
-        # 额外的清理检查：如果总缓冲区接近限制（80%），提前清理
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.8):
-            # 保存最大的3个缓冲区，防止接近限制
-            sorted_symbols = sorted(
-                self.trades_buffer.items(),
-                key=lambda x: len(x[1]),
-                reverse=True
-            )
-            for sym, _ in sorted_symbols[:3]:
-                if len(self.trades_buffer[sym]) >= int(self.trades_buffer_max_size * 0.5):
+        # 如果总缓冲区超过限制，强制保存所有
+        elif total_buffer_size >= self.trades_buffer_total_max_size:
+            # 强制保存所有缓冲区
+            logger.error(f"Trades buffer total size ({total_buffer_size}) exceeds limit, forcing save all...")
+            for sym in list(self.trades_buffer.keys()):
+                if self.trades_buffer[sym]:
                     await self._save_trades_batch(sym)
     
     async def _on_kline_generated(self, symbol: str, kline):
@@ -1048,8 +1055,8 @@ class DataLayerProcess:
                 await asyncio.sleep(1800)
     
     async def _periodic_memory_cleanup(self):
-        """定期内存清理任务：清理不再使用的数据，释放内存"""
-        cleanup_interval = config.get('data.memory_cleanup_interval', 1800)  # 30分钟
+        """定期内存清理任务：清理不再使用的数据，释放内存（目标2-2.5GB）"""
+        cleanup_interval = config.get('data.memory_cleanup_interval', 600)  # 10分钟（更频繁的清理）
         
         while self.running:
             try:
@@ -1105,6 +1112,13 @@ class DataLayerProcess:
                 collected = gc.collect()
                 if collected > 0:
                     logger.debug(f"Garbage collection freed {collected} objects")
+                
+                # 5. 清理空的trades_buffer条目（减少字典大小）
+                empty_buffers = [sym for sym, buf in self.trades_buffer.items() if not buf]
+                for sym in empty_buffers:
+                    del self.trades_buffer[sym]
+                if empty_buffers:
+                    logger.debug(f"Cleaned up {len(empty_buffers)} empty trades_buffer entries")
                 
                 logger.debug("Periodic memory cleanup completed")
                 

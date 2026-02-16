@@ -1125,57 +1125,57 @@ class OrderManager:
             
             # CROSSED（全仓）模式：所有交易对共享账户余额
             if margin_type == 'CROSSED':
-                # 计算可用于交易的金额（应用杠杆）
-                # 例如：10000 USDT可用余额，20倍杠杆，可用资金 = 10000 * 20 = 200000 USDT
-                # 注意：使用可用余额，而不是总余额，确保不会超过实际可用资金
-                available_capital = available_balance * leverage
+            # 计算可用于交易的金额（应用杠杆）
+            # 例如：10000 USDT可用余额，20倍杠杆，可用资金 = 10000 * 20 = 200000 USDT
+            # 注意：使用可用余额，而不是总余额，确保不会超过实际可用资金
+            available_capital = available_balance * leverage
+            
+            # 归一化权重：计算总权重（绝对值之和），然后归一化
+            total_weight = sum(abs(w) for w in target_positions.values())
+            if total_weight > 1e-8:
+                # 归一化权重，使总权重为1.0（100%）
+                normalized_weights = {symbol: w / total_weight for symbol, w in target_positions.items()}
+            else:
+                # 如果总权重为0，使用原始权重
+                normalized_weights = target_positions
+                logger.warning("Total weight is 0, using original weights")
+            
+            # 转换权重为数量
+            target_positions_quantity = {}
+            
+            for symbol, weight in normalized_weights.items():
+                if abs(weight) < 1e-8:  # 权重为0，跳过
+                    continue
                 
-                # 归一化权重：计算总权重（绝对值之和），然后归一化
-                total_weight = sum(abs(w) for w in target_positions.values())
-                if total_weight > 1e-8:
-                    # 归一化权重，使总权重为1.0（100%）
-                    normalized_weights = {symbol: w / total_weight for symbol, w in target_positions.items()}
-                else:
-                    # 如果总权重为0，使用原始权重
-                    normalized_weights = target_positions
-                    logger.warning("Total weight is 0, using original weights")
+                # 计算该交易对应该分配的USDT金额（使用归一化后的权重）
+                target_notional = abs(weight) * available_capital
                 
-                # 转换权重为数量
-                target_positions_quantity = {}
-                
-                for symbol, weight in normalized_weights.items():
-                    if abs(weight) < 1e-8:  # 权重为0，跳过
-                        continue
-                    
-                    # 计算该交易对应该分配的USDT金额（使用归一化后的权重）
-                    target_notional = abs(weight) * available_capital
-                    
-                    # 获取当前价格
-                    try:
-                        current_price = await self.client.get_symbol_price(symbol)
-                        if current_price and current_price > 0:
-                            # 计算数量
-                            quantity = target_notional / current_price
-                            # 根据方向设置正负（使用归一化后的权重）
-                            quantity = quantity if weight > 0 else -quantity
-                            target_positions_quantity[symbol] = quantity
-                        else:
-                            logger.warning(f"Could not get price for {symbol}, skipping weight conversion")
-                            # 如果无法获取价格，使用原始权重（可能是数量而不是权重）
-                            target_positions_quantity[symbol] = weight
-                    except Exception as e:
-                        logger.warning(f"Failed to convert weight to quantity for {symbol}: {e}, using original value")
+                # 获取当前价格
+                try:
+                    current_price = await self.client.get_symbol_price(symbol)
+                    if current_price and current_price > 0:
+                        # 计算数量
+                        quantity = target_notional / current_price
+                        # 根据方向设置正负（使用归一化后的权重）
+                        quantity = quantity if weight > 0 else -quantity
+                        target_positions_quantity[symbol] = quantity
+                    else:
+                        logger.warning(f"Could not get price for {symbol}, skipping weight conversion")
+                        # 如果无法获取价格，使用原始权重（可能是数量而不是权重）
                         target_positions_quantity[symbol] = weight
-                
-                logger.info(
+                except Exception as e:
+                    logger.warning(f"Failed to convert weight to quantity for {symbol}: {e}, using original value")
+                    target_positions_quantity[symbol] = weight
+            
+            logger.info(
                     f"Converted weights to quantities (CROSSED mode): {len(target_positions_quantity)} symbols, "
-                    f"total_balance={total_balance:.2f} USDT, "
-                    f"available_balance={available_balance:.2f} USDT, "
-                    f"available_capital={available_capital:.2f} USDT (leverage={leverage}x), "
-                    f"total_weight={total_weight:.4f} (normalized to 1.0)"
-                )
-                
-                return target_positions_quantity
+                f"total_balance={total_balance:.2f} USDT, "
+                f"available_balance={available_balance:.2f} USDT, "
+                f"available_capital={available_capital:.2f} USDT (leverage={leverage}x), "
+                f"total_weight={total_weight:.4f} (normalized to 1.0)"
+            )
+            
+            return target_positions_quantity
             
         except Exception as e:
             logger.error(f"Failed to convert weights to quantities: {e}", exc_info=True)

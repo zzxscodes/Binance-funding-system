@@ -362,7 +362,7 @@ class MultiFactorBacktest:
             factor_weights=getattr(self, 'factor_weights', {}),
             next_returns=getattr(self, 'next_returns', {}),
         )
-        
+
         # 自动保存结果到data目录
         try:
             output_dir = BacktestResultSaver.save_result_auto(result)
