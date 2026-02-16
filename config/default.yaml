@@ -43,15 +43,20 @@ data:
   universe_check_interval: 300  # Universe更新检查间隔（秒，5分钟）
   
   # K线聚合器内存限制
-  kline_aggregator_max_klines: 8640  # 每个symbol最多缓存K线数（约30天数据，288*30，与cache_max_klines保持一致）
+  kline_aggregator_max_klines: 8640  # 每个symbol最多缓存K线数（约30天数据，288*30，减少内存占用）
   kline_aggregator_max_pending_windows: 50  # 每个symbol最多保留的pending窗口数（防止pending_trades无限增长）
+  kline_aggregator_max_trades_per_window: 10000  # 每个窗口内最多保留的trades数量（防止单个窗口内trades无限增长）
   
   # DataStorage缓存配置
   storage_schema_cache_max_size: 1000  # Schema缓存最大数量（防止内存无限增长）
   
   # Trades缓冲区配置
-  trades_buffer_max_size: 1000  # 每个symbol最多缓存条数
-  trades_buffer_total_max_size: 50000  # 所有symbol的总缓冲区大小限制
+  trades_buffer_max_size: 500  # 每个symbol最多缓存条数（降低以减少内存占用）
+  trades_buffer_total_max_size: 30000  # 所有symbol的总缓冲区大小限制（降低以减少内存占用）
+  
+  # 内存清理配置
+  memory_cleanup_interval: 1800  # 定期内存清理间隔（秒，30分钟）
+  stats_cleanup_interval: 3600  # 统计信息清理间隔（秒，1小时）
   
   # 资金费率采集配置
   funding_rate_collect_interval: 28800  # 8小时（资金费率每8小时更新一次）
@@ -75,8 +80,8 @@ data:
   usd_rmb_rate: 7.0  # 美元对人民币汇率
   
   # 数据API缓存配置
-  cache_max_symbols: 50  # 内存缓存最多保留的symbol数量，防止内存无限增长
-  cache_max_klines: 8640  # 缓存最大K线数（288*30）
+  cache_max_symbols: 30  # 内存缓存最多保留的symbol数量，防止内存无限增长（降低以减少内存占用）
+  cache_max_klines: 8640  # 缓存最大K线数（约30天数据，288*30，降低以减少内存占用）
   
   # 历史数据采集并发配置
   history_collect_max_concurrent: 1  # 历史数据采集最大并发数（降低到1，避免触发403限流）

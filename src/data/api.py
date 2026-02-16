@@ -475,9 +475,12 @@ class DataAPI:
     def _cleanup_cache_if_needed(self):
         """
         清理缓存：如果symbol数量超过限制，删除最久未访问的symbol
+        优化：更激进的清理策略，提前清理（在达到80%限制时就开始清理）
         """
         with self._cache_lock:
-            if len(self._memory_cache) <= self._cache_max_symbols:
+            # 提前清理：在达到80%限制时就开始清理
+            cleanup_threshold = int(self._cache_max_symbols * 0.8)
+            if len(self._memory_cache) <= cleanup_threshold:
                 return
             
             # 按访问时间排序，删除最久未访问的
@@ -495,16 +498,20 @@ class DataAPI:
                 key=lambda x: x[1]
             )
             
-            # 删除最久未访问的symbol，直到满足限制
-            to_remove = len(self._memory_cache) - self._cache_max_symbols
-            for symbol, _ in sorted_symbols[:to_remove]:
-                if symbol in self._memory_cache:
-                    del self._memory_cache[symbol]
-                if symbol in self._cache_access_time:
-                    del self._cache_access_time[symbol]
-            
+            # 删除最久未访问的symbol，直到满足限制（保留到70%）
+            target_size = int(self._cache_max_symbols * 0.7)
+            to_remove = len(self._memory_cache) - target_size
             if to_remove > 0:
-                logger.debug(f"Cleaned up {to_remove} symbols from memory cache (current: {len(self._memory_cache)}/{self._cache_max_symbols})")
+                for symbol, _ in sorted_symbols[:to_remove]:
+                    if symbol in self._memory_cache:
+                        del self._memory_cache[symbol]
+                    if symbol in self._cache_access_time:
+                        del self._cache_access_time[symbol]
+                
+                logger.debug(
+                    f"Cleaned up {to_remove} symbols from memory cache "
+                    f"(current: {len(self._memory_cache)}/{self._cache_max_symbols})"
+                )
     
     async def _update_memory_cache(self, symbol: str, kline_data: dict):
         """
@@ -543,6 +550,11 @@ class DataAPI:
                     # 如果缓存为空，直接添加
                     self._memory_cache[sys_symbol] = new_kline_df
                 else:
+                    # 优化：如果已经达到限制，先清理旧数据再添加新数据（避免内存峰值）
+                    if len(cached_df) >= self._cache_max_klines:
+                        # 保留最新的（max-1）条，为新K线腾出空间
+                        cached_df = cached_df.tail(self._cache_max_klines - 1)
+                    
                     # 合并新数据（使用polars concat，比pandas快）
                     combined_df = pl.concat([cached_df, new_kline_df])
                     # 去重（按open_time，保留最新的）
@@ -550,9 +562,9 @@ class DataAPI:
                     # 按时间排序
                     combined_df = combined_df.sort('open_time')
                     
-                    # 如果超过最大数量，移除最旧的数据
+                    # 如果超过最大数量，移除最旧的数据（双重检查，确保不超过限制）
                     if len(combined_df) > self._cache_max_klines:
-                        # 保留最新的8640根
+                        # 保留最新的K线
                         combined_df = combined_df.tail(self._cache_max_klines)
                     
                     self._memory_cache[sys_symbol] = combined_df

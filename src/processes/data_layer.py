@@ -133,7 +133,7 @@ class DataLayerProcess:
         if symbol not in self.trades_buffer:
             self.trades_buffer[symbol] = []
         
-        # 检查总缓冲区大小，防止内存溢出
+        # 检查总缓冲区大小，防止内存溢出（更激进的清理策略）
         total_buffer_size = sum(len(buf) for buf in self.trades_buffer.values())
         if total_buffer_size >= self.trades_buffer_total_max_size:
             # 强制保存所有缓冲区中最大的几个symbol
@@ -144,8 +144,8 @@ class DataLayerProcess:
                 key=lambda x: len(x[1]),
                 reverse=True
             )
-            # 保存前5个最大的缓冲区
-            for sym, _ in sorted_symbols[:5]:
+            # 保存前10个最大的缓冲区（增加保存数量，更及时清理）
+            for sym, _ in sorted_symbols[:10]:
                 if self.trades_buffer[sym]:
                     await self._save_trades_batch(sym)
         
@@ -154,6 +154,18 @@ class DataLayerProcess:
         # 如果单个symbol的缓冲区达到阈值，立即保存
         if len(self.trades_buffer[symbol]) >= self.trades_buffer_max_size:
             await self._save_trades_batch(symbol)
+        
+        # 额外的清理检查：如果总缓冲区接近限制（80%），提前清理
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.8):
+            # 保存最大的3个缓冲区，防止接近限制
+            sorted_symbols = sorted(
+                self.trades_buffer.items(),
+                key=lambda x: len(x[1]),
+                reverse=True
+            )
+            for sym, _ in sorted_symbols[:3]:
+                if len(self.trades_buffer[sym]) >= int(self.trades_buffer_max_size * 0.5):
+                    await self._save_trades_batch(sym)
     
     async def _on_kline_generated(self, symbol: str, kline):
         """K线生成回调：保存K线数据"""
@@ -439,6 +451,13 @@ class DataLayerProcess:
                     if self.trades_buffer[symbol]:
                         await self._save_trades_batch(symbol)
                 
+                # 清理空的缓冲区条目，释放内存
+                empty_symbols = [
+                    sym for sym, buf in self.trades_buffer.items() if not buf
+                ]
+                for sym in empty_symbols:
+                    del self.trades_buffer[sym]
+                
                 self.last_save_time = asyncio.get_event_loop().time()
                 
                 # 定期清理旧数据
@@ -598,6 +617,10 @@ class DataLayerProcess:
         if not self.is_mock_mode:
             data_integrity_task = asyncio.create_task(self._check_and_complete_data())
             self._add_task_with_error_handler(data_integrity_task, "data_integrity_check")
+        
+        # 12. 启动定期内存清理任务（每30分钟清理一次）
+        memory_cleanup_task = asyncio.create_task(self._periodic_memory_cleanup())
+        self._add_task_with_error_handler(memory_cleanup_task, "memory_cleanup")
         
         logger.info("Data layer process started successfully")
     
@@ -1023,6 +1046,74 @@ class DataLayerProcess:
                 logger.error(f"Error in data integrity check: {e}", exc_info=True)
                 # 出错后等待30分钟再重试
                 await asyncio.sleep(1800)
+    
+    async def _periodic_memory_cleanup(self):
+        """定期内存清理任务：清理不再使用的数据，释放内存"""
+        cleanup_interval = config.get('data.memory_cleanup_interval', 1800)  # 30分钟
+        
+        while self.running:
+            try:
+                await asyncio.sleep(cleanup_interval)
+                
+                if not self.running:
+                    break
+                
+                logger.debug("Starting periodic memory cleanup...")
+                
+                # 1. 清理K线聚合器中的旧数据
+                if self.kline_aggregator:
+                    # 清理不再活跃的symbol的pending_trades
+                    universe = self.universe_manager.current_universe
+                    if universe:
+                        active_symbols = set(universe)
+                        # 清理不在universe中的symbol的pending_trades
+                        inactive_symbols = set(self.kline_aggregator.pending_trades.keys()) - active_symbols
+                        for symbol in inactive_symbols:
+                            if symbol in self.kline_aggregator.pending_trades:
+                                del self.kline_aggregator.pending_trades[symbol]
+                        if inactive_symbols:
+                            logger.debug(f"Cleaned up pending_trades for {len(inactive_symbols)} inactive symbols")
+                        
+                        # 清理不在universe中的symbol的klines（但保留最近的数据以防需要）
+                        inactive_klines = set(self.kline_aggregator.klines.keys()) - active_symbols
+                        for symbol in inactive_klines:
+                            if symbol in self.kline_aggregator.klines:
+                                del self.kline_aggregator.klines[symbol]
+                        if inactive_klines:
+                            logger.debug(f"Cleaned up klines for {len(inactive_klines)} inactive symbols")
+                
+                # 2. 清理trades_buffer中不再活跃的symbol
+                if universe:
+                    active_symbols = set(universe)
+                    inactive_trades_buffer = set(self.trades_buffer.keys()) - active_symbols
+                    for symbol in inactive_trades_buffer:
+                        if symbol in self.trades_buffer:
+                            # 先保存再删除
+                            if self.trades_buffer[symbol]:
+                                await self._save_trades_batch(symbol)
+                            del self.trades_buffer[symbol]
+                    if inactive_trades_buffer:
+                        logger.debug(f"Cleaned up trades_buffer for {len(inactive_trades_buffer)} inactive symbols")
+                
+                # 3. 清理数据API的内存缓存（如果存在）
+                if self.data_api:
+                    # 触发缓存清理（如果缓存超过限制）
+                    self.data_api._cleanup_cache_if_needed()
+                
+                # 4. 强制垃圾回收（Python的gc）
+                import gc
+                collected = gc.collect()
+                if collected > 0:
+                    logger.debug(f"Garbage collection freed {collected} objects")
+                
+                logger.debug("Periodic memory cleanup completed")
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in periodic memory cleanup: {e}", exc_info=True)
+                # 出错后等待较短时间再重试
+                await asyncio.sleep(300)  # 5分钟后重试
     
     def print_stats(self):
         """打印统计信息"""

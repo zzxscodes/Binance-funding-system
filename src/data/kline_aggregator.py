@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Callable, Union
 from collections import defaultdict
 import asyncio
+import time
 
 from ..common.config import config
 from ..common.logger import get_logger
@@ -57,7 +58,12 @@ class KlineAggregator:
         
         # Pending trades窗口数限制：每个symbol最多保留的pending窗口数，防止内存无限增长
         self.max_pending_windows_per_symbol = config.get(
-            "data.kline_aggregator_max_pending_windows", 100
+            "data.kline_aggregator_max_pending_windows", 50
+        )
+        
+        # 每个窗口内trades列表的最大大小限制（防止单个窗口内trades无限增长）
+        self.max_trades_per_window = config.get(
+            "data.kline_aggregator_max_trades_per_window", 10000
         )
 
         # 统计信息
@@ -66,6 +72,10 @@ class KlineAggregator:
             "klines_generated": defaultdict(int),
             "last_kline_time": defaultdict(Optional[datetime]),
         }
+        
+        # 统计信息清理：定期清理不再活跃的symbol的统计信息
+        self._stats_cleanup_interval = config.get("data.stats_cleanup_interval", 3600)  # 1小时
+        self._last_stats_cleanup_time = time.time()
 
         self.running = False
 
@@ -136,6 +146,18 @@ class KlineAggregator:
         self, symbol: str, normalized_trade: Dict, window_start_ms: int
     ):
         """将交易添加到pending列表（优化：使用列表收集，批量转换为DataFrame）"""
+        # 检查窗口内trades数量，防止单个窗口内trades无限增长
+        window_trades = self.pending_trades[symbol][window_start_ms]
+        if len(window_trades) >= self.max_trades_per_window:
+            # 如果超过限制，只保留最新的trades（FIFO策略）
+            # 移除最旧的10%，为新trades腾出空间
+            remove_count = int(self.max_trades_per_window * 0.1)
+            window_trades[:remove_count] = []
+            logger.warning(
+                f"{symbol} window {window_start_ms} trades count ({len(window_trades)}) "
+                f"exceeds limit ({self.max_trades_per_window}), removed oldest {remove_count} trades"
+            )
+        
         # 添加到列表（比频繁concat DataFrame快得多）
         trade_record = {
             "price": normalized_trade["price"],
@@ -183,15 +205,19 @@ class KlineAggregator:
                 if window_start < current_window_start_ms
             ]
 
-            # 聚合已关闭的窗口
+            # 聚合已关闭的窗口（批量处理，减少开销）
             for window_start_ms in windows_to_close:
                 await self._aggregate_window(symbol, window_start_ms)
             
             # 检查pending_trades窗口数，如果超过限制则清理最旧的窗口
-            if len(self.pending_trades[symbol]) > self.max_pending_windows_per_symbol:
+            # 优化：更激进的清理策略，在达到80%限制时就开始清理
+            pending_windows_count = len(self.pending_trades[symbol])
+            if pending_windows_count > int(self.max_pending_windows_per_symbol * 0.8):
                 # 按窗口时间排序，删除最旧的
                 sorted_windows = sorted(self.pending_trades[symbol].keys())
-                to_remove = len(sorted_windows) - self.max_pending_windows_per_symbol
+                # 清理到70%限制，提前释放内存
+                target_count = int(self.max_pending_windows_per_symbol * 0.7)
+                to_remove = max(0, pending_windows_count - target_count)
                 for window_start in sorted_windows[:to_remove]:
                     # 先尝试聚合，如果失败则直接删除
                     try:
@@ -232,7 +258,16 @@ class KlineAggregator:
             has_trades = len(trades_list) > 0
 
             # 批量转换为Polars DataFrame（比频繁concat快）
+            # 优化：如果trades_list太大，只使用最新的部分（防止内存爆炸）
             if has_trades:
+                max_trades_for_aggregation = self.max_trades_per_window
+                if len(trades_list) > max_trades_for_aggregation:
+                    # 只使用最新的trades（保留最新的数据）
+                    trades_list = trades_list[-max_trades_for_aggregation:]
+                    logger.warning(
+                        f"{symbol} window {window_start_ms} has {len(trades_list)} trades, "
+                        f"using latest {max_trades_for_aggregation} for aggregation"
+                    )
                 trades_df = pl.DataFrame(trades_list)
             else:
                 trades_df = pl.DataFrame()
@@ -600,9 +635,17 @@ class KlineAggregator:
                 )
 
             # 更新klines DataFrame
+            # 优化：在添加新K线之前就检查数量，避免不必要的concat操作
             if symbol not in self.klines or self.klines[symbol].is_empty():
                 self.klines[symbol] = kline_df
             else:
+                # 如果已经达到限制，先清理旧数据再添加新数据（避免内存峰值）
+                if len(self.klines[symbol]) >= self.max_klines_per_symbol:
+                    # 保留最新的（max-1）条，为新K线腾出空间
+                    self.klines[symbol] = self.klines[symbol].tail(
+                        self.max_klines_per_symbol - 1
+                    )
+                
                 # Polars的concat比pandas快很多
                 self.klines[symbol] = pl.concat([self.klines[symbol], kline_df])
 
@@ -613,10 +656,14 @@ class KlineAggregator:
                 .sort("open_time")
             )
 
-            # 限制K线数量，防止内存无限增长
+            # 限制K线数量，防止内存无限增长（更激进的清理策略）
             if len(self.klines[symbol]) > self.max_klines_per_symbol:
+                # 保留最新的K线，删除最旧的
                 self.klines[symbol] = self.klines[symbol].tail(
                     self.max_klines_per_symbol
+                )
+                logger.debug(
+                    f"{symbol} klines count exceeds limit, trimmed to {self.max_klines_per_symbol}"
                 )
 
             # 更新统计
@@ -851,8 +898,35 @@ class KlineAggregator:
         else:
             self.klines.clear()
 
+    def _cleanup_stats(self):
+        """清理不再活跃的symbol的统计信息"""
+        current_time = time.time()
+        if current_time - self._last_stats_cleanup_time < self._stats_cleanup_interval:
+            return
+        
+        self._last_stats_cleanup_time = current_time
+        
+        # 获取当前活跃的symbol（有pending_trades或klines的symbol）
+        active_symbols = set(self.pending_trades.keys()) | set(self.klines.keys())
+        
+        # 清理统计信息中不再活跃的symbol
+        for stat_key in ["trades_processed", "klines_generated", "last_kline_time"]:
+            if stat_key in self.stats:
+                stats_dict = self.stats[stat_key]
+                if isinstance(stats_dict, dict):
+                    inactive_symbols = set(stats_dict.keys()) - active_symbols
+                    for symbol in inactive_symbols:
+                        stats_dict.pop(symbol, None)
+                    if inactive_symbols:
+                        logger.debug(
+                            f"Cleaned up stats for {len(inactive_symbols)} inactive symbols"
+                        )
+    
     def get_stats(self) -> Dict:
         """获取统计信息"""
+        # 清理不再活跃的symbol的统计信息
+        self._cleanup_stats()
+        
         return {
             "interval_minutes": self.interval_minutes,
             "trades_processed": dict(self.stats["trades_processed"]),
