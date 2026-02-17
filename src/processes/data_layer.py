@@ -135,35 +135,35 @@ class DataLayerProcess:
         
         self.trades_buffer[symbol].append(trade)
         
-        # 检查总缓冲区大小，防止内存溢出（更激进的清理策略，目标2-2.5GB）
+        # 检查总缓冲区大小，防止内存溢出（更激进的清理策略，目标40%系统内存）
         total_buffer_size = sum(len(buf) for buf in self.trades_buffer.values())
         
         # 如果单个symbol的缓冲区达到阈值，立即保存
         if len(self.trades_buffer[symbol]) >= self.trades_buffer_max_size:
             await self._save_trades_batch(symbol)
-        # 如果总缓冲区接近限制（50%），提前清理
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.5):
-            # 保存最大的8个缓冲区，防止接近限制
+        # 如果总缓冲区接近限制（30%），提前清理
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.3):
+            # 保存最大的5个缓冲区，防止接近限制
             sorted_symbols = sorted(
                 self.trades_buffer.items(),
                 key=lambda x: len(x[1]),
                 reverse=True
             )
-            for sym, _ in sorted_symbols[:8]:
-                if len(self.trades_buffer[sym]) >= int(self.trades_buffer_max_size * 0.3):
+            for sym, _ in sorted_symbols[:5]:
+                if len(self.trades_buffer[sym]) >= int(self.trades_buffer_max_size * 0.2):
                     await self._save_trades_batch(sym)
-        # 如果总缓冲区超过限制（70%），强制保存更多
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.7):
+        # 如果总缓冲区超过限制（50%），强制保存更多
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.5):
             # 强制保存所有缓冲区中最大的几个symbol
-            logger.warning(f"Trades buffer total size ({total_buffer_size}) exceeds 70% limit, forcing save...")
+            logger.warning(f"Trades buffer total size ({total_buffer_size}) exceeds 50% limit, forcing save...")
             # 按缓冲区大小排序，优先保存最大的
             sorted_symbols = sorted(
                 self.trades_buffer.items(),
                 key=lambda x: len(x[1]),
                 reverse=True
             )
-            # 保存前20个最大的缓冲区（增加保存数量，更及时清理）
-            for sym, _ in sorted_symbols[:20]:
+            # 保存前15个最大的缓冲区（增加保存数量，更及时清理）
+            for sym, _ in sorted_symbols[:15]:
                 if self.trades_buffer[sym]:
                     await self._save_trades_batch(sym)
         # 如果总缓冲区超过限制，强制保存所有

@@ -478,8 +478,8 @@ class DataAPI:
         优化：更激进的清理策略，提前清理（在达到50%限制时就开始清理，目标2-2.5GB）
         """
         with self._cache_lock:
-            # 提前清理：在达到50%限制时就开始清理
-            cleanup_threshold = int(self._cache_max_symbols * 0.5)
+            # 提前清理：在达到40%限制时就开始清理（目标40%系统内存）
+            cleanup_threshold = int(self._cache_max_symbols * 0.4)
             if len(self._memory_cache) <= cleanup_threshold:
                 return
             
@@ -498,8 +498,8 @@ class DataAPI:
                 key=lambda x: x[1]
             )
             
-            # 删除最久未访问的symbol，直到满足限制（保留到40%）
-            target_size = int(self._cache_max_symbols * 0.4)
+            # 删除最久未访问的symbol，直到满足限制（保留到30%）
+            target_size = int(self._cache_max_symbols * 0.3)
             to_remove = len(self._memory_cache) - target_size
             if to_remove > 0:
                 for symbol, _ in sorted_symbols[:to_remove]:
@@ -550,8 +550,8 @@ class DataAPI:
                     # 如果缓存为空，直接添加
                     self._memory_cache[sys_symbol] = new_kline_df
                 else:
-                    # 优化：更激进的清理策略，在达到85%限制时就开始清理（目标2-2.5GB）
-                    cleanup_threshold = int(self._cache_max_klines * 0.85)
+                    # 优化：更激进的清理策略，在达到80%限制时就开始清理（目标40%系统内存）
+                    cleanup_threshold = int(self._cache_max_klines * 0.8)
                     if len(cached_df) >= cleanup_threshold:
                         # 保留最新的（max-1）条，为新K线腾出空间
                         cached_df = cached_df.tail(self._cache_max_klines - 1)
@@ -560,7 +560,7 @@ class DataAPI:
                     combined_df = pl.concat([cached_df, new_kline_df])
                     
                     # 如果数据量大，使用lazy API优化去重和排序
-                    # 优化：降低阈值，更频繁使用lazy API（目标2-2.5GB）
+                    # 优化：降低阈值，更频繁使用lazy API（目标40%系统内存）
                     if len(combined_df) > 50:
                         combined_df = (
                             combined_df

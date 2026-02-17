@@ -44,19 +44,19 @@ data:
   
   # K线聚合器内存限制
   kline_aggregator_max_klines: 8640  # 每个symbol最多缓存K线数（约30天数据，288*30，保持30天数据）
-  kline_aggregator_max_pending_windows: 25  # 每个symbol最多保留的pending窗口数（大幅降低以减少内存占用，目标2-2.5GB）
-  kline_aggregator_max_trades_per_window: 5000  # 每个窗口内最多保留的trades数量（大幅降低以减少内存占用，目标2-2.5GB）
+  kline_aggregator_max_pending_windows: 10  # 每个symbol最多保留的pending窗口数（进一步降低以减少内存占用，目标40%系统内存）
+  kline_aggregator_max_trades_per_window: 2000  # 每个窗口内最多保留的trades数量（进一步降低以减少内存占用，目标40%系统内存）
   
   # DataStorage缓存配置
-  storage_schema_cache_max_size: 500  # Schema缓存最大数量（降低以减少内存占用）
+  storage_schema_cache_max_size: 200  # Schema缓存最大数量（进一步降低以减少内存占用）
   
   # Trades缓冲区配置
-  trades_buffer_max_size: 200  # 每个symbol最多缓存条数（大幅降低以减少内存占用，目标2-2.5GB）
-  trades_buffer_total_max_size: 12000  # 所有symbol的总缓冲区大小限制（大幅降低以减少内存占用，目标2-2.5GB）
+  trades_buffer_max_size: 100  # 每个symbol最多缓存条数（进一步降低以减少内存占用，目标40%系统内存）
+  trades_buffer_total_max_size: 5000  # 所有symbol的总缓冲区大小限制（进一步降低以减少内存占用，目标40%系统内存）
   
   # 内存清理配置
-  memory_cleanup_interval: 600  # 定期内存清理间隔（秒，10分钟，更频繁的清理以控制内存峰值）
-  stats_cleanup_interval: 1800  # 统计信息清理间隔（秒，30分钟，更频繁的清理）
+  memory_cleanup_interval: 300  # 定期内存清理间隔（秒，5分钟，更频繁的清理以控制内存峰值）
+  stats_cleanup_interval: 900  # 统计信息清理间隔（秒，15分钟，更频繁的清理）
   
   # 资金费率采集配置
   funding_rate_collect_interval: 28800  # 8小时（资金费率每8小时更新一次）
@@ -80,7 +80,7 @@ data:
   usd_rmb_rate: 7.0  # 美元对人民币汇率
   
   # 数据API缓存配置
-  cache_max_symbols: 15  # 内存缓存最多保留的symbol数量，防止内存无限增长（大幅降低以减少内存占用，目标2-2.5GB）
+  cache_max_symbols: 8  # 内存缓存最多保留的symbol数量，防止内存无限增长（进一步降低以减少内存占用，目标40%系统内存）
   cache_max_klines: 8640  # 缓存最大K线数（约30天数据，288*30，保持30天数据）
   
   # 历史数据采集并发配置

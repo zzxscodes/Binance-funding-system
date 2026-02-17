@@ -147,19 +147,19 @@ class KlineAggregator:
     ):
         """将交易添加到pending列表（优化：使用列表收集，批量转换为DataFrame）"""
         # 检查窗口内trades数量，防止单个窗口内trades无限增长
-        # 优化：更激进的清理策略，在达到80%限制时就开始清理（目标2-2.5GB内存）
+        # 优化：更激进的清理策略，在达到60%限制时就开始清理（目标40%系统内存）
         window_trades = self.pending_trades[symbol][window_start_ms]
-        cleanup_threshold = int(self.max_trades_per_window * 0.8)
+        cleanup_threshold = int(self.max_trades_per_window * 0.6)
         if len(window_trades) >= cleanup_threshold:
-            # 如果超过80%限制，只保留最新的trades（FIFO策略）
-            # 移除最旧的20%，为新trades腾出空间，清理到70%限制
-            target_size = int(self.max_trades_per_window * 0.7)
+            # 如果超过60%限制，只保留最新的trades（FIFO策略）
+            # 移除最旧的30%，为新trades腾出空间，清理到50%限制
+            target_size = int(self.max_trades_per_window * 0.5)
             remove_count = len(window_trades) - target_size
             if remove_count > 0:
                 window_trades[:remove_count] = []
                 logger.debug(
                     f"{symbol} window {window_start_ms} trades count ({len(window_trades)}) "
-                    f"exceeds 80% limit ({self.max_trades_per_window}), removed oldest {remove_count} trades"
+                    f"exceeds 60% limit ({self.max_trades_per_window}), removed oldest {remove_count} trades"
                 )
         
         # 添加到列表（比频繁concat DataFrame快得多）
@@ -214,14 +214,14 @@ class KlineAggregator:
                 await self._aggregate_window(symbol, window_start_ms)
             
             # 检查pending_trades窗口数，如果超过限制则清理最旧的窗口
-            # 优化：更激进的清理策略，在达到50%限制时就开始清理（目标2-2.5GB内存）
+            # 优化：更激进的清理策略，在达到40%限制时就开始清理（目标40%系统内存）
             pending_windows_count = len(self.pending_trades[symbol])
-            cleanup_threshold = int(self.max_pending_windows_per_symbol * 0.5)
+            cleanup_threshold = int(self.max_pending_windows_per_symbol * 0.4)
             if pending_windows_count > cleanup_threshold:
                 # 按窗口时间排序，删除最旧的
                 sorted_windows = sorted(self.pending_trades[symbol].keys())
-                # 清理到40%限制，提前释放内存
-                target_count = int(self.max_pending_windows_per_symbol * 0.4)
+                # 清理到30%限制，提前释放内存
+                target_count = int(self.max_pending_windows_per_symbol * 0.3)
                 to_remove = max(0, pending_windows_count - target_count)
                 for window_start in sorted_windows[:to_remove]:
                     # 先尝试聚合，如果失败则直接删除
@@ -640,14 +640,14 @@ class KlineAggregator:
                 )
 
             # 更新klines DataFrame
-            # 优化：更激进的清理策略，在达到85%限制时就开始清理，避免内存峰值（目标2-2.5GB）
-            cleanup_threshold = int(self.max_klines_per_symbol * 0.85)
+            # 优化：更激进的清理策略，在达到80%限制时就开始清理，避免内存峰值（目标40%系统内存）
+            cleanup_threshold = int(self.max_klines_per_symbol * 0.8)
             
             if symbol not in self.klines or self.klines[symbol].is_empty():
                 self.klines[symbol] = kline_df
             else:
                 current_df = self.klines[symbol]
-                # 如果已经达到85%限制，先清理旧数据再添加新数据（避免内存峰值）
+                # 如果已经达到80%限制，先清理旧数据再添加新数据（避免内存峰值）
                 if len(current_df) >= cleanup_threshold:
                     # 保留最新的（max-1）条，为新K线腾出空间
                     current_df = current_df.tail(self.max_klines_per_symbol - 1)
@@ -668,7 +668,7 @@ class KlineAggregator:
                 self.klines[symbol] = self.klines[symbol].tail(self.max_klines_per_symbol)
             
             # 去重和排序（使用lazy API优化大数据量处理）
-            # 优化：降低阈值，更频繁使用lazy API（目标2-2.5GB）
+            # 优化：降低阈值，更频繁使用lazy API（目标40%系统内存）
             if current_len > 50:  # 数据量大时使用lazy API
                 self.klines[symbol] = (
                     self.klines[symbol]
@@ -949,7 +949,7 @@ class KlineAggregator:
                         logger.debug(
                             f"Cleaned up stats for {len(inactive_symbols)} inactive symbols"
                         )
-    
+
     def get_stats(self) -> Dict:
         """获取统计信息"""
         # 清理不再活跃的symbol的统计信息
