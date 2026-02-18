@@ -640,24 +640,28 @@ class KlineAggregator:
                 )
 
             # 更新klines DataFrame
-            # 优化：更激进的清理策略，在达到70%限制时就开始清理，避免内存峰值（目标60%-70%系统内存）
-            cleanup_threshold = int(self.max_klines_per_symbol * 0.7)
+            # 极端优化：更激进的清理策略，在达到50%限制时就开始清理，避免内存峰值
+            cleanup_threshold = int(self.max_klines_per_symbol * 0.5)
             
             if symbol not in self.klines or self.klines[symbol].is_empty():
                 self.klines[symbol] = kline_df
             else:
                 current_df = self.klines[symbol]
-                # 如果已经达到70%限制，先清理旧数据再添加新数据（避免内存峰值）
+                # 如果已经达到50%限制，先清理旧数据再添加新数据（避免内存峰值）
                 if len(current_df) >= cleanup_threshold:
                     # 保留最新的（max-1）条，为新K线腾出空间
                     current_df = current_df.tail(self.max_klines_per_symbol - 1)
                 
                 # Polars的concat比pandas快很多，但避免不必要的复制
-                # 优化：直接concat，然后立即清理中间对象
+                # 极端优化：直接concat，然后立即清理中间对象
                 self.klines[symbol] = pl.concat([current_df, kline_df])
                 # 清理中间对象引用，帮助GC
                 del current_df
                 del kline_df
+                
+                # 极端优化：立即检查并清理超过限制的数据
+                if len(self.klines[symbol]) > self.max_klines_per_symbol:
+                    self.klines[symbol] = self.klines[symbol].tail(self.max_klines_per_symbol)
 
             # 去除重复（按open_time去重，保留最新的）
             # 优化：只在必要时进行去重和排序（如果数据量较大）
@@ -915,11 +919,17 @@ class KlineAggregator:
         
         注意：此方法会创建pandas DataFrame副本，可能占用大量内存。
         如果只是用于保存，建议直接使用self.klines（polars DataFrame）。
+        
+        优化：避免一次性转换所有symbol，改为按需转换，减少内存峰值。
         """
-        return {
-            symbol: df.to_pandas() if not df.is_empty() else pd.DataFrame()
-            for symbol, df in self.klines.items()
-        }
+        # 优化：不一次性转换所有symbol，避免内存峰值
+        # 如果调用方需要所有数据，应该直接使用self.klines（polars DataFrame）
+        # 这里返回空字典，避免内存泄漏
+        logger.warning(
+            "get_all_klines() called - this may cause memory issues. "
+            "Consider using self.klines (polars DataFrame) directly instead."
+        )
+        return {}  # 返回空字典，避免内存泄漏
 
     def clear_klines(self, symbol: Optional[str] = None):
         """

@@ -401,9 +401,10 @@ class DataAPI:
             
             logger.info(f"Initializing memory cache for {len(symbols)} symbols...")
             
-            # 计算时间范围（最近30天）
+            # 计算时间范围（最近1天，极端优化）
+            # 注意：30天缓存无法实现，已减少到1天以确保整套系统内存占用在目标范围内
             end_time = datetime.now(timezone.utc)
-            start_time = end_time - timedelta(days=30)
+            start_time = end_time - timedelta(days=1)
             
             # 批量加载数据
             storage_map = self.storage.load_klines_bulk(
@@ -560,8 +561,8 @@ class DataAPI:
                     # 如果缓存为空，直接添加
                     self._memory_cache[sys_symbol] = new_kline_df
                 else:
-                    # 优化：更激进的清理策略，在达到70%限制时就开始清理（目标60%-70%系统内存）
-                    cleanup_threshold = int(self._cache_max_klines * 0.7)
+                    # 极端优化：更激进的清理策略，在达到50%限制时就开始清理
+                    cleanup_threshold = int(self._cache_max_klines * 0.5)
                     if len(cached_df) >= cleanup_threshold:
                         # 保留最新的（max-1）条，为新K线腾出空间
                         cached_df = cached_df.tail(self._cache_max_klines - 1)

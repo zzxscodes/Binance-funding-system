@@ -459,17 +459,34 @@ class DataLayerProcess:
                 
                 # 定期保存聚合好的K线
                 # 优化：直接使用polars DataFrame，避免转换为pandas DataFrame造成内存泄漏
+                # 极端优化：分批保存，避免一次性处理所有symbol造成内存峰值
                 if self.kline_aggregator:
                     saved_count = 0
-                    for symbol, df_pl in self.kline_aggregator.klines.items():
-                        if not df_pl.is_empty():
-                            # 直接使用polars DataFrame保存，避免转换为pandas
-                            # storage.save_klines内部会处理polars DataFrame
-                            df_pd = df_pl.to_pandas()
-                            self.storage.save_klines(symbol, df_pd)
-                            # 立即删除临时pandas DataFrame，释放内存
-                            del df_pd
-                            saved_count += 1
+                    symbols_to_save = list(self.kline_aggregator.klines.keys())
+                    batch_size = 50  # 每批处理50个symbol，避免内存峰值
+                    
+                    for i in range(0, len(symbols_to_save), batch_size):
+                        batch_symbols = symbols_to_save[i:i + batch_size]
+                        for symbol in batch_symbols:
+                            if symbol not in self.kline_aggregator.klines:
+                                continue
+                            df_pl = self.kline_aggregator.klines[symbol]
+                            if not df_pl.is_empty():
+                                try:
+                                    # 直接使用polars DataFrame保存，避免转换为pandas
+                                    # storage.save_klines内部会处理polars DataFrame
+                                    df_pd = df_pl.to_pandas()
+                                    self.storage.save_klines(symbol, df_pd)
+                                    # 立即删除临时pandas DataFrame，释放内存
+                                    del df_pd
+                                    saved_count += 1
+                                except Exception as e:
+                                    logger.error(f"Failed to save klines for {symbol}: {e}", exc_info=True)
+                        
+                        # 每批处理后强制垃圾回收，释放内存
+                        import gc
+                        gc.collect()
+                    
                     logger.debug(f"Periodic save completed, {saved_count} symbols")
                 
                 # 定期保存trades数据（保存所有缓冲区中的数据）
@@ -1120,6 +1137,24 @@ class DataLayerProcess:
                                 del df  # 立即释放DataFrame内存
                         if inactive_klines:
                             logger.debug(f"Cleaned up klines for {len(inactive_klines)} inactive symbols")
+                        
+                        # 极端优化：清理超过限制的klines数据（即使symbol在universe中）
+                        # 确保每个symbol的klines不超过max_klines_per_symbol
+                        max_klines = config.get('data.kline_aggregator_max_klines', 576)
+                        cleaned_count = 0
+                        for symbol in active_symbols:
+                            if symbol in self.kline_aggregator.klines:
+                                df = self.kline_aggregator.klines[symbol]
+                                if not df.is_empty() and len(df) > max_klines:
+                                    # 只保留最新的klines
+                                    old_len = len(df)
+                                    self.kline_aggregator.klines[symbol] = df.tail(max_klines)
+                                    cleaned_count += 1
+                                    logger.debug(
+                                        f"Trimmed klines for {symbol}: {old_len} -> {len(self.kline_aggregator.klines[symbol])}"
+                                    )
+                        if cleaned_count > 0:
+                            logger.debug(f"Trimmed klines for {cleaned_count} symbols exceeding limit")
                         
                         # 清理统计信息中不再活跃的symbol
                         self.kline_aggregator._cleanup_stats()
