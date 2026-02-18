@@ -171,6 +171,9 @@ class DataAPI:
                         if not df_realtime.empty:
                             if not df_storage.empty:
                                 combined_df = pd.concat([df_storage, df_realtime], ignore_index=True)
+                                # 立即释放原始DataFrame引用
+                                del df_storage
+                                del df_realtime
                                 combined_df = combined_df.drop_duplicates(subset=['open_time'], keep='last')
                                 combined_df = combined_df.sort_values('open_time').reset_index(drop=True)
                                 combined_df = combined_df[
@@ -178,13 +181,16 @@ class DataAPI:
                                     (combined_df['close_time'] <= end_time)
                                 ]
                                 df = combined_df
+                                del combined_df  # 清理中间对象
                             else:
                                 df = df_realtime[
                                     (df_realtime['open_time'] >= start_time) &
                                     (df_realtime['close_time'] <= end_time)
                                 ]
+                                del df_realtime  # 清理原始引用
                         else:
                             df = df_storage
+                            del df_realtime  # 清理空DataFrame
 
                         # 返回key：系统格式 btc-usdt（策略侧更友好）
                         key = to_system_symbol(ex_symbol)
@@ -239,6 +245,9 @@ class DataAPI:
                 if not df_storage.empty:
                     # 合并数据
                     combined_df = pd.concat([df_storage, df_realtime], ignore_index=True)
+                    # 立即释放原始DataFrame引用
+                    del df_storage
+                    del df_realtime
                     # 去重（按open_time）
                     combined_df = combined_df.drop_duplicates(subset=['open_time'], keep='last')
                     combined_df = combined_df.sort_values('open_time').reset_index(drop=True)
@@ -250,11 +259,12 @@ class DataAPI:
                     return combined_df
                 else:
                     # 只有实时数据
-                    df_realtime = df_realtime[
-                        (df_realtime['open_time'] >= start_time) & 
+                    filtered_df = df_realtime[
+                        (df_realtime['open_time'] >= start_time) &
                         (df_realtime['close_time'] <= end_time)
                     ]
-                    return df_realtime
+                    del df_realtime  # 清理原始引用
+                    return filtered_df
         
         # 返回存储的数据
         return df_storage
@@ -475,11 +485,11 @@ class DataAPI:
     def _cleanup_cache_if_needed(self):
         """
         清理缓存：如果symbol数量超过限制，删除最久未访问的symbol
-        优化：更激进的清理策略，提前清理（在达到50%限制时就开始清理，目标2-2.5GB）
+        优化：更激进的清理策略，提前清理（在达到50%限制时就开始清理，目标60%-70%系统内存）
         """
         with self._cache_lock:
-            # 提前清理：在达到40%限制时就开始清理（目标40%系统内存）
-            cleanup_threshold = int(self._cache_max_symbols * 0.4)
+            # 提前清理：在达到50%限制时就开始清理（目标60%-70%系统内存）
+            cleanup_threshold = int(self._cache_max_symbols * 0.5)
             if len(self._memory_cache) <= cleanup_threshold:
                 return
             
@@ -550,20 +560,24 @@ class DataAPI:
                     # 如果缓存为空，直接添加
                     self._memory_cache[sys_symbol] = new_kline_df
                 else:
-                    # 优化：更激进的清理策略，在达到80%限制时就开始清理（目标40%系统内存）
-                    cleanup_threshold = int(self._cache_max_klines * 0.8)
+                    # 优化：更激进的清理策略，在达到70%限制时就开始清理（目标60%-70%系统内存）
+                    cleanup_threshold = int(self._cache_max_klines * 0.7)
                     if len(cached_df) >= cleanup_threshold:
                         # 保留最新的（max-1）条，为新K线腾出空间
                         cached_df = cached_df.tail(self._cache_max_klines - 1)
                     
                     # 合并新数据（使用polars concat，比pandas快）
                     combined_df = pl.concat([cached_df, new_kline_df])
+                    # 清理中间对象引用，帮助GC
+                    del cached_df
+                    del new_kline_df
                     
                     # 如果数据量大，使用lazy API优化去重和排序
-                    # 优化：降低阈值，更频繁使用lazy API（目标40%系统内存）
-                    if len(combined_df) > 50:
-                        combined_df = (
-                            combined_df
+                    # 优化：降低阈值，更频繁使用lazy API（目标60%-70%系统内存）
+                    df_to_process = combined_df
+                    if len(df_to_process) > 50:
+                        df_to_process = (
+                            df_to_process
                             .lazy()
                             .unique(subset=['open_time'], keep='last')
                             .sort('open_time')
@@ -571,9 +585,12 @@ class DataAPI:
                         )
                     else:
                         # 去重（按open_time，保留最新的）
-                        combined_df = combined_df.unique(subset=['open_time'], keep='last')
+                        df_to_process = df_to_process.unique(subset=['open_time'], keep='last')
                         # 按时间排序
-                        combined_df = combined_df.sort('open_time')
+                        df_to_process = df_to_process.sort('open_time')
+                    combined_df = df_to_process
+                    # 清理中间引用
+                    del df_to_process
                     
                     # 如果超过最大数量，移除最旧的数据（双重检查，确保不超过限制）
                     if len(combined_df) > self._cache_max_klines:

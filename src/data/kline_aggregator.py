@@ -147,19 +147,19 @@ class KlineAggregator:
     ):
         """将交易添加到pending列表（优化：使用列表收集，批量转换为DataFrame）"""
         # 检查窗口内trades数量，防止单个窗口内trades无限增长
-        # 优化：更激进的清理策略，在达到60%限制时就开始清理（目标40%系统内存）
+        # 优化：更激进的清理策略，在达到50%限制时就开始清理（目标60%-70%系统内存）
         window_trades = self.pending_trades[symbol][window_start_ms]
-        cleanup_threshold = int(self.max_trades_per_window * 0.6)
+        cleanup_threshold = int(self.max_trades_per_window * 0.5)
         if len(window_trades) >= cleanup_threshold:
-            # 如果超过60%限制，只保留最新的trades（FIFO策略）
-            # 移除最旧的30%，为新trades腾出空间，清理到50%限制
-            target_size = int(self.max_trades_per_window * 0.5)
+            # 如果超过50%限制，只保留最新的trades（FIFO策略）
+            # 移除最旧的40%，为新trades腾出空间，清理到30%限制
+            target_size = int(self.max_trades_per_window * 0.3)
             remove_count = len(window_trades) - target_size
             if remove_count > 0:
                 window_trades[:remove_count] = []
                 logger.debug(
                     f"{symbol} window {window_start_ms} trades count ({len(window_trades)}) "
-                    f"exceeds 60% limit ({self.max_trades_per_window}), removed oldest {remove_count} trades"
+                    f"exceeds 50% limit ({self.max_trades_per_window}), removed oldest {remove_count} trades"
                 )
         
         # 添加到列表（比频繁concat DataFrame快得多）
@@ -214,14 +214,14 @@ class KlineAggregator:
                 await self._aggregate_window(symbol, window_start_ms)
             
             # 检查pending_trades窗口数，如果超过限制则清理最旧的窗口
-            # 优化：更激进的清理策略，在达到40%限制时就开始清理（目标40%系统内存）
+            # 优化：更激进的清理策略，在达到50%限制时就开始清理（目标60%-70%系统内存）
             pending_windows_count = len(self.pending_trades[symbol])
-            cleanup_threshold = int(self.max_pending_windows_per_symbol * 0.4)
+            cleanup_threshold = int(self.max_pending_windows_per_symbol * 0.5)
             if pending_windows_count > cleanup_threshold:
                 # 按窗口时间排序，删除最旧的
                 sorted_windows = sorted(self.pending_trades[symbol].keys())
-                # 清理到30%限制，提前释放内存
-                target_count = int(self.max_pending_windows_per_symbol * 0.3)
+                # 清理到30%限制，提前释放内存（至少保留1个窗口，确保系统正常运行）
+                target_count = max(1, int(self.max_pending_windows_per_symbol * 0.3))
                 to_remove = max(0, pending_windows_count - target_count)
                 for window_start in sorted_windows[:to_remove]:
                     # 先尝试聚合，如果失败则直接删除
@@ -640,25 +640,24 @@ class KlineAggregator:
                 )
 
             # 更新klines DataFrame
-            # 优化：更激进的清理策略，在达到80%限制时就开始清理，避免内存峰值（目标40%系统内存）
-            cleanup_threshold = int(self.max_klines_per_symbol * 0.8)
+            # 优化：更激进的清理策略，在达到70%限制时就开始清理，避免内存峰值（目标60%-70%系统内存）
+            cleanup_threshold = int(self.max_klines_per_symbol * 0.7)
             
             if symbol not in self.klines or self.klines[symbol].is_empty():
                 self.klines[symbol] = kline_df
             else:
                 current_df = self.klines[symbol]
-                # 如果已经达到80%限制，先清理旧数据再添加新数据（避免内存峰值）
+                # 如果已经达到70%限制，先清理旧数据再添加新数据（避免内存峰值）
                 if len(current_df) >= cleanup_threshold:
                     # 保留最新的（max-1）条，为新K线腾出空间
                     current_df = current_df.tail(self.max_klines_per_symbol - 1)
                 
                 # Polars的concat比pandas快很多，但避免不必要的复制
-                # 如果只有一条新K线，直接concat；否则先合并再concat
-                if len(kline_df) == 1:
-                    self.klines[symbol] = pl.concat([current_df, kline_df])
-                else:
-                    # 多条K线时，先合并kline_df内部，再concat
-                    self.klines[symbol] = pl.concat([current_df, kline_df])
+                # 优化：直接concat，然后立即清理中间对象
+                self.klines[symbol] = pl.concat([current_df, kline_df])
+                # 清理中间对象引用，帮助GC
+                del current_df
+                del kline_df
 
             # 去除重复（按open_time去重，保留最新的）
             # 优化：只在必要时进行去重和排序（如果数据量较大）
@@ -668,21 +667,26 @@ class KlineAggregator:
                 self.klines[symbol] = self.klines[symbol].tail(self.max_klines_per_symbol)
             
             # 去重和排序（使用lazy API优化大数据量处理）
-            # 优化：降低阈值，更频繁使用lazy API（目标40%系统内存）
+            # 优化：降低阈值，更频繁使用lazy API（目标60%-70%系统内存）
+            # 优化：先获取引用，避免重复访问
+            df_to_process = self.klines[symbol]
             if current_len > 50:  # 数据量大时使用lazy API
-                self.klines[symbol] = (
-                    self.klines[symbol]
+                df_to_process = (
+                    df_to_process
                     .lazy()
                     .unique(subset=["open_time"], keep="last")
                     .sort("open_time")
                     .collect()
                 )
             else:
-                self.klines[symbol] = (
-                    self.klines[symbol]
+                df_to_process = (
+                    df_to_process
                     .unique(subset=["open_time"], keep="last")
                     .sort("open_time")
                 )
+            self.klines[symbol] = df_to_process
+            # 清理中间引用
+            del df_to_process
 
             # 限制K线数量，防止内存无限增长（双重检查，确保不超过限制）
             if len(self.klines[symbol]) > self.max_klines_per_symbol:
@@ -906,7 +910,12 @@ class KlineAggregator:
         return df.to_pandas()
 
     def get_all_klines(self) -> Dict[str, pd.DataFrame]:
-        """获取所有交易对的K线数据（返回pandas DataFrame保持兼容性）"""
+        """
+        获取所有交易对的K线数据（返回pandas DataFrame保持兼容性）
+        
+        注意：此方法会创建pandas DataFrame副本，可能占用大量内存。
+        如果只是用于保存，建议直接使用self.klines（polars DataFrame）。
+        """
         return {
             symbol: df.to_pandas() if not df.is_empty() else pd.DataFrame()
             for symbol, df in self.klines.items()

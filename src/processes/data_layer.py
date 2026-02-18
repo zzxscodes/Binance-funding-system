@@ -135,35 +135,48 @@ class DataLayerProcess:
         
         self.trades_buffer[symbol].append(trade)
         
-        # 检查总缓冲区大小，防止内存溢出（更激进的清理策略，目标40%系统内存）
+        # 检查总缓冲区大小，防止内存溢出（更激进的清理策略，目标60%-70%系统内存）
         total_buffer_size = sum(len(buf) for buf in self.trades_buffer.values())
         
         # 如果单个symbol的缓冲区达到阈值，立即保存
         if len(self.trades_buffer[symbol]) >= self.trades_buffer_max_size:
             await self._save_trades_batch(symbol)
-        # 如果总缓冲区接近限制（30%），提前清理
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.3):
-            # 保存最大的5个缓冲区，防止接近限制
+        # 如果总缓冲区接近限制（20%），提前清理
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.2):
+            # 保存最大的3个缓冲区，防止接近限制
             sorted_symbols = sorted(
                 self.trades_buffer.items(),
                 key=lambda x: len(x[1]),
                 reverse=True
             )
-            for sym, _ in sorted_symbols[:5]:
-                if len(self.trades_buffer[sym]) >= int(self.trades_buffer_max_size * 0.2):
+            for sym, _ in sorted_symbols[:3]:
+                if len(self.trades_buffer[sym]) >= int(self.trades_buffer_max_size * 0.3):
                     await self._save_trades_batch(sym)
-        # 如果总缓冲区超过限制（50%），强制保存更多
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.5):
+        # 如果总缓冲区超过限制（40%），强制保存更多
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.4):
             # 强制保存所有缓冲区中最大的几个symbol
-            logger.warning(f"Trades buffer total size ({total_buffer_size}) exceeds 50% limit, forcing save...")
+            logger.warning(f"Trades buffer total size ({total_buffer_size}) exceeds 40% limit, forcing save...")
             # 按缓冲区大小排序，优先保存最大的
             sorted_symbols = sorted(
                 self.trades_buffer.items(),
                 key=lambda x: len(x[1]),
                 reverse=True
             )
-            # 保存前15个最大的缓冲区（增加保存数量，更及时清理）
-            for sym, _ in sorted_symbols[:15]:
+            # 保存前10个最大的缓冲区（更及时清理）
+            for sym, _ in sorted_symbols[:10]:
+                if self.trades_buffer[sym]:
+                    await self._save_trades_batch(sym)
+        # 如果总缓冲区超过限制（70%），强制保存更多
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.7):
+            # 强制保存所有缓冲区中最大的symbol
+            logger.error(f"Trades buffer total size ({total_buffer_size}) exceeds 70% limit, forcing save...")
+            sorted_symbols = sorted(
+                self.trades_buffer.items(),
+                key=lambda x: len(x[1]),
+                reverse=True
+            )
+            # 保存前20个最大的缓冲区
+            for sym, _ in sorted_symbols[:20]:
                 if self.trades_buffer[sym]:
                     await self._save_trades_batch(sym)
         # 如果总缓冲区超过限制，强制保存所有
@@ -445,13 +458,19 @@ class DataLayerProcess:
                         await self.kline_aggregator.check_and_generate_empty_windows(list(universe))
                 
                 # 定期保存聚合好的K线
+                # 优化：直接使用polars DataFrame，避免转换为pandas DataFrame造成内存泄漏
                 if self.kline_aggregator:
-                    all_klines = self.kline_aggregator.get_all_klines()
-                    for symbol, df in all_klines.items():
-                        if not df.empty:
-                            self.storage.save_klines(symbol, df)
-                    
-                    logger.debug(f"Periodic save completed, {len(all_klines)} symbols")
+                    saved_count = 0
+                    for symbol, df_pl in self.kline_aggregator.klines.items():
+                        if not df_pl.is_empty():
+                            # 直接使用polars DataFrame保存，避免转换为pandas
+                            # storage.save_klines内部会处理polars DataFrame
+                            df_pd = df_pl.to_pandas()
+                            self.storage.save_klines(symbol, df_pd)
+                            # 立即删除临时pandas DataFrame，释放内存
+                            del df_pd
+                            saved_count += 1
+                    logger.debug(f"Periodic save completed, {saved_count} symbols")
                 
                 # 定期保存trades数据（保存所有缓冲区中的数据）
                 for symbol in list(self.trades_buffer.keys()):
@@ -662,11 +681,12 @@ class DataLayerProcess:
         if self.kline_aggregator:
             await self.kline_aggregator.flush_pending()
             
-            # 保存所有K线数据
-            all_klines = self.kline_aggregator.get_all_klines()
-            for symbol, df in all_klines.items():
-                if not df.empty:
-                    self.storage.save_klines(symbol, df)
+            # 保存所有K线数据（直接使用polars DataFrame，避免内存泄漏）
+            for symbol, df_pl in self.kline_aggregator.klines.items():
+                if not df_pl.is_empty():
+                    df_pd = df_pl.to_pandas()
+                    self.storage.save_klines(symbol, df_pd)
+                    del df_pd  # 立即释放临时DataFrame
         
         # 保存所有待处理的trades数据
         for symbol in list(self.trades_buffer.keys()):
@@ -1074,20 +1094,35 @@ class DataLayerProcess:
                     if universe:
                         active_symbols = set(universe)
                         # 清理不在universe中的symbol的pending_trades
-                        inactive_symbols = set(self.kline_aggregator.pending_trades.keys()) - active_symbols
+                        # 优化：使用list()创建副本，避免在迭代时修改字典
+                        all_pending_symbols = list(self.kline_aggregator.pending_trades.keys())
+                        inactive_symbols = set(all_pending_symbols) - active_symbols
                         for symbol in inactive_symbols:
                             if symbol in self.kline_aggregator.pending_trades:
-                                del self.kline_aggregator.pending_trades[symbol]
+                                # 清理defaultdict中的条目，避免内存泄漏
+                                windows = self.kline_aggregator.pending_trades.pop(symbol, None)
+                                if windows:
+                                    # 清理所有窗口的trades列表
+                                    for window_trades in windows.values():
+                                        window_trades.clear()
+                                    windows.clear()
+                                del windows
                         if inactive_symbols:
                             logger.debug(f"Cleaned up pending_trades for {len(inactive_symbols)} inactive symbols")
                         
-                        # 清理不在universe中的symbol的klines（但保留最近的数据以防需要）
-                        inactive_klines = set(self.kline_aggregator.klines.keys()) - active_symbols
+                        # 清理不在universe中的symbol的klines
+                        # 优化：使用list()创建副本，避免在迭代时修改字典
+                        all_kline_symbols = list(self.kline_aggregator.klines.keys())
+                        inactive_klines = set(all_kline_symbols) - active_symbols
                         for symbol in inactive_klines:
                             if symbol in self.kline_aggregator.klines:
-                                del self.kline_aggregator.klines[symbol]
+                                df = self.kline_aggregator.klines.pop(symbol, None)
+                                del df  # 立即释放DataFrame内存
                         if inactive_klines:
                             logger.debug(f"Cleaned up klines for {len(inactive_klines)} inactive symbols")
+                        
+                        # 清理统计信息中不再活跃的symbol
+                        self.kline_aggregator._cleanup_stats()
                 
                 # 2. 清理trades_buffer中不再活跃的symbol
                 if universe:
