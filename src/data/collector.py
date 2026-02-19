@@ -455,6 +455,13 @@ class TradeCollector:
             self.symbols_lower = [s.lower() for s in self.symbols]
             logger.info(f"Symbols updated: added {len(added)}, removed {len(removed)}")
             
+            # 优化：清理不再使用的symbol的统计信息，防止内存累积
+            if removed:
+                for symbol in removed:
+                    self.stats['trades_received'].pop(symbol, None)
+                    self.stats['last_message_time'].pop(symbol, None)
+                logger.debug(f"Cleaned up stats for {len(removed)} removed symbols")
+            
             # 如果正在运行，需要重新连接
             if self.running:
                 logger.info("Restarting WebSocket connection with new symbols...")

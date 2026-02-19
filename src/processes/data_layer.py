@@ -6,11 +6,16 @@ import asyncio
 import signal
 import sys
 import time
+import os
 from pathlib import Path
 from typing import Set, Optional, Dict, List
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 from ..common.config import config
 from ..common.logger import get_logger
@@ -135,27 +140,27 @@ class DataLayerProcess:
         
         self.trades_buffer[symbol].append(trade)
         
-        # 检查总缓冲区大小，防止内存溢出（更激进的清理策略，目标60%-70%系统内存）
+        # 检查总缓冲区大小，防止内存溢出（更激进的清理策略，提前清理）
         total_buffer_size = sum(len(buf) for buf in self.trades_buffer.values())
         
         # 如果单个symbol的缓冲区达到阈值，立即保存
         if len(self.trades_buffer[symbol]) >= self.trades_buffer_max_size:
             await self._save_trades_batch(symbol)
-        # 如果总缓冲区接近限制（20%），提前清理
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.2):
-            # 保存最大的3个缓冲区，防止接近限制
+        # 如果总缓冲区接近限制（10%），提前清理（更激进的阈值）
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.1):
+            # 保存最大的5个缓冲区，防止接近限制
             sorted_symbols = sorted(
                 self.trades_buffer.items(),
                 key=lambda x: len(x[1]),
                 reverse=True
             )
-            for sym, _ in sorted_symbols[:3]:
-                if len(self.trades_buffer[sym]) >= int(self.trades_buffer_max_size * 0.3):
+            for sym, _ in sorted_symbols[:5]:
+                if len(self.trades_buffer[sym]) >= int(self.trades_buffer_max_size * 0.2):
                     await self._save_trades_batch(sym)
-        # 如果总缓冲区超过限制（40%），强制保存更多
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.4):
+        # 如果总缓冲区超过限制（20%），强制保存更多
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.2):
             # 强制保存所有缓冲区中最大的几个symbol
-            logger.warning(f"Trades buffer total size ({total_buffer_size}) exceeds 40% limit, forcing save...")
+            logger.warning(f"Trades buffer total size ({total_buffer_size}) exceeds 20% limit, forcing save...")
             # 按缓冲区大小排序，优先保存最大的
             sorted_symbols = sorted(
                 self.trades_buffer.items(),
@@ -164,6 +169,19 @@ class DataLayerProcess:
             )
             # 保存前10个最大的缓冲区（更及时清理）
             for sym, _ in sorted_symbols[:10]:
+                if self.trades_buffer[sym]:
+                    await self._save_trades_batch(sym)
+        # 如果总缓冲区超过限制（40%），强制保存更多
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.4):
+            # 强制保存所有缓冲区中最大的symbol
+            logger.error(f"Trades buffer total size ({total_buffer_size}) exceeds 40% limit, forcing save...")
+            sorted_symbols = sorted(
+                self.trades_buffer.items(),
+                key=lambda x: len(x[1]),
+                reverse=True
+            )
+            # 保存前20个最大的缓冲区
+            for sym, _ in sorted_symbols[:20]:
                 if self.trades_buffer[sym]:
                     await self._save_trades_batch(sym)
         # 如果总缓冲区超过限制（70%），强制保存更多
@@ -175,8 +193,8 @@ class DataLayerProcess:
                 key=lambda x: len(x[1]),
                 reverse=True
             )
-            # 保存前20个最大的缓冲区
-            for sym, _ in sorted_symbols[:20]:
+            # 保存前30个最大的缓冲区
+            for sym, _ in sorted_symbols[:30]:
                 if self.trades_buffer[sym]:
                     await self._save_trades_batch(sym)
         # 如果总缓冲区超过限制，强制保存所有
@@ -191,14 +209,15 @@ class DataLayerProcess:
         """K线生成回调：保存K线数据"""
         with self.performance_monitor.measure('data_layer', 'kline_save', {'symbol': symbol}):
             try:
-                # 转换为DataFrame
+                # 优化：直接使用dict或转换为polars DataFrame，避免不必要的pandas转换
+                # storage.save_klines支持dict和DataFrame
                 if isinstance(kline, dict):
-                    kline_df = pd.DataFrame([kline])
+                    # 直接传递dict，storage内部会处理
+                    self.storage.save_klines(symbol, pd.DataFrame([kline]))
                 else:
-                    kline_df = pd.DataFrame([kline.to_dict()])
-                
-                # 保存到存储
-                self.storage.save_klines(symbol, kline_df)
+                    # 如果是其他类型，转换为dict
+                    kline_dict = kline.to_dict() if hasattr(kline, 'to_dict') else dict(kline)
+                    self.storage.save_klines(symbol, pd.DataFrame([kline_dict]))
                 
                 # 检查是否需要通知策略进程（所有合约的5分钟K线都更新完成）
                 # 使用时间节流：每5秒最多检查一次，避免频繁检查
@@ -475,10 +494,8 @@ class DataLayerProcess:
                                 try:
                                     # 直接使用polars DataFrame保存，避免转换为pandas
                                     # storage.save_klines内部会处理polars DataFrame
-                                    df_pd = df_pl.to_pandas()
-                                    self.storage.save_klines(symbol, df_pd)
-                                    # 立即删除临时pandas DataFrame，释放内存
-                                    del df_pd
+                                    # 优化：只在需要时转换为pandas（storage内部会处理）
+                                    self.storage.save_klines(symbol, df_pl)
                                     saved_count += 1
                                 except Exception as e:
                                     logger.error(f"Failed to save klines for {symbol}: {e}", exc_info=True)
@@ -701,9 +718,8 @@ class DataLayerProcess:
             # 保存所有K线数据（直接使用polars DataFrame，避免内存泄漏）
             for symbol, df_pl in self.kline_aggregator.klines.items():
                 if not df_pl.is_empty():
-                    df_pd = df_pl.to_pandas()
-                    self.storage.save_klines(symbol, df_pd)
-                    del df_pd  # 立即释放临时DataFrame
+                    # 直接使用polars DataFrame，storage内部会处理
+                    self.storage.save_klines(symbol, df_pl)
         
         # 保存所有待处理的trades数据
         for symbol in list(self.trades_buffer.keys()):
@@ -1093,7 +1109,7 @@ class DataLayerProcess:
     
     async def _periodic_memory_cleanup(self):
         """定期内存清理任务：清理不再使用的数据，释放内存（目标2-2.5GB）"""
-        cleanup_interval = config.get('data.memory_cleanup_interval', 600)  # 10分钟（更频繁的清理）
+        cleanup_interval = config.get('data.memory_cleanup_interval', 60)  # 1分钟（更频繁的清理）
         
         while self.running:
             try:
@@ -1101,6 +1117,16 @@ class DataLayerProcess:
                 
                 if not self.running:
                     break
+                
+                # 记录清理前的内存使用情况
+                mem_before = 0
+                mem_after = 0
+                if psutil:
+                    try:
+                        process = psutil.Process(os.getpid())
+                        mem_before = process.memory_info().rss / 1024 / 1024  # MB
+                    except Exception:
+                        pass
                 
                 logger.debug("Starting periodic memory cleanup...")
                 
@@ -1127,6 +1153,40 @@ class DataLayerProcess:
                         if inactive_symbols:
                             logger.debug(f"Cleaned up pending_trades for {len(inactive_symbols)} inactive symbols")
                         
+                        # 增强：强制清理所有symbol的旧pending窗口（即使symbol在universe中）
+                        # 清理超过时间窗口的pending_trades（保留最近2个窗口）
+                        current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                        current_window_start_ms = self.kline_aggregator._get_window_start(current_time_ms)
+                        max_pending_windows = config.get('data.kline_aggregator_max_pending_windows', 2)
+                        
+                        pending_cleaned_count = 0
+                        for symbol in list(self.kline_aggregator.pending_trades.keys()):
+                            if symbol not in self.kline_aggregator.pending_trades:
+                                continue
+                            windows = self.kline_aggregator.pending_trades[symbol]
+                            if not windows:
+                                continue
+                            
+                            # 找出所有旧的窗口（超过max_pending_windows个）
+                            window_starts = sorted(windows.keys())
+                            if len(window_starts) > max_pending_windows:
+                                # 保留最新的max_pending_windows个窗口
+                                windows_to_remove = window_starts[:-max_pending_windows]
+                                for window_start in windows_to_remove:
+                                    if window_start in windows:
+                                        # 先尝试聚合，如果失败则直接删除
+                                        try:
+                                            await self.kline_aggregator._aggregate_window(symbol, window_start)
+                                        except Exception:
+                                            # 如果聚合失败，直接删除
+                                            window_trades = windows.pop(window_start, None)
+                                            if window_trades:
+                                                window_trades.clear()
+                                        pending_cleaned_count += 1
+                        
+                        if pending_cleaned_count > 0:
+                            logger.debug(f"Cleaned up {pending_cleaned_count} old pending windows")
+                        
                         # 清理不在universe中的symbol的klines
                         # 优化：使用list()创建副本，避免在迭代时修改字典
                         all_kline_symbols = list(self.kline_aggregator.klines.keys())
@@ -1140,7 +1200,7 @@ class DataLayerProcess:
                         
                         # 极端优化：清理超过限制的klines数据（即使symbol在universe中）
                         # 确保每个symbol的klines不超过max_klines_per_symbol
-                        max_klines = config.get('data.kline_aggregator_max_klines', 576)
+                        max_klines = config.get('data.kline_aggregator_max_klines', 288)
                         cleaned_count = 0
                         for symbol in active_symbols:
                             if symbol in self.kline_aggregator.klines:
@@ -1171,6 +1231,17 @@ class DataLayerProcess:
                             del self.trades_buffer[symbol]
                     if inactive_trades_buffer:
                         logger.debug(f"Cleaned up trades_buffer for {len(inactive_trades_buffer)} inactive symbols")
+                    
+                    # 增强：强制清理所有symbol的trades_buffer（即使symbol在universe中）
+                    # 如果总缓冲区超过阈值，强制保存所有
+                    total_buffer_size = sum(len(buf) for buf in self.trades_buffer.values())
+                    if total_buffer_size > 0:
+                        # 如果总缓冲区超过50%限制，强制保存所有
+                        if total_buffer_size >= int(self.trades_buffer_total_max_size * 0.5):
+                            logger.warning(f"Trades buffer total size ({total_buffer_size}) exceeds 50% limit, forcing save all during cleanup...")
+                            for sym in list(self.trades_buffer.keys()):
+                                if self.trades_buffer[sym]:
+                                    await self._save_trades_batch(sym)
                 
                 # 3. 清理数据API的内存缓存（如果存在）
                 if self.data_api:
@@ -1190,7 +1261,35 @@ class DataLayerProcess:
                 if empty_buffers:
                     logger.debug(f"Cleaned up {len(empty_buffers)} empty trades_buffer entries")
                 
-                logger.debug("Periodic memory cleanup completed")
+                # 记录清理后的内存使用情况和统计信息
+                if psutil:
+                    try:
+                        process = psutil.Process(os.getpid())
+                        mem_after = process.memory_info().rss / 1024 / 1024  # MB
+                    except Exception:
+                        mem_after = 0
+                mem_freed = mem_before - mem_after
+                
+                # 统计各组件内存使用情况
+                stats = {
+                    'trades_buffer_size': sum(len(buf) for buf in self.trades_buffer.values()),
+                    'trades_buffer_symbols': len(self.trades_buffer),
+                }
+                if self.kline_aggregator:
+                    stats['pending_trades_symbols'] = len(self.kline_aggregator.pending_trades)
+                    stats['pending_trades_windows'] = sum(len(windows) for windows in self.kline_aggregator.pending_trades.values())
+                    stats['klines_symbols'] = len(self.kline_aggregator.klines)
+                    stats['klines_total'] = sum(len(df) for df in self.kline_aggregator.klines.values() if not df.is_empty())
+                if self.data_api:
+                    with self.data_api._cache_lock:
+                        stats['cache_symbols'] = len(self.data_api._memory_cache)
+                        stats['cache_total_klines'] = sum(len(df) for df in self.data_api._memory_cache.values() if not df.is_empty())
+                
+                logger.info(
+                    f"Memory cleanup completed: "
+                    f"before={mem_before:.2f}MB, after={mem_after:.2f}MB, freed={mem_freed:.2f}MB. "
+                    f"Stats: {stats}"
+                )
                 
             except asyncio.CancelledError:
                 break

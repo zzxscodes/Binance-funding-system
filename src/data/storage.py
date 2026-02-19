@@ -203,13 +203,21 @@ class DataStorage:
                                 f"Existing kline file is empty, will overwrite with new data: {file_path}"
                             )
                         else:
+                            # 优化：使用lazy API进行合并和去重，减少中间对象
                             # Polars的concat和unique比pandas快很多
                             combined_df = pl.concat([existing_df_pl, df_pl])
-                            combined_df = combined_df.unique(
-                                subset=["open_time"], keep="last"
+                            # 清理existing_df_pl引用
+                            del existing_df_pl
+                            # 使用lazy API优化去重和排序
+                            combined_df = (
+                                combined_df.lazy()
+                                .unique(subset=["open_time"], keep="last")
+                                .sort("open_time")
+                                .collect()
                             )
-                            combined_df = combined_df.sort("open_time")
                             df_pl = combined_df
+                            # 清理combined_df引用
+                            del combined_df
                         break  # 成功读取，退出重试循环
                     except (IOError, OSError, PermissionError) as e:
                         if attempt < max_retries - 1:
@@ -288,14 +296,32 @@ class DataStorage:
                 return pd.DataFrame()
 
             # 使用Polars加载所有文件并合并（比pandas快）
+            # 优化：分批加载文件，避免一次性加载所有文件到内存
             dfs_pl = []
-            for file_path in sorted(all_files):
-                try:
-                    df_pl = self._load_dataframe_polars(file_path)
-                    if not df_pl.is_empty():
-                        dfs_pl.append(df_pl)
-                except Exception as e:
-                    logger.warning(f"Failed to load {file_path}: {e}")
+            batch_file_size = 10  # 每批处理10个文件，避免内存峰值
+            for i in range(0, len(all_files), batch_file_size):
+                batch_files = all_files[i:i + batch_file_size]
+                batch_dfs = []
+                for file_path in batch_files:
+                    try:
+                        df_pl = self._load_dataframe_polars(file_path)
+                        if not df_pl.is_empty():
+                            batch_dfs.append(df_pl)
+                    except Exception as e:
+                        logger.warning(f"Failed to load {file_path}: {e}")
+                
+                # 如果这批有数据，合并到主列表
+                if batch_dfs:
+                    if len(batch_dfs) > 1:
+                        # 合并这批文件
+                        batch_combined = pl.concat(batch_dfs)
+                        dfs_pl.append(batch_combined)
+                        # 清理中间对象
+                        del batch_dfs
+                        del batch_combined
+                    else:
+                        dfs_pl.append(batch_dfs[0])
+                        del batch_dfs
 
             if not dfs_pl:
                 return pd.DataFrame()
@@ -378,20 +404,31 @@ class DataStorage:
                 return pd.DataFrame()
 
             # combined_df_pl已经在上面统一schema时创建了
-            combined_df_pl = combined_df_pl.unique(subset=["open_time"], keep="last")
-            combined_df_pl = combined_df_pl.sort("open_time")
-
+            # 优化：使用lazy API进行去重、排序和过滤，减少中间对象
+            lazy_df = combined_df_pl.lazy()
+            lazy_df = lazy_df.unique(subset=["open_time"], keep="last")
+            lazy_df = lazy_df.sort("open_time")
+            
             # 时间过滤（使用Polars Lazy API优化）
-            if start_date or end_date:
-                lazy_df = combined_df_pl.lazy()
-                if start_date and "open_time" in combined_df_pl.columns:
-                    lazy_df = lazy_df.filter(pl.col("open_time") >= start_date)
-                if end_date and "close_time" in combined_df_pl.columns:
-                    lazy_df = lazy_df.filter(pl.col("close_time") <= end_date)
-                combined_df_pl = lazy_df.collect()
+            if start_date and "open_time" in combined_df_pl.columns:
+                lazy_df = lazy_df.filter(pl.col("open_time") >= start_date)
+            if end_date and "close_time" in combined_df_pl.columns:
+                lazy_df = lazy_df.filter(pl.col("close_time") <= end_date)
+            
+            # 一次性collect，减少中间对象
+            combined_df_pl = lazy_df.collect()
+            # 清理lazy_df引用
+            del lazy_df
+            
+            # 清理dfs_pl引用，帮助GC
+            del dfs_pl
 
             # 转换为pandas DataFrame（保持兼容性）
-            return combined_df_pl.to_pandas()
+            # 优化：只在最后需要时转换，减少内存占用
+            result = combined_df_pl.to_pandas()
+            # 立即清理polars DataFrame
+            del combined_df_pl
+            return result
 
         except Exception as e:
             logger.error(f"Failed to load klines for {symbol}: {e}", exc_info=True)
@@ -407,6 +444,8 @@ class DataStorage:
         """
         批量加载多个交易对的K线数据（并发 IO 加速）。
         返回key使用 format_symbol 后的交易对（大写）。
+        
+        优化：分批处理symbol，避免一次性加载所有数据导致内存峰值。
         """
         if not symbols:
             return {}
@@ -417,24 +456,38 @@ class DataStorage:
             # 默认：最多 16 线程，且不超过 symbols 数量
             workers = min(16, max(1, len(symbols)))
 
+        # 优化：分批处理symbol，避免一次性加载所有数据（540个symbol时内存占用过大）
+        # 每批处理50个symbol，避免内存峰值
+        batch_size = 50
         result: Dict[str, pd.DataFrame] = {}
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            fut_map = {
-                ex.submit(self.load_klines, symbol, start_date, end_date): symbol
-                for symbol in symbols
-            }
-            for fut in as_completed(fut_map):
-                symbol = fut_map[fut]
-                try:
-                    result[format_symbol(symbol)] = fut.result()
-                except PanicException as e:
-                    logger.error(f"Bulk load klines panic for {symbol}: {e}")
-                    result[format_symbol(symbol)] = pd.DataFrame()
-                except Exception as e:
-                    logger.error(
-                        f"Bulk load klines failed for {symbol}: {e}", exc_info=True
-                    )
-                    result[format_symbol(symbol)] = pd.DataFrame()
+        
+        for i in range(0, len(symbols), batch_size):
+            batch_symbols = symbols[i:i + batch_size]
+            
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                fut_map = {
+                    ex.submit(self.load_klines, symbol, start_date, end_date): symbol
+                    for symbol in batch_symbols
+                }
+                for fut in as_completed(fut_map):
+                    symbol = fut_map[fut]
+                    try:
+                        result[format_symbol(symbol)] = fut.result()
+                    except PanicException as e:
+                        logger.error(f"Bulk load klines panic for {symbol}: {e}")
+                        result[format_symbol(symbol)] = pd.DataFrame()
+                    except Exception as e:
+                        logger.error(
+                            f"Bulk load klines failed for {symbol}: {e}", exc_info=True
+                        )
+                        result[format_symbol(symbol)] = pd.DataFrame()
+            
+            # 每批处理后强制垃圾回收，释放内存
+            import gc
+            gc.collect()
+            
+            if i + batch_size < len(symbols):
+                logger.debug(f"Loaded {i + batch_size}/{len(symbols)} symbols, continuing...")
 
         return result
 

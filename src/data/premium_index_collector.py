@@ -48,7 +48,9 @@ class PremiumIndexCollector:
         # Binance溢价指数K线API: /fapi/v1/premiumIndexKlines
         url = f"{self.api_base}/fapi/v1/premiumIndexKlines"
         
+        # 优化：使用列表但限制大小，避免内存累积
         all_klines = []
+        max_klines_limit = 50000  # 最多保留50000条（约17天数据），超过则分批处理
         last_exception = None
         
         for attempt in range(max_retries):
@@ -83,6 +85,15 @@ class PremiumIndexCollector:
                             
                             if not data:
                                 break
+                            
+                            # 优化：检查列表大小，避免内存累积过多
+                            if len(all_klines) + len(data) > max_klines_limit:
+                                logger.warning(
+                                    f"Premium index klines for {symbol} exceeds limit ({max_klines_limit}), "
+                                    f"truncating to latest data"
+                                )
+                                # 只保留最新的数据
+                                all_klines = all_klines[-max_klines_limit:]
                             
                             all_klines.extend(data)
                             

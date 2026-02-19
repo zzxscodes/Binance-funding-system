@@ -65,7 +65,9 @@ class FundingRateCollector:
             - markPrice: 标记价格
         """
         symbol = format_symbol(symbol)
+        # 优化：使用列表但限制大小，避免内存累积
         all_rates = []
+        max_rates_limit = 10000  # 最多保留10000条，超过则分批处理
         last_exception = None
         
         for attempt in range(max_retries):
@@ -105,6 +107,15 @@ class FundingRateCollector:
                             
                             if not data:
                                 break
+                            
+                            # 优化：检查列表大小，避免内存累积过多
+                            if len(all_rates) + len(data) > max_rates_limit:
+                                logger.warning(
+                                    f"Funding rate data for {symbol} exceeds limit ({max_rates_limit}), "
+                                    f"truncating to latest data"
+                                )
+                                # 只保留最新的数据
+                                all_rates = all_rates[-max_rates_limit:]
                             
                             all_rates.extend(data)
                             

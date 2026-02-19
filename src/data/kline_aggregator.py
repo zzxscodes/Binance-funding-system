@@ -74,7 +74,7 @@ class KlineAggregator:
         }
         
         # 统计信息清理：定期清理不再活跃的symbol的统计信息
-        self._stats_cleanup_interval = config.get("data.stats_cleanup_interval", 3600)  # 1小时
+        self._stats_cleanup_interval = config.get("data.stats_cleanup_interval", 120)  # 2分钟（更频繁的清理）
         self._last_stats_cleanup_time = time.time()
 
         self.running = False
@@ -669,28 +669,26 @@ class KlineAggregator:
             if current_len > cleanup_threshold:
                 # 数据量大时，先trim再去重，减少处理量
                 self.klines[symbol] = self.klines[symbol].tail(self.max_klines_per_symbol)
+                current_len = len(self.klines[symbol])
             
             # 去重和排序（使用lazy API优化大数据量处理）
             # 优化：降低阈值，更频繁使用lazy API（目标60%-70%系统内存）
-            # 优化：先获取引用，避免重复访问
-            df_to_process = self.klines[symbol]
+            # 优化：直接修改self.klines[symbol]，避免创建中间引用
             if current_len > 50:  # 数据量大时使用lazy API
-                df_to_process = (
-                    df_to_process
+                self.klines[symbol] = (
+                    self.klines[symbol]
                     .lazy()
                     .unique(subset=["open_time"], keep="last")
                     .sort("open_time")
                     .collect()
                 )
-            else:
-                df_to_process = (
-                    df_to_process
+            elif current_len > 1:  # 只有1条数据时不需要去重
+                # 直接去重和排序，避免创建中间对象
+                self.klines[symbol] = (
+                    self.klines[symbol]
                     .unique(subset=["open_time"], keep="last")
                     .sort("open_time")
                 )
-            self.klines[symbol] = df_to_process
-            # 清理中间引用
-            del df_to_process
 
             # 限制K线数量，防止内存无限增长（双重检查，确保不超过限制）
             if len(self.klines[symbol]) > self.max_klines_per_symbol:

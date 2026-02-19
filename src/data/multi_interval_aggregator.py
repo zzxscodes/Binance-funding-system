@@ -82,8 +82,12 @@ class MultiIntervalAggregator:
         
         target_minutes = self.INTERVAL_MAP[target_interval]
         
-        # 转换为Polars DataFrame以提高性能
-        df_pl = pl.from_pandas(df_5min)
+        # 优化：如果已经是polars DataFrame，直接使用；否则转换
+        if isinstance(df_5min, pl.DataFrame):
+            df_pl = df_5min
+        else:
+            # 转换为Polars DataFrame以提高性能
+            df_pl = pl.from_pandas(df_5min)
         
         # 使用polars直接计算窗口起始时间（避免pandas转换）
         # 计算从当天0点开始的分钟数，然后计算窗口索引
@@ -198,8 +202,13 @@ class MultiIntervalAggregator:
         # 按时间排序
         agg_result = agg_result.sort('open_time')
         
-        # 转换为pandas DataFrame（保持API兼容性）
+        # 优化：如果输入是polars DataFrame，尝试返回polars DataFrame
+        # 但为了保持API兼容性，仍然转换为pandas
+        # 注意：这里可以进一步优化，让调用方直接使用polars DataFrame
         result_df = agg_result.to_pandas()
+        
+        # 清理polars DataFrame引用
+        del agg_result
         
         # 确保时间字段格式正确（polars转换后应该已经是datetime，但确保一下）
         if 'open_time' in result_df.columns:
