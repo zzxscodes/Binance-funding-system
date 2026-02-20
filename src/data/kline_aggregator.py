@@ -147,19 +147,19 @@ class KlineAggregator:
     ):
         """将交易添加到pending列表（优化：使用列表收集，批量转换为DataFrame）"""
         # 检查窗口内trades数量，防止单个窗口内trades无限增长
-        # 优化：更激进的清理策略，在达到50%限制时就开始清理（目标60%-70%系统内存）
+        # 极端优化：强制限制，确保不超过配置值
         window_trades = self.pending_trades[symbol][window_start_ms]
-        cleanup_threshold = int(self.max_trades_per_window * 0.5)
-        if len(window_trades) >= cleanup_threshold:
-            # 如果超过50%限制，只保留最新的trades（FIFO策略）
-            # 移除最旧的40%，为新trades腾出空间，清理到30%限制
-            target_size = int(self.max_trades_per_window * 0.3)
+        if len(window_trades) >= self.max_trades_per_window:
+            # 如果达到限制，只保留最新的trades（FIFO策略）
+            # 移除最旧的，保留最新的(max-1)条
+            target_size = self.max_trades_per_window - 1
             remove_count = len(window_trades) - target_size
             if remove_count > 0:
-                window_trades[:remove_count] = []
+                # 使用del删除最旧的数据，避免创建新列表
+                del window_trades[:remove_count]
                 logger.debug(
-                    f"{symbol} window {window_start_ms} trades count ({len(window_trades)}) "
-                    f"exceeds 50% limit ({self.max_trades_per_window}), removed oldest {remove_count} trades"
+                    f"{symbol} window {window_start_ms} trades count exceeds limit "
+                    f"({self.max_trades_per_window}), removed oldest {remove_count} trades"
                 )
         
         # 添加到列表（比频繁concat DataFrame快得多）
@@ -214,22 +214,23 @@ class KlineAggregator:
                 await self._aggregate_window(symbol, window_start_ms)
             
             # 检查pending_trades窗口数，如果超过限制则清理最旧的窗口
-            # 优化：更激进的清理策略，在达到50%限制时就开始清理（目标60%-70%系统内存）
+            # 极端优化：强制限制，确保不超过配置值
             pending_windows_count = len(self.pending_trades[symbol])
-            cleanup_threshold = int(self.max_pending_windows_per_symbol * 0.5)
-            if pending_windows_count > cleanup_threshold:
+            if pending_windows_count > self.max_pending_windows_per_symbol:
                 # 按窗口时间排序，删除最旧的
                 sorted_windows = sorted(self.pending_trades[symbol].keys())
-                # 清理到30%限制，提前释放内存（至少保留1个窗口，确保系统正常运行）
-                target_count = max(1, int(self.max_pending_windows_per_symbol * 0.3))
-                to_remove = max(0, pending_windows_count - target_count)
+                # 强制清理到配置限制
+                to_remove = pending_windows_count - self.max_pending_windows_per_symbol
                 for window_start in sorted_windows[:to_remove]:
                     # 先尝试聚合，如果失败则直接删除
                     try:
                         await self._aggregate_window(symbol, window_start)
                     except Exception:
-                        # 如果聚合失败，直接删除
-                        self.pending_trades[symbol].pop(window_start, None)
+                        # 如果聚合失败，直接删除并清理trades列表
+                        window_trades = self.pending_trades[symbol].pop(window_start, None)
+                        if window_trades:
+                            window_trades.clear()
+                        del window_trades
 
         except Exception as e:
             logger.error(f"Error adding trade for {symbol}: {e}", exc_info=True)
@@ -640,66 +641,117 @@ class KlineAggregator:
                 )
 
             # 更新klines DataFrame
-            # 极端优化：更激进的清理策略，在达到50%限制时就开始清理，避免内存峰值
-            cleanup_threshold = int(self.max_klines_per_symbol * 0.5)
+            # 极端优化：强制限制，确保不超过配置值，防止内存泄漏
+            # 在添加新K线前，先trim到(max-1)，避免超过限制
+            max_klines = self.max_klines_per_symbol
             
             if symbol not in self.klines or self.klines[symbol].is_empty():
                 self.klines[symbol] = kline_df
             else:
+                # 获取当前DataFrame
                 current_df = self.klines[symbol]
-                # 如果已经达到50%限制，先清理旧数据再添加新数据（避免内存峰值）
-                if len(current_df) >= cleanup_threshold:
-                    # 保留最新的（max-1）条，为新K线腾出空间
-                    current_df = current_df.tail(self.max_klines_per_symbol - 1)
+                current_len = len(current_df)
                 
-                # Polars的concat比pandas快很多，但避免不必要的复制
-                # 极端优化：直接concat，然后立即清理中间对象
-                self.klines[symbol] = pl.concat([current_df, kline_df])
-                # 清理中间对象引用，帮助GC
+                # 强制限制：如果当前已经达到或超过限制，先trim到(max-1)
+                if current_len >= max_klines:
+                    # 保留最新的(max-1)条，为新K线腾出空间
+                    # 使用clone()确保创建新对象，然后删除旧引用
+                    current_df = current_df.tail(max_klines - 1).clone()
+                    # 立即更新klines，释放旧的DataFrame
+                    old_df = self.klines[symbol]
+                    self.klines[symbol] = current_df
+                    del old_df
+                    current_len = len(current_df)
+                
+                # 合并新K线
+                # 使用clone()确保创建新对象
+                new_df = pl.concat([current_df, kline_df]).clone()
+                # 立即更新并释放旧对象
+                self.klines[symbol] = new_df
                 del current_df
                 del kline_df
+                del new_df  # 临时变量，立即释放
                 
-                # 极端优化：立即检查并清理超过限制的数据
-                if len(self.klines[symbol]) > self.max_klines_per_symbol:
-                    self.klines[symbol] = self.klines[symbol].tail(self.max_klines_per_symbol)
+                # 强制检查：确保不超过限制
+                if len(self.klines[symbol]) > max_klines:
+                    # 强制trim到限制值
+                    trimmed_df = self.klines[symbol].tail(max_klines).clone()
+                    old_df = self.klines[symbol]
+                    self.klines[symbol] = trimmed_df
+                    del old_df
+                    del trimmed_df
 
             # 去除重复（按open_time去重，保留最新的）
-            # 优化：只在必要时进行去重和排序（如果数据量较大）
+            # 优化：只在必要时进行去重和排序
             current_len = len(self.klines[symbol])
-            if current_len > cleanup_threshold:
-                # 数据量大时，先trim再去重，减少处理量
-                self.klines[symbol] = self.klines[symbol].tail(self.max_klines_per_symbol)
-                current_len = len(self.klines[symbol])
+            
+            # 如果数据量较大，先trim再去重，减少处理量
+            if current_len > max_klines:
+                trimmed_df = self.klines[symbol].tail(max_klines).clone()
+                old_df = self.klines[symbol]
+                self.klines[symbol] = trimmed_df
+                del old_df
+                del trimmed_df
+                current_len = max_klines
             
             # 去重和排序（使用lazy API优化大数据量处理）
-            # 优化：降低阈值，更频繁使用lazy API（目标60%-70%系统内存）
-            # 优化：直接修改self.klines[symbol]，避免创建中间引用
             if current_len > 50:  # 数据量大时使用lazy API
-                self.klines[symbol] = (
+                # 使用lazy API，减少中间对象
+                processed_df = (
                     self.klines[symbol]
                     .lazy()
                     .unique(subset=["open_time"], keep="last")
                     .sort("open_time")
                     .collect()
                 )
+                # 立即更新并释放旧对象
+                old_df = self.klines[symbol]
+                self.klines[symbol] = processed_df
+                del old_df
+                del processed_df
             elif current_len > 1:  # 只有1条数据时不需要去重
-                # 直接去重和排序，避免创建中间对象
-                self.klines[symbol] = (
+                # 直接去重和排序
+                processed_df = (
                     self.klines[symbol]
                     .unique(subset=["open_time"], keep="last")
                     .sort("open_time")
+                    .clone()
+                )
+                old_df = self.klines[symbol]
+                self.klines[symbol] = processed_df
+                del old_df
+                del processed_df
+
+            # 最终强制检查：确保不超过限制（三重检查，防止内存泄漏）
+            final_len = len(self.klines[symbol])
+            if final_len > max_klines:
+                # 强制trim到限制值
+                final_df = self.klines[symbol].tail(max_klines).clone()
+                old_df = self.klines[symbol]
+                self.klines[symbol] = final_df
+                del old_df
+                del final_df
+                logger.warning(
+                    f"{symbol} klines count ({final_len}) exceeds limit ({max_klines}), "
+                    f"force trimmed to {max_klines}"
                 )
 
-            # 限制K线数量，防止内存无限增长（双重检查，确保不超过限制）
-            if len(self.klines[symbol]) > self.max_klines_per_symbol:
-                # 保留最新的K线，删除最旧的
-                self.klines[symbol] = self.klines[symbol].tail(
-                    self.max_klines_per_symbol
-                )
-                logger.debug(
-                    f"{symbol} klines count exceeds limit, trimmed to {self.max_klines_per_symbol}"
-                )
-
+            # 清理临时DataFrame，释放内存
+            if has_trades:
+                # 释放所有临时DataFrame引用
+                del buy_trades
+                del sell_trades
+                del buy_tier1
+                del buy_tier2
+                del buy_tier3
+                del buy_tier4
+                del sell_tier1
+                del sell_tier2
+                del sell_tier3
+                del sell_tier4
+                del trades_df
+                del agg_result
+            
             # 更新统计
             self.stats["klines_generated"][symbol] += 1
             self.stats["last_kline_time"][symbol] = window_start_dt
