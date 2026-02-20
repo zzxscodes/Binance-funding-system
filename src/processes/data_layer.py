@@ -1282,7 +1282,7 @@ class DataLayerProcess:
                                 f"Trimmed klines for {cleaned_count} symbols exceeding limit ({max_klines}), "
                                 f"removed {total_trimmed} klines total"
                             )
-                        elif expected_max_klines > 0 and current_klines_total > expected_max_klines * 0.9:  # 接近限制但未清理
+                        elif expected_max_klines > 1 and current_klines_total > expected_max_klines * 0.9:  # 接近限制但未清理（max_klines=1时跳过警告）
                             logger.warning(
                                 f"Klines total ({current_klines_total}) is close to limit ({expected_max_klines:.0f}) "
                                 f"but no trimming occurred. This may indicate a cleanup issue."
