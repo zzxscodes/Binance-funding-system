@@ -1159,12 +1159,14 @@ class DataLayerProcess:
                             if symbol not in self.kline_aggregator.pending_trades:
                                 continue
                             # 清理defaultdict中的条目，避免内存泄漏
+                            # 修复内存泄漏：确保所有pending_trades被完全清理
                             windows = self.kline_aggregator.pending_trades.pop(symbol, None)
                             if windows:
                                 # 清理所有窗口的trades列表
-                                for window_trades in windows.values():
+                                for window_start, window_trades in list(windows.items()):
                                     if window_trades:
                                         window_trades.clear()
+                                        del window_trades
                                 windows.clear()
                                 del windows
                                 inactive_cleaned += 1
@@ -1173,6 +1175,9 @@ class DataLayerProcess:
                                 f"Cleaned up pending_trades for {inactive_cleaned} inactive symbols "
                                 f"(removed {len(inactive_symbols)} symbols from pending_trades)"
                             )
+                            # 强制垃圾回收，帮助释放内存
+                            import gc
+                            gc.collect()
                         
                         # 增强：强制清理所有symbol的旧pending窗口（即使symbol在universe中）
                         # 清理超过时间窗口的pending_trades（保留最近2个窗口）
@@ -1198,16 +1203,18 @@ class DataLayerProcess:
                                     if window_start not in windows:
                                         continue  # 可能已被其他线程删除
                                     # 先尝试聚合，如果失败则直接删除
+                                    # 修复内存泄漏：确保窗口和trades列表被完全清理
                                     try:
                                         await self.kline_aggregator._aggregate_window(symbol, window_start)
                                         # 聚合成功，窗口已被_aggregate_window内部的pop移除
                                         pending_cleaned_count += 1
                                     except Exception as e:
-                                        # 如果聚合失败，直接删除
-                                        window_trades = windows.pop(window_start, None)
-                                        if window_trades:
-                                            window_trades.clear()
-                                            del window_trades
+                                        # 如果聚合失败，直接删除并清理
+                                        if window_start in windows:
+                                            window_trades = windows.pop(window_start, None)
+                                            if window_trades:
+                                                window_trades.clear()
+                                                del window_trades
                                         pending_cleaned_count += 1
                                         logger.debug(
                                             f"Failed to aggregate window {window_start} for {symbol}, "
@@ -1221,15 +1228,21 @@ class DataLayerProcess:
                             )
                         
                         # 清理不在universe中的symbol的klines
+                        # 修复内存泄漏：确保所有DataFrame被完全释放
                         # 优化：使用list()创建副本，避免在迭代时修改字典
                         all_kline_symbols = list(self.kline_aggregator.klines.keys())
                         inactive_klines = set(all_kline_symbols) - active_symbols
                         for symbol in inactive_klines:
                             if symbol in self.kline_aggregator.klines:
                                 df = self.kline_aggregator.klines.pop(symbol, None)
-                                del df  # 立即释放DataFrame内存
+                                if df is not None:
+                                    # 确保DataFrame被完全释放
+                                    del df
                         if inactive_klines:
                             logger.debug(f"Cleaned up klines for {len(inactive_klines)} inactive symbols")
+                            # 强制垃圾回收，帮助释放内存
+                            import gc
+                            gc.collect()
                         
                         # 极端优化：强制清理超过限制的klines数据（即使symbol在universe中）
                         # 确保每个symbol的klines不超过max_klines_per_symbol
@@ -1251,10 +1264,13 @@ class DataLayerProcess:
                             current_len = len(df)
                             if current_len > max_klines:
                                 # 只保留最新的klines，使用clone()确保创建新对象
-                                trimmed_df = df.tail(max_klines).clone()
+                                # 修复内存泄漏：确保旧DataFrame被完全释放
+                                old_df = self.kline_aggregator.klines[symbol]
+                                trimmed_df = old_df.tail(max_klines).clone()
                                 # 立即更新并释放旧对象
                                 self.kline_aggregator.klines[symbol] = trimmed_df
-                                del df
+                                if old_df is not None and old_df is not trimmed_df:
+                                    del old_df
                                 del trimmed_df
                                 cleaned_count += 1
                                 total_trimmed += (current_len - max_klines)
@@ -1288,10 +1304,13 @@ class DataLayerProcess:
                             current_len = len(df)
                             if current_len > trim_threshold:
                                 # 预防性清理：trim到80%限制
+                                # 修复内存泄漏：确保旧DataFrame被完全释放
                                 old_len = current_len
-                                trimmed_df = df.tail(trim_threshold).clone()
+                                old_df = self.kline_aggregator.klines[symbol]
+                                trimmed_df = old_df.tail(trim_threshold).clone()
                                 self.kline_aggregator.klines[symbol] = trimmed_df
-                                del df
+                                if old_df is not None and old_df is not trimmed_df:
+                                    del old_df
                                 del trimmed_df
                                 preventive_cleaned += 1
                                 preventive_total_trimmed += (old_len - trim_threshold)
@@ -1335,15 +1354,22 @@ class DataLayerProcess:
                     self.data_api._cleanup_cache_if_needed()
                 
                 # 4. 强制垃圾回收（Python的gc）
+                # 修复内存泄漏：更激进的GC策略，确保内存被真正释放
                 import gc
                 # 如果内存超过阈值，执行多次GC
-                gc_rounds = 3 if mem_before > memory_warning_threshold else 1
+                gc_rounds = 5 if mem_before > memory_warning_threshold else 2
                 total_collected = 0
                 for _ in range(gc_rounds):
                     collected = gc.collect()
                     total_collected += collected
                 if total_collected > 0:
                     logger.debug(f"Garbage collection freed {total_collected} objects ({gc_rounds} rounds)")
+                
+                # 如果内存仍然很高，执行更激进的GC（包括清理循环引用）
+                if mem_before > memory_warning_threshold:
+                    # 清理所有代（generation）的垃圾
+                    for generation in range(3):
+                        gc.collect(generation)
                 
                 # 如果内存仍然很高，强制清理所有可能的缓存
                 if mem_before > memory_critical_threshold and self.kline_aggregator:
@@ -1356,9 +1382,12 @@ class DataLayerProcess:
                         if symbol in self.kline_aggregator.klines:
                             df = self.kline_aggregator.klines[symbol]
                             if not df.is_empty() and len(df) > aggressive_limit:
-                                trimmed_df = df.tail(aggressive_limit).clone()
+                                # 修复内存泄漏：确保旧DataFrame被完全释放
+                                old_df = self.kline_aggregator.klines[symbol]
+                                trimmed_df = old_df.tail(aggressive_limit).clone()
                                 self.kline_aggregator.klines[symbol] = trimmed_df
-                                del df
+                                if old_df is not None and old_df is not trimmed_df:
+                                    del old_df
                                 del trimmed_df
                                 aggressive_cleaned += 1
                     if aggressive_cleaned > 0:

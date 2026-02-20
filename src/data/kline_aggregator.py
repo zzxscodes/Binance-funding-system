@@ -74,7 +74,8 @@ class KlineAggregator:
         }
         
         # 统计信息清理：定期清理不再活跃的symbol的统计信息
-        self._stats_cleanup_interval = config.get("data.stats_cleanup_interval", 120)  # 2分钟（更频繁的清理）
+        # 修复内存泄漏：更频繁的清理，避免统计信息累积
+        self._stats_cleanup_interval = config.get("data.stats_cleanup_interval", 60)  # 1分钟（更频繁的清理）
         self._last_stats_cleanup_time = time.time()
 
         self.running = False
@@ -232,10 +233,12 @@ class KlineAggregator:
                         removed_count += 1
                     except Exception as e:
                         # 如果聚合失败，直接删除并清理trades列表
-                        window_trades = self.pending_trades[symbol].pop(window_start, None)
-                        if window_trades:
-                            window_trades.clear()
-                        del window_trades
+                        # 修复内存泄漏：确保窗口和trades列表被完全清理
+                        if symbol in self.pending_trades and window_start in self.pending_trades[symbol]:
+                            window_trades = self.pending_trades[symbol].pop(window_start, None)
+                            if window_trades:
+                                window_trades.clear()
+                                del window_trades
                         removed_count += 1
                         logger.debug(
                             f"Failed to aggregate window {window_start} for {symbol} during limit check, "
@@ -268,14 +271,25 @@ class KlineAggregator:
         """
         try:
             # 从pending列表获取trades（现在是List[Dict]）
-            trades_list = self.pending_trades[symbol].pop(window_start_ms, [])
+            # 修复内存泄漏：确保窗口被完全移除，并立即清理trades_list引用
+            if window_start_ms in self.pending_trades.get(symbol, {}):
+                trades_list = self.pending_trades[symbol].pop(window_start_ms, [])
+                # 立即清空列表，释放内存
+                if trades_list:
+                    trades_list.clear()
+            else:
+                trades_list = []
 
             if trades_override is not None:
                 # 覆盖使用外部提供的成交
                 trades_list = trades_override
-                # 移除可能残留的pending
-                if window_start_ms in self.pending_trades[symbol]:
-                    self.pending_trades[symbol].pop(window_start_ms, None)
+                # 移除可能残留的pending，并清理
+                if symbol in self.pending_trades:
+                    if window_start_ms in self.pending_trades[symbol]:
+                        old_trades = self.pending_trades[symbol].pop(window_start_ms, None)
+                        if old_trades:
+                            old_trades.clear()
+                            del old_trades
 
             # 检查是否有交易
             has_trades = len(trades_list) > 0
@@ -658,8 +672,7 @@ class KlineAggregator:
                 )
 
             # 更新klines DataFrame
-            # 极端优化：强制限制，确保不超过配置值，防止内存泄漏
-            # 在添加新K线前，先trim到(max-1)，避免超过限制
+            # 修复内存泄漏：确保所有DataFrame引用被正确释放，使用更激进的清理策略
             max_klines = self.max_klines_per_symbol
             
             if symbol not in self.klines or self.klines[symbol].is_empty():
@@ -669,39 +682,47 @@ class KlineAggregator:
                 current_df = self.klines[symbol]
                 current_len = len(current_df)
                 
-                # 强制限制：如果当前已经达到或超过限制，先trim到(max-1)
-                if current_len >= max_klines:
-                    # 保留最新的(max-1)条，为新K线腾出空间
+                # 修复内存泄漏：更激进的清理策略，提前trim到80%限制，避免内存峰值
+                trim_threshold = int(max_klines * 0.8)
+                if current_len >= trim_threshold:
+                    # 提前trim到80%限制，为新K线腾出空间
                     # 使用clone()确保创建新对象，然后删除旧引用
-                    current_df = current_df.tail(max_klines - 1).clone()
+                    trimmed_current = current_df.tail(trim_threshold - 1).clone()
                     # 立即更新klines，释放旧的DataFrame
                     old_df = self.klines[symbol]
-                    self.klines[symbol] = current_df
+                    self.klines[symbol] = trimmed_current
                     del old_df
+                    del current_df
+                    current_df = trimmed_current
                     current_len = len(current_df)
                 
                 # 合并新K线
                 # 使用concat合并，不立即clone（减少不必要的复制）
                 new_df = pl.concat([current_df, kline_df])
-                # 立即释放中间对象引用
+                # 立即释放中间对象引用，帮助GC
                 del current_df
                 del kline_df
-                
-                # 更新klines（在去重前先更新，避免去重过程中数据丢失）
-                self.klines[symbol] = new_df
                 
                 # 强制检查：如果合并后超过限制，立即trim（在去重前）
                 if len(new_df) > max_klines:
                     # 先trim到限制值，然后再去重（避免去重后仍超过限制）
                     trimmed_df = new_df.tail(max_klines).clone()
+                    old_new_df = self.klines.get(symbol)
                     self.klines[symbol] = trimmed_df
                     del new_df
                     del trimmed_df
+                    if old_new_df is not None and old_new_df is not self.klines[symbol]:
+                        del old_new_df
                 else:
+                    # 更新klines（在去重前先更新，避免去重过程中数据丢失）
+                    old_new_df = self.klines.get(symbol)
+                    self.klines[symbol] = new_df
+                    if old_new_df is not None and old_new_df is not new_df:
+                        del old_new_df
                     del new_df  # 临时变量，立即释放
 
             # 去除重复（按open_time去重，保留最新的）
-            # 优化：只在必要时进行去重和排序
+            # 修复内存泄漏：确保所有中间DataFrame被正确释放
             current_len = len(self.klines[symbol])
             
             # 如果数据量较大，先trim再去重，减少处理量
@@ -709,47 +730,54 @@ class KlineAggregator:
                 trimmed_df = self.klines[symbol].tail(max_klines).clone()
                 old_df = self.klines[symbol]
                 self.klines[symbol] = trimmed_df
-                del old_df
+                # 确保旧DataFrame被完全释放
+                if old_df is not None and old_df is not trimmed_df:
+                    del old_df
                 del trimmed_df
                 current_len = max_klines
             
             # 去重和排序（使用lazy API优化大数据量处理）
+            # 修复内存泄漏：只在必要时进行去重，并确保释放所有中间对象
             if current_len > 50:  # 数据量大时使用lazy API
                 # 使用lazy API，减少中间对象
+                old_df = self.klines[symbol]
                 processed_df = (
-                    self.klines[symbol]
+                    old_df
                     .lazy()
                     .unique(subset=["open_time"], keep="last")
                     .sort("open_time")
                     .collect()
                 )
                 # 立即更新并释放旧对象
-                old_df = self.klines[symbol]
                 self.klines[symbol] = processed_df
-                del old_df
+                if old_df is not None and old_df is not processed_df:
+                    del old_df
                 del processed_df
             elif current_len > 1:  # 只有1条数据时不需要去重
                 # 直接去重和排序
+                old_df = self.klines[symbol]
                 processed_df = (
-                    self.klines[symbol]
+                    old_df
                     .unique(subset=["open_time"], keep="last")
                     .sort("open_time")
                     .clone()
                 )
-                old_df = self.klines[symbol]
                 self.klines[symbol] = processed_df
-                del old_df
+                if old_df is not None and old_df is not processed_df:
+                    del old_df
                 del processed_df
 
             # 最终强制检查：确保不超过限制（三重检查，防止内存泄漏）
-            # 注意：去重后数据量可能减少，但仍需检查是否超过限制
+            # 修复内存泄漏：确保所有DataFrame引用被正确释放
             final_len = len(self.klines[symbol])
             if final_len > max_klines:
                 # 强制trim到限制值（保留最新的）
-                final_df = self.klines[symbol].tail(max_klines).clone()
                 old_df = self.klines[symbol]
+                final_df = old_df.tail(max_klines).clone()
                 self.klines[symbol] = final_df
-                del old_df
+                # 确保旧DataFrame被完全释放
+                if old_df is not None and old_df is not final_df:
+                    del old_df
                 del final_df
                 logger.warning(
                     f"{symbol} klines count ({final_len}) exceeds limit ({max_klines}), "
@@ -761,8 +789,15 @@ class KlineAggregator:
                     f"{symbol} klines count ({final_len}) is close to limit ({max_klines}), "
                     f"will be trimmed in next cleanup cycle"
                 )
+            
+            # 强制垃圾回收：在关键路径上触发GC，帮助释放内存
+            # 注意：只在数据量大时触发，避免频繁GC影响性能
+            if final_len > 100:
+                import gc
+                gc.collect()
 
-            # 清理临时DataFrame，释放内存
+            # 清理临时DataFrame和列表，释放内存
+            # 修复内存泄漏：确保所有临时对象被完全释放
             if has_trades:
                 # 释放所有临时DataFrame引用
                 del buy_trades
@@ -777,6 +812,15 @@ class KlineAggregator:
                 del sell_tier4
                 del trades_df
                 del agg_result
+                # 清空trades_list，释放内存
+                if trades_list:
+                    trades_list.clear()
+                del trades_list
+            else:
+                # 即使没有trades，也要清理trades_list
+                if trades_list:
+                    trades_list.clear()
+                del trades_list
             
             # 更新统计
             self.stats["klines_generated"][symbol] += 1
@@ -1023,6 +1067,7 @@ class KlineAggregator:
 
     def _cleanup_stats(self):
         """清理不再活跃的symbol的统计信息"""
+        # 修复内存泄漏：更频繁的清理，确保统计信息不会无限累积
         current_time = time.time()
         if current_time - self._last_stats_cleanup_time < self._stats_cleanup_interval:
             return
@@ -1033,17 +1078,26 @@ class KlineAggregator:
         active_symbols = set(self.pending_trades.keys()) | set(self.klines.keys())
         
         # 清理统计信息中不再活跃的symbol
+        # 修复内存泄漏：确保所有不活跃的symbol被完全移除
+        total_cleaned = 0
         for stat_key in ["trades_processed", "klines_generated", "last_kline_time"]:
             if stat_key in self.stats:
                 stats_dict = self.stats[stat_key]
                 if isinstance(stats_dict, dict):
                     inactive_symbols = set(stats_dict.keys()) - active_symbols
                     for symbol in inactive_symbols:
+                        # 使用pop确保完全移除
                         stats_dict.pop(symbol, None)
-                    if inactive_symbols:
-                        logger.debug(
-                            f"Cleaned up stats for {len(inactive_symbols)} inactive symbols"
-                        )
+                    total_cleaned += len(inactive_symbols)
+        
+        if total_cleaned > 0:
+            logger.debug(
+                f"Cleaned up stats for {total_cleaned} inactive symbols "
+                f"(active: {len(active_symbols)})"
+            )
+            # 强制垃圾回收，帮助释放内存
+            import gc
+            gc.collect()
 
     def get_stats(self) -> Dict:
         """获取统计信息"""

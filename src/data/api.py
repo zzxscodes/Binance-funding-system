@@ -532,19 +532,29 @@ class DataAPI:
             )
             
             # 删除最久未访问的symbol，直到满足限制（保留到20%）
+            # 修复内存泄漏：确保所有DataFrame被完全释放
             target_size = int(self._cache_max_symbols * 0.2)
             to_remove = len(self._memory_cache) - target_size
             if to_remove > 0:
+                removed_count = 0
                 for symbol, _ in sorted_symbols[:to_remove]:
                     if symbol in self._memory_cache:
-                        del self._memory_cache[symbol]
+                        # 确保DataFrame被完全释放
+                        df = self._memory_cache.pop(symbol, None)
+                        if df is not None:
+                            del df
+                        removed_count += 1
                     if symbol in self._cache_access_time:
                         del self._cache_access_time[symbol]
                 
-                logger.debug(
-                    f"Cleaned up {to_remove} symbols from memory cache "
-                    f"(current: {len(self._memory_cache)}/{self._cache_max_symbols})"
-                )
+                if removed_count > 0:
+                    logger.debug(
+                        f"Cleaned up {removed_count} symbols from memory cache "
+                        f"(current: {len(self._memory_cache)}/{self._cache_max_symbols})"
+                    )
+                    # 强制垃圾回收，帮助释放内存
+                    import gc
+                    gc.collect()
     
     async def _update_memory_cache(self, symbol: str, kline_data: dict):
         """
@@ -590,6 +600,8 @@ class DataAPI:
                         cached_df = cached_df.tail(self._cache_max_klines - 1)
                     
                     # 合并新数据（使用polars concat，比pandas快）
+                    # 修复内存泄漏：确保所有中间DataFrame被正确释放
+                    old_cached_df = cached_df
                     combined_df = pl.concat([cached_df, new_kline_df])
                     # 清理中间对象引用，帮助GC
                     del cached_df
@@ -599,25 +611,39 @@ class DataAPI:
                     # 优化：降低阈值，更频繁使用lazy API（目标60%-70%系统内存）
                     combined_len = len(combined_df)
                     if combined_len > 50:
+                        old_combined_df = combined_df
                         combined_df = (
-                            combined_df
+                            old_combined_df
                             .lazy()
                             .unique(subset=['open_time'], keep='last')
                             .sort('open_time')
                             .collect()
                         )
+                        if old_combined_df is not None and old_combined_df is not combined_df:
+                            del old_combined_df
                     elif combined_len > 1:
                         # 去重（按open_time，保留最新的）
-                        combined_df = combined_df.unique(subset=['open_time'], keep='last')
-                        # 按时间排序
+                        old_combined_df = combined_df
+                        combined_df = old_combined_df.unique(subset=['open_time'], keep='last')
                         combined_df = combined_df.sort('open_time')
+                        if old_combined_df is not None and old_combined_df is not combined_df:
+                            del old_combined_df
                     
                     # 如果超过最大数量，移除最旧的数据（双重检查，确保不超过限制）
                     if len(combined_df) > self._cache_max_klines:
                         # 保留最新的K线
-                        combined_df = combined_df.tail(self._cache_max_klines)
+                        old_combined_df = combined_df
+                        combined_df = old_combined_df.tail(self._cache_max_klines)
+                        if old_combined_df is not None and old_combined_df is not combined_df:
+                            del old_combined_df
                     
+                    # 更新缓存，确保旧DataFrame被释放
+                    old_cached = self._memory_cache.get(sys_symbol)
                     self._memory_cache[sys_symbol] = combined_df
+                    if old_cached is not None and old_cached is not combined_df and old_cached is not old_cached_df:
+                        del old_cached
+                    if old_cached_df is not None and old_cached_df is not combined_df:
+                        del old_cached_df
                 
                 # 检查并清理缓存
                 self._cleanup_cache_if_needed()
