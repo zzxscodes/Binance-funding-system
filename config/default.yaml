@@ -45,15 +45,15 @@ data:
   # K线聚合器内存限制（极端优化：确保整套系统占用free内存40%-60%）
   # 注意：30天缓存无法实现，已减少到1天以确保整套系统内存占用在目标范围内
   kline_aggregator_max_klines: 288  # 每个symbol最多缓存K线数（约1天数据，288*1，极端优化以确保整套系统在free内存40%-60%范围内）
-  kline_aggregator_max_pending_windows: 2  # 每个symbol最多保留的pending窗口数（保持2个窗口）
-  kline_aggregator_max_trades_per_window: 250  # 每个窗口内最多保留的trades数量（极端优化：300->250，进一步降低内存占用）
+  kline_aggregator_max_pending_windows: 1  # 每个symbol最多保留的pending窗口数（保持2个窗口）
+  kline_aggregator_max_trades_per_window: 10  # 每个窗口内最多保留的trades数量
   
   # DataStorage缓存配置
-  storage_schema_cache_max_size: 100  # Schema缓存最大数量（大幅降低以减少内存占用）
+  storage_schema_cache_max_size: 10  # Schema缓存最大数量（大幅降低以减少内存占用）
   
   # Trades缓冲区配置（极端优化）
-  trades_buffer_max_size: 30  # 每个symbol最多缓存条数（极端优化：40->30，进一步降低内存占用）
-  trades_buffer_total_max_size: 1000  # 所有symbol的总缓冲区大小限制（极端优化：1500->1000，进一步降低内存占用）
+  trades_buffer_max_size: 10  # 每个symbol最多缓存条数（极端优化：40->30，进一步降低内存占用）
+  trades_buffer_total_max_size: 10  # 所有symbol的总缓冲区大小限制
   
   # 内存清理配置（极端优化：更频繁的清理以确保整套系统内存占用在目标范围内）
   memory_cleanup_interval: 60  # 定期内存清理间隔（秒，1分钟，极端优化：更频繁的清理以控制内存峰值）
@@ -80,10 +80,9 @@ data:
   tran_stats_tier3_threshold_rmb: 1000000  # 第三档阈值（人民币）
   usd_rmb_rate: 7.0  # 美元对人民币汇率
   
-  # 数据API缓存配置（极端优化：确保整套系统占用free内存40%-60%）
-  # 注意：30天缓存无法实现，已减少到1天以确保整套系统内存占用在目标范围内
-  cache_max_symbols: 3  # 内存缓存最多保留的symbol数量（只缓存最活跃的3个symbol）
-  cache_max_klines: 288  # 缓存最大K线数（约1天数据，288*1，极端优化以确保整套系统在free内存40%-60%范围内）
+  # 数据API缓存配置
+  cache_max_symbols: 1  # 内存缓存最多保留的symbol数量（只缓存最活跃的1个symbol）
+  cache_max_klines: 288  # 缓存最大K线数（约1天数据，288*1）
   
   # 历史数据采集并发配置
   history_collect_max_concurrent: 1  # 历史数据采集最大并发数（降低到1，避免触发403限流）
