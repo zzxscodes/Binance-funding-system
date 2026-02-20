@@ -1324,7 +1324,30 @@ class DataLayerProcess:
                             )
                         
                         # 清理统计信息中不再活跃的symbol
+                        # 修复内存泄漏：确保统计信息被及时清理
                         self.kline_aggregator._cleanup_stats()
+                        
+                        # 强制清理统计信息：即使不在清理间隔内，也确保统计信息不会无限积累
+                        # 如果统计信息中的symbol数量远大于活跃symbol数量，强制清理
+                        stats_symbols = set()
+                        for stat_key in ["trades_processed", "klines_generated", "last_kline_time"]:
+                            if stat_key in self.kline_aggregator.stats:
+                                stats_dict = self.kline_aggregator.stats[stat_key]
+                                if isinstance(stats_dict, dict):
+                                    stats_symbols.update(stats_dict.keys())
+                        
+                        if len(stats_symbols) > len(active_symbols) * 1.5:  # 如果统计信息中的symbol数量超过活跃symbol的1.5倍，强制清理
+                            logger.debug(f"Force cleaning stats: stats_symbols={len(stats_symbols)}, active_symbols={len(active_symbols)}")
+                            for stat_key in ["trades_processed", "klines_generated", "last_kline_time"]:
+                                if stat_key in self.kline_aggregator.stats:
+                                    stats_dict = self.kline_aggregator.stats[stat_key]
+                                    if isinstance(stats_dict, dict):
+                                        inactive_symbols = set(stats_dict.keys()) - active_symbols
+                                        for symbol in inactive_symbols:
+                                            stats_dict.pop(symbol, None)
+                            # 强制垃圾回收
+                            import gc
+                            gc.collect()
                 
                 # 2. 清理trades_buffer中不再活跃的symbol
                 if universe:
@@ -1354,6 +1377,16 @@ class DataLayerProcess:
                 if self.data_api:
                     # 触发缓存清理（如果缓存超过限制）
                     self.data_api._cleanup_cache_if_needed()
+                    
+                    # 修复内存泄漏：强制清理缓存访问时间中不再使用的条目
+                    with self.data_api._cache_lock:
+                        cache_symbols = set(self.data_api._memory_cache.keys())
+                        access_time_keys = set(self.data_api._cache_access_time.keys())
+                        stale_keys = access_time_keys - cache_symbols
+                        if stale_keys:
+                            for key in stale_keys:
+                                del self.data_api._cache_access_time[key]
+                            logger.debug(f"Cleaned up {len(stale_keys)} stale cache access time entries")
                 
                 # 4. 强制垃圾回收（Python的gc）
                 # 修复内存泄漏：更激进的GC策略，确保内存被真正释放
@@ -1404,6 +1437,15 @@ class DataLayerProcess:
                     del self.trades_buffer[sym]
                 if empty_buffers:
                     logger.debug(f"Cleaned up {len(empty_buffers)} empty trades_buffer entries")
+                
+                # 6. 清理performance_monitor的旧数据（如果启用）
+                # 修复内存泄漏：确保performance_monitor不会无限积累数据
+                if self.performance_monitor and self.performance_monitor.enabled:
+                    try:
+                        # 触发自动清理
+                        self.performance_monitor.cleanup_old_rounds()
+                    except Exception as e:
+                        logger.debug(f"Failed to cleanup performance monitor: {e}")
                 
                 # 记录清理后的内存使用情况和统计信息
                 if psutil:
