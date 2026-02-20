@@ -1154,18 +1154,25 @@ class DataLayerProcess:
                         # 优化：使用list()创建副本，避免在迭代时修改字典
                         all_pending_symbols = list(self.kline_aggregator.pending_trades.keys())
                         inactive_symbols = set(all_pending_symbols) - active_symbols
+                        inactive_cleaned = 0
                         for symbol in inactive_symbols:
-                            if symbol in self.kline_aggregator.pending_trades:
-                                # 清理defaultdict中的条目，避免内存泄漏
-                                windows = self.kline_aggregator.pending_trades.pop(symbol, None)
-                                if windows:
-                                    # 清理所有窗口的trades列表
-                                    for window_trades in windows.values():
+                            if symbol not in self.kline_aggregator.pending_trades:
+                                continue
+                            # 清理defaultdict中的条目，避免内存泄漏
+                            windows = self.kline_aggregator.pending_trades.pop(symbol, None)
+                            if windows:
+                                # 清理所有窗口的trades列表
+                                for window_trades in windows.values():
+                                    if window_trades:
                                         window_trades.clear()
-                                    windows.clear()
+                                windows.clear()
                                 del windows
-                        if inactive_symbols:
-                            logger.debug(f"Cleaned up pending_trades for {len(inactive_symbols)} inactive symbols")
+                                inactive_cleaned += 1
+                        if inactive_cleaned > 0:
+                            logger.info(
+                                f"Cleaned up pending_trades for {inactive_cleaned} inactive symbols "
+                                f"(removed {len(inactive_symbols)} symbols from pending_trades)"
+                            )
                         
                         # 增强：强制清理所有symbol的旧pending窗口（即使symbol在universe中）
                         # 清理超过时间窗口的pending_trades（保留最近2个窗口）
@@ -1184,22 +1191,34 @@ class DataLayerProcess:
                             # 找出所有旧的窗口（超过max_pending_windows个）
                             window_starts = sorted(windows.keys())
                             if len(window_starts) > max_pending_windows:
-                                # 保留最新的max_pending_windows个窗口
-                                windows_to_remove = window_starts[:-max_pending_windows]
+                                # 保留最新的max_pending_windows个窗口，删除最旧的
+                                # 注意：window_starts[:-max_pending_windows] 会保留除了最后N个之外的所有窗口（这是要删除的）
+                                windows_to_remove = window_starts[:len(window_starts) - max_pending_windows]
                                 for window_start in windows_to_remove:
-                                    if window_start in windows:
-                                        # 先尝试聚合，如果失败则直接删除
-                                        try:
-                                            await self.kline_aggregator._aggregate_window(symbol, window_start)
-                                        except Exception:
-                                            # 如果聚合失败，直接删除
-                                            window_trades = windows.pop(window_start, None)
-                                            if window_trades:
-                                                window_trades.clear()
+                                    if window_start not in windows:
+                                        continue  # 可能已被其他线程删除
+                                    # 先尝试聚合，如果失败则直接删除
+                                    try:
+                                        await self.kline_aggregator._aggregate_window(symbol, window_start)
+                                        # 聚合成功，窗口已被_aggregate_window内部的pop移除
                                         pending_cleaned_count += 1
+                                    except Exception as e:
+                                        # 如果聚合失败，直接删除
+                                        window_trades = windows.pop(window_start, None)
+                                        if window_trades:
+                                            window_trades.clear()
+                                            del window_trades
+                                        pending_cleaned_count += 1
+                                        logger.debug(
+                                            f"Failed to aggregate window {window_start} for {symbol}, "
+                                            f"deleted directly: {e}"
+                                        )
                         
                         if pending_cleaned_count > 0:
-                            logger.debug(f"Cleaned up {pending_cleaned_count} old pending windows")
+                            logger.info(
+                                f"Cleaned up {pending_cleaned_count} old pending windows "
+                                f"(kept {max_pending_windows} latest windows per symbol)"
+                            )
                         
                         # 清理不在universe中的symbol的klines
                         # 优化：使用list()创建副本，避免在迭代时修改字典
@@ -1217,44 +1236,71 @@ class DataLayerProcess:
                         max_klines = config.get('data.kline_aggregator_max_klines', 288)
                         cleaned_count = 0
                         total_trimmed = 0
-                        for symbol in active_symbols:
-                            if symbol in self.kline_aggregator.klines:
-                                df = self.kline_aggregator.klines[symbol]
-                                if not df.is_empty() and len(df) > max_klines:
-                                    # 只保留最新的klines，使用clone()确保创建新对象
-                                    old_len = len(df)
-                                    trimmed_df = df.tail(max_klines).clone()
-                                    # 立即更新并释放旧对象
-                                    self.kline_aggregator.klines[symbol] = trimmed_df
-                                    del df
-                                    del trimmed_df
-                                    cleaned_count += 1
-                                    total_trimmed += (old_len - max_klines)
-                                    logger.debug(
-                                        f"Trimmed klines for {symbol}: {old_len} -> {max_klines}"
-                                    )
+                        # 先计算当前klines总数，用于后续检查
+                        current_klines_total = sum(len(df) for df in self.kline_aggregator.klines.values() if not df.is_empty())
+                        expected_max_klines = len(active_symbols) * max_klines if active_symbols else 0
+                        
+                        # 遍历所有klines中的symbol（包括不在active_symbols中的，确保全面清理）
+                        all_kline_symbols = list(self.kline_aggregator.klines.keys())
+                        for symbol in all_kline_symbols:
+                            if symbol not in self.kline_aggregator.klines:
+                                continue  # 可能已被其他线程删除
+                            df = self.kline_aggregator.klines[symbol]
+                            if df.is_empty():
+                                continue
+                            current_len = len(df)
+                            if current_len > max_klines:
+                                # 只保留最新的klines，使用clone()确保创建新对象
+                                trimmed_df = df.tail(max_klines).clone()
+                                # 立即更新并释放旧对象
+                                self.kline_aggregator.klines[symbol] = trimmed_df
+                                del df
+                                del trimmed_df
+                                cleaned_count += 1
+                                total_trimmed += (current_len - max_klines)
+                                logger.info(
+                                    f"Trimmed klines for {symbol}: {current_len} -> {max_klines}"
+                                )
                         if cleaned_count > 0:
                             logger.info(
-                                f"Trimmed klines for {cleaned_count} symbols exceeding limit, "
+                                f"Trimmed klines for {cleaned_count} symbols exceeding limit ({max_klines}), "
                                 f"removed {total_trimmed} klines total"
+                            )
+                        elif expected_max_klines > 0 and current_klines_total > expected_max_klines * 0.9:  # 接近限制但未清理
+                            logger.warning(
+                                f"Klines total ({current_klines_total}) is close to limit ({expected_max_klines:.0f}) "
+                                f"but no trimming occurred. This may indicate a cleanup issue."
                             )
                         
                         # 强制清理：即使没有超过限制，也定期trim到80%限制，确保内存稳定
                         # 这样可以提前释放内存，避免内存峰值
                         trim_threshold = int(max_klines * 0.8)
                         preventive_cleaned = 0
-                        for symbol in list(self.kline_aggregator.klines.keys()):
-                            if symbol in self.kline_aggregator.klines:
-                                df = self.kline_aggregator.klines[symbol]
-                                if not df.is_empty() and len(df) > trim_threshold:
-                                    # 预防性清理：trim到80%限制
-                                    trimmed_df = df.tail(trim_threshold).clone()
-                                    self.kline_aggregator.klines[symbol] = trimmed_df
-                                    del df
-                                    del trimmed_df
-                                    preventive_cleaned += 1
+                        preventive_total_trimmed = 0
+                        # 遍历所有klines中的symbol，确保全面清理
+                        all_kline_symbols = list(self.kline_aggregator.klines.keys())
+                        for symbol in all_kline_symbols:
+                            if symbol not in self.kline_aggregator.klines:
+                                continue  # 可能已被其他线程删除
+                            df = self.kline_aggregator.klines[symbol]
+                            if df.is_empty():
+                                continue
+                            current_len = len(df)
+                            if current_len > trim_threshold:
+                                # 预防性清理：trim到80%限制
+                                old_len = current_len
+                                trimmed_df = df.tail(trim_threshold).clone()
+                                self.kline_aggregator.klines[symbol] = trimmed_df
+                                del df
+                                del trimmed_df
+                                preventive_cleaned += 1
+                                preventive_total_trimmed += (old_len - trim_threshold)
                         if preventive_cleaned > 0:
-                            logger.debug(f"Preventive trimmed klines for {preventive_cleaned} symbols")
+                            logger.info(
+                                f"Preventive trimmed klines for {preventive_cleaned} symbols "
+                                f"(trimmed to {trim_threshold} klines, 80% of max {max_klines}), "
+                                f"removed {preventive_total_trimmed} klines total"
+                            )
                         
                         # 清理统计信息中不再活跃的symbol
                         self.kline_aggregator._cleanup_stats()
@@ -1346,10 +1392,45 @@ class DataLayerProcess:
                     stats['pending_trades_windows'] = sum(len(windows) for windows in self.kline_aggregator.pending_trades.values())
                     stats['klines_symbols'] = len(self.kline_aggregator.klines)
                     stats['klines_total'] = sum(len(df) for df in self.kline_aggregator.klines.values() if not df.is_empty())
+                    # 计算平均每个symbol的klines数量
+                    if stats['klines_symbols'] > 0:
+                        stats['avg_klines_per_symbol'] = round(stats['klines_total'] / stats['klines_symbols'], 1)
                 if self.data_api:
                     with self.data_api._cache_lock:
                         stats['cache_symbols'] = len(self.data_api._memory_cache)
                         stats['cache_total_klines'] = sum(len(df) for df in self.data_api._memory_cache.values() if not df.is_empty())
+                
+                # 检查清理效果和内存趋势
+                max_klines = config.get('data.kline_aggregator_max_klines', 288)
+                klines_total = stats.get('klines_total', 0)
+                klines_symbols = stats.get('klines_symbols', 0)
+                expected_max_klines = klines_symbols * max_klines if klines_symbols > 0 else 0
+                
+                # 如果klines_total超过预期，发出警告
+                if klines_total > expected_max_klines * 1.1:  # 超过10%容差
+                    logger.warning(
+                        f"Klines total ({klines_total}) exceeds expected limit ({expected_max_klines:.0f}), "
+                        f"some symbols may not be trimmed properly. "
+                        f"Average klines per symbol: {klines_total/klines_symbols:.1f} (max: {max_klines})"
+                    )
+                
+                # 如果清理效果不明显（释放内存<1MB且内存仍在增长），发出警告
+                if mem_freed < 1.0 and mem_before > 200:  # 内存超过200MB但释放很少
+                    logger.warning(
+                        f"Memory cleanup had limited effect: freed only {mem_freed:.2f}MB. "
+                        f"Current memory: {mem_after:.2f}MB. "
+                        f"This may indicate memory growth or insufficient cleanup."
+                    )
+                
+                # 记录清理详情（INFO级别，便于监控）
+                cleanup_details = []
+                if stats.get('pending_trades_windows', 0) > klines_symbols * 2:  # 平均每个symbol超过2个窗口
+                    cleanup_details.append(f"pending_windows={stats.get('pending_trades_windows', 0)}")
+                if stats.get('trades_buffer_size', 0) > 0:
+                    cleanup_details.append(f"trades_buffer={stats.get('trades_buffer_size', 0)}")
+                
+                if cleanup_details:
+                    logger.info(f"Memory cleanup details: {', '.join(cleanup_details)}")
                 
                 logger.info(
                     f"Memory cleanup completed: "

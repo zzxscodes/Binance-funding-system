@@ -219,18 +219,35 @@ class KlineAggregator:
             if pending_windows_count > self.max_pending_windows_per_symbol:
                 # 按窗口时间排序，删除最旧的
                 sorted_windows = sorted(self.pending_trades[symbol].keys())
-                # 强制清理到配置限制
+                # 强制清理到配置限制（保留最新的N个窗口）
                 to_remove = pending_windows_count - self.max_pending_windows_per_symbol
+                removed_count = 0
                 for window_start in sorted_windows[:to_remove]:
+                    if window_start not in self.pending_trades[symbol]:
+                        continue  # 可能已被其他线程删除
                     # 先尝试聚合，如果失败则直接删除
                     try:
                         await self._aggregate_window(symbol, window_start)
-                    except Exception:
+                        # 聚合成功，窗口已被_aggregate_window内部的pop移除
+                        removed_count += 1
+                    except Exception as e:
                         # 如果聚合失败，直接删除并清理trades列表
                         window_trades = self.pending_trades[symbol].pop(window_start, None)
                         if window_trades:
                             window_trades.clear()
                         del window_trades
+                        removed_count += 1
+                        logger.debug(
+                            f"Failed to aggregate window {window_start} for {symbol} during limit check, "
+                            f"deleted directly: {e}"
+                        )
+                
+                if removed_count > 0:
+                    logger.debug(
+                        f"{symbol}: cleaned up {removed_count} pending windows "
+                        f"(kept {self.max_pending_windows_per_symbol} latest, "
+                        f"was {pending_windows_count})"
+                    )
 
         except Exception as e:
             logger.error(f"Error adding trade for {symbol}: {e}", exc_info=True)
@@ -664,22 +681,24 @@ class KlineAggregator:
                     current_len = len(current_df)
                 
                 # 合并新K线
-                # 使用clone()确保创建新对象
-                new_df = pl.concat([current_df, kline_df]).clone()
-                # 立即更新并释放旧对象
-                self.klines[symbol] = new_df
+                # 使用concat合并，不立即clone（减少不必要的复制）
+                new_df = pl.concat([current_df, kline_df])
+                # 立即释放中间对象引用
                 del current_df
                 del kline_df
-                del new_df  # 临时变量，立即释放
                 
-                # 强制检查：确保不超过限制
-                if len(self.klines[symbol]) > max_klines:
-                    # 强制trim到限制值
-                    trimmed_df = self.klines[symbol].tail(max_klines).clone()
-                    old_df = self.klines[symbol]
+                # 更新klines（在去重前先更新，避免去重过程中数据丢失）
+                self.klines[symbol] = new_df
+                
+                # 强制检查：如果合并后超过限制，立即trim（在去重前）
+                if len(new_df) > max_klines:
+                    # 先trim到限制值，然后再去重（避免去重后仍超过限制）
+                    trimmed_df = new_df.tail(max_klines).clone()
                     self.klines[symbol] = trimmed_df
-                    del old_df
+                    del new_df
                     del trimmed_df
+                else:
+                    del new_df  # 临时变量，立即释放
 
             # 去除重复（按open_time去重，保留最新的）
             # 优化：只在必要时进行去重和排序
@@ -723,9 +742,10 @@ class KlineAggregator:
                 del processed_df
 
             # 最终强制检查：确保不超过限制（三重检查，防止内存泄漏）
+            # 注意：去重后数据量可能减少，但仍需检查是否超过限制
             final_len = len(self.klines[symbol])
             if final_len > max_klines:
-                # 强制trim到限制值
+                # 强制trim到限制值（保留最新的）
                 final_df = self.klines[symbol].tail(max_klines).clone()
                 old_df = self.klines[symbol]
                 self.klines[symbol] = final_df
@@ -734,6 +754,12 @@ class KlineAggregator:
                 logger.warning(
                     f"{symbol} klines count ({final_len}) exceeds limit ({max_klines}), "
                     f"force trimmed to {max_klines}"
+                )
+            # 额外检查：即使没有超过限制，如果接近限制也记录日志（用于调试）
+            elif final_len > max_klines * 0.9:
+                logger.debug(
+                    f"{symbol} klines count ({final_len}) is close to limit ({max_klines}), "
+                    f"will be trimmed in next cleanup cycle"
                 )
 
             # 清理临时DataFrame，释放内存
