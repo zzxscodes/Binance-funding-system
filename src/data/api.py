@@ -594,10 +594,13 @@ class DataAPI:
                     self._memory_cache[sys_symbol] = new_kline_df
                 else:
                     # 极端优化：更激进的清理策略，在达到50%限制时就开始清理
-                    cleanup_threshold = int(self._cache_max_klines * 0.5)
+                    # 修复：当cache_max_klines=1时，cleanup_threshold至少为1，避免为0
+                    cleanup_threshold = max(1, int(self._cache_max_klines * 0.5))
                     if len(cached_df) >= cleanup_threshold:
                         # 保留最新的（max-1）条，为新K线腾出空间
-                        cached_df = cached_df.tail(self._cache_max_klines - 1)
+                        # 修复：当cache_max_klines=1时，至少保留1条，避免tail(0)导致空DataFrame
+                        tail_count = max(1, self._cache_max_klines - 1)
+                        cached_df = cached_df.tail(tail_count)
                     
                     # 合并新数据（使用polars concat，比pandas快）
                     # 修复内存泄漏：确保所有中间DataFrame被正确释放

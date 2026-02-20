@@ -1288,9 +1288,11 @@ class DataLayerProcess:
                                 f"but no trimming occurred. This may indicate a cleanup issue."
                             )
                         
-                        # 强制清理：即使没有超过限制，也定期trim到80%限制，确保内存稳定
+                        # 强制清理：即使没有超过限制，也定期trim到60%限制（从80%降低到60%），确保内存稳定
+                        # 修复配置安全性：降低trim阈值，确保内存不超过1.5-2GB目标
+                        # 修复：当max_klines=1时，trim_threshold至少为1，避免为0导致所有K线被删除
                         # 这样可以提前释放内存，避免内存峰值
-                        trim_threshold = int(max_klines * 0.8)
+                        trim_threshold = max(1, int(max_klines * 0.6))  # 从80%降低到60%，更激进的清理，但至少保留1条
                         preventive_cleaned = 0
                         preventive_total_trimmed = 0
                         # 遍历所有klines中的symbol，确保全面清理
@@ -1303,7 +1305,7 @@ class DataLayerProcess:
                                 continue
                             current_len = len(df)
                             if current_len > trim_threshold:
-                                # 预防性清理：trim到80%限制
+                                # 预防性清理：trim到60%限制（从80%降低到60%）
                                 # 修复内存泄漏：确保旧DataFrame被完全释放
                                 old_len = current_len
                                 old_df = self.kline_aggregator.klines[symbol]
@@ -1317,7 +1319,7 @@ class DataLayerProcess:
                         if preventive_cleaned > 0:
                             logger.info(
                                 f"Preventive trimmed klines for {preventive_cleaned} symbols "
-                                f"(trimmed to {trim_threshold} klines, 80% of max {max_klines}), "
+                                f"(trimmed to {trim_threshold} klines, 60% of max {max_klines}), "
                                 f"removed {preventive_total_trimmed} klines total"
                             )
                         
@@ -1375,8 +1377,9 @@ class DataLayerProcess:
                 if mem_before > memory_critical_threshold and self.kline_aggregator:
                     logger.warning("Memory still high after cleanup, performing aggressive trim...")
                     # 强制trim所有klines到50%限制
+                    # 修复：当max_klines=1时，aggressive_limit至少为1，避免为0
                     max_klines = config.get('data.kline_aggregator_max_klines', 288)
-                    aggressive_limit = int(max_klines * 0.5)
+                    aggressive_limit = max(1, int(max_klines * 0.5))  # 至少保留1条
                     aggressive_cleaned = 0
                     for symbol in list(self.kline_aggregator.klines.keys()):
                         if symbol in self.kline_aggregator.klines:
