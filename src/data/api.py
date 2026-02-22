@@ -501,11 +501,11 @@ class DataAPI:
     def _cleanup_cache_if_needed(self):
         """
         清理缓存：如果symbol数量超过限制，删除最久未访问的symbol
-        优化：更激进的清理策略，提前清理（在达到30%限制时就开始清理，目标60%-70%系统内存）
+        优化：更激进的清理策略，提前清理（在达到20%限制时就开始清理，修复内存泄漏）
         """
         with self._cache_lock:
-            # 提前清理：在达到30%限制时就开始清理（更激进的策略）
-            cleanup_threshold = int(self._cache_max_symbols * 0.3)
+            # 修复内存泄漏：降低清理阈值从30%到20%，更早清理
+            cleanup_threshold = int(self._cache_max_symbols * 0.2)
             if len(self._memory_cache) <= cleanup_threshold:
                 return
             
@@ -531,9 +531,10 @@ class DataAPI:
                 key=lambda x: x[1]
             )
             
-            # 删除最久未访问的symbol，直到满足限制（保留到20%）
+            # 修复内存泄漏：降低保留比例从20%到10%，更激进的清理
+            # 删除最久未访问的symbol，直到满足限制（保留到10%）
             # 修复内存泄漏：确保所有DataFrame被完全释放
-            target_size = int(self._cache_max_symbols * 0.2)
+            target_size = int(self._cache_max_symbols * 0.1)
             to_remove = len(self._memory_cache) - target_size
             if to_remove > 0:
                 removed_count = 0

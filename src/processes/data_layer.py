@@ -1170,6 +1170,22 @@ class DataLayerProcess:
                                 windows.clear()
                                 del windows
                                 inactive_cleaned += 1
+                        
+                        # 修复内存泄漏：清理所有空字典条目（即使symbol在universe中）
+                        # 这是关键修复：清理pending_trades中的空字典条目
+                        empty_symbols = []
+                        for symbol in list(self.kline_aggregator.pending_trades.keys()):
+                            if symbol not in self.kline_aggregator.pending_trades:
+                                continue
+                            if not self.kline_aggregator.pending_trades[symbol]:
+                                # 空字典，删除整个条目
+                                del self.kline_aggregator.pending_trades[symbol]
+                                empty_symbols.append(symbol)
+                        if empty_symbols:
+                            logger.info(
+                                f"Cleaned up {len(empty_symbols)} empty pending_trades entries "
+                                f"(memory leak fix)"
+                            )
                         if inactive_cleaned > 0:
                             logger.info(
                                 f"Cleaned up pending_trades for {inactive_cleaned} inactive symbols "
@@ -1405,6 +1421,24 @@ class DataLayerProcess:
                     # 清理所有代（generation）的垃圾
                     for generation in range(3):
                         gc.collect(generation)
+                
+                # 修复内存泄漏：强制清理pending_trades中的空字典（关键修复）
+                # 在GC之前清理，确保空字典被完全删除
+                if self.kline_aggregator:
+                    empty_pending_count = 0
+                    for symbol in list(self.kline_aggregator.pending_trades.keys()):
+                        if symbol not in self.kline_aggregator.pending_trades:
+                            continue
+                        if not self.kline_aggregator.pending_trades[symbol]:
+                            del self.kline_aggregator.pending_trades[symbol]
+                            empty_pending_count += 1
+                    if empty_pending_count > 0:
+                        logger.info(
+                            f"Memory cleanup: removed {empty_pending_count} empty pending_trades entries "
+                            f"(critical memory leak fix)"
+                        )
+                        # 再次GC，确保释放内存
+                        gc.collect()
                 
                 # 如果内存仍然很高，强制清理所有可能的缓存
                 if mem_before > memory_critical_threshold and self.kline_aggregator:

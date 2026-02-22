@@ -251,6 +251,11 @@ class KlineAggregator:
                         f"(kept {self.max_pending_windows_per_symbol} latest, "
                         f"was {pending_windows_count})"
                     )
+                
+                # 修复内存泄漏：清理空字典条目（如果symbol的pending_trades为空字典，删除整个条目）
+                if symbol in self.pending_trades and not self.pending_trades[symbol]:
+                    del self.pending_trades[symbol]
+                    logger.debug(f"Removed empty pending_trades entry for {symbol}")
 
         except Exception as e:
             logger.error(f"Error adding trade for {symbol}: {e}", exc_info=True)
@@ -277,6 +282,9 @@ class KlineAggregator:
                 # 立即清空列表，释放内存
                 if trades_list:
                     trades_list.clear()
+                # 修复内存泄漏：如果symbol的pending_trades变为空字典，删除整个条目
+                if symbol in self.pending_trades and not self.pending_trades[symbol]:
+                    del self.pending_trades[symbol]
             else:
                 trades_list = []
 

@@ -311,8 +311,8 @@ execution:
       - account_id: account1
         # 优先级：环境变量 {ACCOUNT_ID}_API_KEY/SECRET > 配置文件
         # 环境变量示例：ACCOUNT1_API_KEY, ACCOUNT1_API_SECRET
-        api_key: your_account1_api_key_here
-        api_secret: your_account1_api_secret_here
+        api_key: pE8xqJ6UDr2BiIXwH4QMwHyCZxS8jdM4MWVyMf9oDEkrK2z1PJ0axsotUMf1Ri7A
+        api_secret: IJAS4zzmNpxmFky8R8oZQX08OsaoEz0wkTWu8w2quuFvrBb8s4zWerkVeCnBV6o1
       # 以下账户配置不完整，不会被启动。如需启用，请取消注释并填写API密钥
       # - account_id: account2
       #   api_key: your_account2_api_key_here
