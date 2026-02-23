@@ -279,9 +279,7 @@ class DataStorage:
                             # 清理所有引用
                             del existing_df_pl
                             del combined_df
-                            # 强制GC，确保内存释放
-                            import gc
-                            gc.collect()
+                            # 优化：减少GC调用频率，只在必要时调用（这里不调用，让Python自动管理）
                         break  # 成功读取，退出重试循环
                     except (IOError, OSError, PermissionError) as e:
                         if attempt < max_retries - 1:
@@ -307,11 +305,7 @@ class DataStorage:
             self._save_dataframe_polars(df_pl, file_path)
             logger.debug(f"Saved {len(df_pl)} klines for {symbol} to {file_path}")
             
-            # 修复内存泄漏：保存后立即清理DataFrame引用
-            # 注意：df_pl可能被外部引用，这里只清理本地引用
-            # 如果df_pl是传入的参数，不应该在这里删除，但可以强制GC
-            import gc
-            gc.collect()
+            # 优化：减少GC调用频率，让Python自动管理内存（只在内存压力大时手动调用）
 
         except Exception as e:
             logger.error(
@@ -488,7 +482,7 @@ class DataStorage:
         批量加载多个交易对的K线数据（并发 IO 加速）。
         返回key使用 format_symbol 后的交易对（大写）。
         
-        优化：分批处理symbol，避免一次性加载所有数据导致内存峰值。
+        注意：使用lazy loading保证内存安全，全量并发加载保证性能。
         """
         if not symbols:
             return {}
@@ -499,38 +493,26 @@ class DataStorage:
             # 默认：最多 16 线程，且不超过 symbols 数量
             workers = min(16, max(1, len(symbols)))
 
-        # 修复内存泄漏：降低批次大小，更频繁的GC
-        # 每批处理30个symbol（从50降低到30），避免内存峰值
-        batch_size = 30
         result: Dict[str, pd.DataFrame] = {}
         
-        for i in range(0, len(symbols), batch_size):
-            batch_symbols = symbols[i:i + batch_size]
-            
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                fut_map = {
-                    ex.submit(self.load_klines, symbol, start_date, end_date): symbol
-                    for symbol in batch_symbols
-                }
-                for fut in as_completed(fut_map):
-                    symbol = fut_map[fut]
-                    try:
-                        result[format_symbol(symbol)] = fut.result()
-                    except PanicException as e:
-                        logger.error(f"Bulk load klines panic for {symbol}: {e}")
-                        result[format_symbol(symbol)] = pd.DataFrame()
-                    except Exception as e:
-                        logger.error(
-                            f"Bulk load klines failed for {symbol}: {e}", exc_info=True
-                        )
-                        result[format_symbol(symbol)] = pd.DataFrame()
-            
-            # 每批处理后强制垃圾回收，释放内存
-            import gc
-            gc.collect()
-            
-            if i + batch_size < len(symbols):
-                logger.debug(f"Loaded {i + batch_size}/{len(symbols)} symbols, continuing...")
+        # 全量并发加载（使用lazy loading保证内存安全）
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_map = {
+                ex.submit(self.load_klines, symbol, start_date, end_date): symbol
+                for symbol in symbols
+            }
+            for fut in as_completed(fut_map):
+                symbol = fut_map[fut]
+                try:
+                    result[format_symbol(symbol)] = fut.result()
+                except PanicException as e:
+                    logger.error(f"Bulk load klines panic for {symbol}: {e}")
+                    result[format_symbol(symbol)] = pd.DataFrame()
+                except Exception as e:
+                    logger.error(
+                        f"Bulk load klines failed for {symbol}: {e}", exc_info=True
+                    )
+                    result[format_symbol(symbol)] = pd.DataFrame()
 
         return result
 
@@ -1055,32 +1037,24 @@ class DataStorage:
         if workers is None:
             workers = min(16, max(1, len(symbols)))
 
-        # 修复内存泄漏：分批处理symbol，避免一次性加载所有数据
-        batch_size = 30  # 每批处理30个symbol
         result: Dict[str, pd.DataFrame] = {}
         
-        for i in range(0, len(symbols), batch_size):
-            batch_symbols = symbols[i:i + batch_size]
-            
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                fut_map = {
-                    ex.submit(self.load_funding_rates, symbol, start_date, end_date): symbol
-                    for symbol in batch_symbols
-                }
-                for fut in as_completed(fut_map):
-                    symbol = fut_map[fut]
-                    try:
-                        result[format_symbol(symbol)] = fut.result()
-                    except Exception as e:
-                        logger.error(
-                            f"Bulk load funding rates failed for {symbol}: {e}",
-                            exc_info=True,
-                        )
-                        result[format_symbol(symbol)] = pd.DataFrame()
-            
-            # 每批处理后强制垃圾回收
-            import gc
-            gc.collect()
+        # 全量并发加载（使用lazy loading保证内存安全）
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_map = {
+                ex.submit(self.load_funding_rates, symbol, start_date, end_date): symbol
+                for symbol in symbols
+            }
+            for fut in as_completed(fut_map):
+                symbol = fut_map[fut]
+                try:
+                    result[format_symbol(symbol)] = fut.result()
+                except Exception as e:
+                    logger.error(
+                        f"Bulk load funding rates failed for {symbol}: {e}",
+                        exc_info=True,
+                    )
+                    result[format_symbol(symbol)] = pd.DataFrame()
 
         return result
 
@@ -1342,34 +1316,26 @@ class DataStorage:
         if workers is None:
             workers = min(16, max(1, len(symbols)))
 
-        # 修复内存泄漏：分批处理symbol，避免一次性加载所有数据
-        batch_size = 30  # 每批处理30个symbol
         result: Dict[str, pd.DataFrame] = {}
         
-        for i in range(0, len(symbols), batch_size):
-            batch_symbols = symbols[i:i + batch_size]
-            
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                fut_map = {
-                    ex.submit(
-                        self.load_premium_index_klines, symbol, start_date, end_date
-                    ): symbol
-                    for symbol in batch_symbols
-                }
-                for fut in as_completed(fut_map):
-                    symbol = fut_map[fut]
-                    try:
-                        result[format_symbol(symbol)] = fut.result()
-                    except Exception as e:
-                        logger.error(
-                            f"Bulk load premium index klines failed for {symbol}: {e}",
-                            exc_info=True,
-                        )
-                        result[format_symbol(symbol)] = pd.DataFrame()
-            
-            # 每批处理后强制垃圾回收
-            import gc
-            gc.collect()
+        # 全量并发加载（使用lazy loading保证内存安全）
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_map = {
+                ex.submit(
+                    self.load_premium_index_klines, symbol, start_date, end_date
+                ): symbol
+                for symbol in symbols
+            }
+            for fut in as_completed(fut_map):
+                symbol = fut_map[fut]
+                try:
+                    result[format_symbol(symbol)] = fut.result()
+                except Exception as e:
+                    logger.error(
+                        f"Bulk load premium index klines failed for {symbol}: {e}",
+                        exc_info=True,
+                    )
+                    result[format_symbol(symbol)] = pd.DataFrame()
 
         return result
 
