@@ -149,13 +149,24 @@ class DataAPI:
             with self.performance_monitor.measure('data_api', 'get_klines', {'symbols_count': len(symbols), 'days': days}):
                 result = {}
 
-                # 1) 批量并发加载本地存储（主要瓶颈）
-                with self.performance_monitor.measure('data_api', 'load_klines_bulk', {'symbols_count': len(symbols), 'days': days}):
-                    storage_map = self.storage.load_klines_bulk(
-                        symbols=[to_exchange_symbol(s) for s in symbols],
-                        start_date=start_time,
-                        end_date=end_time,
-                    )
+                # 修复内存泄漏：分批处理symbol，避免一次性加载所有数据
+                # 策略部分获取大量数据时不能一次性全部加载到内存
+                batch_size = 30  # 每批处理30个symbol，避免内存峰值
+                
+                # 1) 分批加载本地存储（使用流式lazy加载）
+                storage_map = {}
+                for i in range(0, len(symbols), batch_size):
+                    batch_symbols = symbols[i:i + batch_size]
+                    with self.performance_monitor.measure('data_api', 'load_klines_bulk', {'symbols_count': len(batch_symbols), 'days': days}):
+                        batch_storage_map = self.storage.load_klines_bulk(
+                            symbols=[to_exchange_symbol(s) for s in batch_symbols],
+                            start_date=start_time,
+                            end_date=end_time,
+                        )
+                        storage_map.update(batch_storage_map)
+                        # 每批处理后强制垃圾回收
+                        import gc
+                        gc.collect()
 
                 # 2) 合并实时聚合器数据（如有）
                 for raw_symbol in symbols:
