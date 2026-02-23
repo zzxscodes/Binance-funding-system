@@ -154,10 +154,11 @@ class DataAPI:
                 batch_size = 30  # 每批处理30个symbol，避免内存峰值
                 
                 # 1) 分批加载本地存储（使用流式lazy加载）
-                storage_map = {}
-                for i in range(0, len(symbols), batch_size):
-                    batch_symbols = symbols[i:i + batch_size]
-                    with self.performance_monitor.measure('data_api', 'load_klines_bulk', {'symbols_count': len(batch_symbols), 'days': days}):
+                # 保持性能监控测量点在外层，与修改前保持一致
+                with self.performance_monitor.measure('data_api', 'load_klines_bulk', {'symbols_count': len(symbols), 'days': days}):
+                    storage_map = {}
+                    for i in range(0, len(symbols), batch_size):
+                        batch_symbols = symbols[i:i + batch_size]
                         batch_storage_map = self.storage.load_klines_bulk(
                             symbols=[to_exchange_symbol(s) for s in batch_symbols],
                             start_date=start_time,
