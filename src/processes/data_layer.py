@@ -209,15 +209,32 @@ class DataLayerProcess:
         """K线生成回调：保存K线数据"""
         with self.performance_monitor.measure('data_layer', 'kline_save', {'symbol': symbol}):
             try:
-                # 优化：直接使用dict或转换为polars DataFrame，避免不必要的pandas转换
-                # storage.save_klines支持dict和DataFrame
+                # 修复内存泄漏：直接使用polars DataFrame，避免pandas转换
+                # 减少DataFrame转换次数，降低内存占用
+                import polars as pl
                 if isinstance(kline, dict):
-                    # 直接传递dict，storage内部会处理
-                    self.storage.save_klines(symbol, pd.DataFrame([kline]))
+                    # 直接创建polars DataFrame，避免pandas中间转换
+                    df_pl = pl.DataFrame([kline])
+                    self.storage.save_klines(symbol, df_pl)
+                    # 立即清理引用
+                    del df_pl
                 else:
                     # 如果是其他类型，转换为dict
                     kline_dict = kline.to_dict() if hasattr(kline, 'to_dict') else dict(kline)
-                    self.storage.save_klines(symbol, pd.DataFrame([kline_dict]))
+                    df_pl = pl.DataFrame([kline_dict])
+                    self.storage.save_klines(symbol, df_pl)
+                    # 立即清理引用
+                    del df_pl
+                    del kline_dict
+                
+                # 修复内存泄漏：定期触发GC，避免DataFrame累积
+                # 每100个K线触发一次GC（降低频率，避免性能影响）
+                if not hasattr(self, '_kline_save_count'):
+                    self._kline_save_count = 0
+                self._kline_save_count += 1
+                if self._kline_save_count % 100 == 0:
+                    import gc
+                    gc.collect()
                 
                 # 检查是否需要通知策略进程（所有合约的5分钟K线都更新完成）
                 # 使用时间节流：每5秒最多检查一次，避免频繁检查
