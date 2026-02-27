@@ -692,19 +692,22 @@ class KlineAggregator:
                 
                 # 修复内存泄漏：更激进的清理策略，提前trim到60%限制（从80%降低到60%），避免内存峰值
                 # 修复配置安全性：降低trim阈值，确保内存不超过1.5-2GB目标
-                # 修复：当max_klines=1时，trim_threshold至少为1，避免为0导致所有K线被删除
-                trim_threshold = max(1, int(max_klines * 0.6))  # 从80%降低到60%，更激进的清理，但至少保留1条
-                if current_len >= trim_threshold:
-                    # 提前trim到80%限制，为新K线腾出空间
-                    # 使用clone()确保创建新对象，然后删除旧引用
-                    trimmed_current = current_df.tail(trim_threshold - 1).clone()
-                    # 立即更新klines，释放旧的DataFrame
-                    old_df = self.klines[symbol]
-                    self.klines[symbol] = trimmed_current
-                    del old_df
-                    del current_df
-                    current_df = trimmed_current
-                    current_len = len(current_df)
+                # 修复：当max_klines=1时，不应该提前trim（因为trim后就没有数据了）
+                # 只有当max_klines > 1时才进行提前trim
+                if max_klines > 1:
+                    trim_threshold = max(1, int(max_klines * 0.6))  # 从80%降低到60%，更激进的清理，但至少保留1条
+                    if current_len >= trim_threshold:
+                        # 提前trim到60%限制，为新K线腾出空间
+                        # 使用clone()确保创建新对象，然后删除旧引用
+                        # 修复：保留trim_threshold条，而不是trim_threshold-1条（避免tail(0)导致空DataFrame）
+                        trimmed_current = current_df.tail(trim_threshold).clone()
+                        # 立即更新klines，释放旧的DataFrame
+                        old_df = self.klines[symbol]
+                        self.klines[symbol] = trimmed_current
+                        del old_df
+                        del current_df
+                        current_df = trimmed_current
+                        current_len = len(current_df)
                 
                 # 合并新K线
                 # 使用concat合并，不立即clone（减少不必要的复制）
