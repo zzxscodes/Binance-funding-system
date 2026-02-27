@@ -62,8 +62,9 @@ class DataLayerProcess:
         self.running = False
         self.save_interval = config.get('data.save_interval', 60)  # 秒
         self.cleanup_interval = config.get('data.cleanup_interval', 3600)  # 秒
-        self.last_save_time = asyncio.get_event_loop().time()
-        self.last_cleanup_time = asyncio.get_event_loop().time()
+        # 使用time.time()而不是asyncio.get_event_loop().time()，因为初始化时可能还没有事件循环
+        self.last_save_time = time.time()
+        self.last_cleanup_time = time.time()
         
         # 任务集合
         self.tasks: Set[asyncio.Task] = set()
@@ -535,10 +536,10 @@ class DataLayerProcess:
                 for sym in empty_symbols:
                     del self.trades_buffer[sym]
                 
-                self.last_save_time = asyncio.get_event_loop().time()
+                self.last_save_time = time.time()
                 
                 # 定期清理旧数据
-                current_time = asyncio.get_event_loop().time()
+                current_time = time.time()
                 if current_time - self.last_cleanup_time >= self.cleanup_interval:
                     max_days = config.get('data.max_history_days', 30)
                     self.storage.cleanup_old_data(days=max_days)
@@ -789,7 +790,7 @@ class DataLayerProcess:
             
             if not symbols_to_collect:
                 logger.info("All symbols already have funding rate data, skipping initial collection")
-                self.last_funding_rate_collect_time = asyncio.get_event_loop().time()
+                self.last_funding_rate_collect_time = time.time()
                 return
             
             # 批量采集（降低并发数，避免API限流）
@@ -828,7 +829,7 @@ class DataLayerProcess:
                 f"saved={saved_count}/{len(symbols_to_collect)}, existing={existing_count}, empty={empty_count}, errors={error_count}, "
                 f"total_records={total_records}"
             )
-            self.last_funding_rate_collect_time = asyncio.get_event_loop().time()
+            self.last_funding_rate_collect_time = time.time()
             
         except Exception as e:
             logger.error(f"Error in initial funding rate collection: {e}", exc_info=True)
@@ -888,9 +889,7 @@ class DataLayerProcess:
                     f"saved={saved_count}/{len(symbols)}, empty={empty_count}, errors={error_count}, "
                     f"total_records={total_records}"
                 )
-                
-                logger.info(f"Periodic funding rate collection completed: {saved_count}/{len(symbols)} symbols updated")
-                self.last_funding_rate_collect_time = asyncio.get_event_loop().time()
+                self.last_funding_rate_collect_time = time.time()
                 
             except asyncio.CancelledError:
                 break
@@ -939,7 +938,7 @@ class DataLayerProcess:
             
             if not symbols_to_collect:
                 logger.info("All symbols already have premium index data, skipping initial collection")
-                self.last_premium_index_collect_time = asyncio.get_event_loop().time()
+                self.last_premium_index_collect_time = time.time()
                 return
             
             # 批量采集（降低并发数，避免API限流）
@@ -967,7 +966,7 @@ class DataLayerProcess:
                         logger.error(f"Failed to save premium index klines for {symbol}: {e}", exc_info=True)
             
             logger.info(f"Initial premium index collection completed: saved={saved_count}/{len(symbols_to_collect)}, existing={existing_count}, errors={error_count}")
-            self.last_premium_index_collect_time = asyncio.get_event_loop().time()
+            self.last_premium_index_collect_time = time.time()
             
         except Exception as e:
             logger.error(f"Error in initial premium index collection: {e}", exc_info=True)
@@ -1016,7 +1015,7 @@ class DataLayerProcess:
                             logger.error(f"Failed to save premium index klines for {symbol}: {e}", exc_info=True)
                 
                 logger.info(f"Periodic premium index collection completed: {saved_count}/{len(symbols)} symbols updated")
-                self.last_premium_index_collect_time = asyncio.get_event_loop().time()
+                self.last_premium_index_collect_time = time.time()
                 
             except asyncio.CancelledError:
                 break
@@ -1295,7 +1294,9 @@ class DataLayerProcess:
                             if df.is_empty():
                                 continue
                             current_len = len(df)
-                            if current_len > max_klines:
+                            # 修复：当max_klines=1时，如果current_len > 1才需要trim
+                            # 当max_klines > 1时，如果current_len > max_klines才需要trim
+                            if max_klines > 1 and current_len > max_klines:
                                 # 只保留最新的klines，使用clone()确保创建新对象
                                 # 修复内存泄漏：确保旧DataFrame被完全释放
                                 old_df = self.kline_aggregator.klines[symbol]
@@ -1310,45 +1311,68 @@ class DataLayerProcess:
                                 logger.info(
                                     f"Trimmed klines for {symbol}: {current_len} -> {max_klines}"
                                 )
+                            elif max_klines == 1 and current_len > 1:
+                                # 当max_klines=1时，如果超过1条，trim到1条
+                                old_df = self.kline_aggregator.klines[symbol]
+                                trimmed_df = old_df.tail(1).clone()
+                                self.kline_aggregator.klines[symbol] = trimmed_df
+                                if old_df is not None and old_df is not trimmed_df:
+                                    del old_df
+                                del trimmed_df
+                                cleaned_count += 1
+                                total_trimmed += (current_len - 1)
+                                logger.info(
+                                    f"Trimmed klines for {symbol}: {current_len} -> 1"
+                                )
                         if cleaned_count > 0:
                             logger.info(
                                 f"Trimmed klines for {cleaned_count} symbols exceeding limit ({max_klines}), "
                                 f"removed {total_trimmed} klines total"
                             )
-                        elif expected_max_klines > 1 and current_klines_total > expected_max_klines * 0.9:  # 接近限制但未清理（max_klines=1时跳过警告）
-                            logger.warning(
-                                f"Klines total ({current_klines_total}) is close to limit ({expected_max_klines:.0f}) "
-                                f"but no trimming occurred. This may indicate a cleanup issue."
+                        
+                        # 如果接近限制但未清理，触发预防性trim
+                        # 修复：当接近限制时，应该触发trim而不是只警告
+                        should_trigger_preventive = False
+                        if expected_max_klines > 1 and current_klines_total > expected_max_klines * 0.9:
+                            should_trigger_preventive = True
+                            logger.info(
+                                f"Klines total ({current_klines_total}) is close to limit ({expected_max_klines:.0f}), "
+                                f"triggering preventive trim..."
                             )
                         
                         # 强制清理：即使没有超过限制，也定期trim到60%限制（从80%降低到60%），确保内存稳定
                         # 修复配置安全性：降低trim阈值，确保内存不超过1.5-2GB目标
-                        # 修复：当max_klines=1时，trim_threshold至少为1，避免为0导致所有K线被删除
-                        # 这样可以提前释放内存，避免内存峰值
-                        trim_threshold = max(1, int(max_klines * 0.6))  # 从80%降低到60%，更激进的清理，但至少保留1条
+                        # 修复：当max_klines=1时，不应该进行预防性trim（因为trim后就没有数据了）
+                        # 只有当max_klines > 1时才进行预防性trim
                         preventive_cleaned = 0
                         preventive_total_trimmed = 0
-                        # 遍历所有klines中的symbol，确保全面清理
-                        all_kline_symbols = list(self.kline_aggregator.klines.keys())
-                        for symbol in all_kline_symbols:
-                            if symbol not in self.kline_aggregator.klines:
-                                continue  # 可能已被其他线程删除
-                            df = self.kline_aggregator.klines[symbol]
-                            if df.is_empty():
-                                continue
-                            current_len = len(df)
-                            if current_len > trim_threshold:
-                                # 预防性清理：trim到60%限制（从80%降低到60%）
-                                # 修复内存泄漏：确保旧DataFrame被完全释放
-                                old_len = current_len
-                                old_df = self.kline_aggregator.klines[symbol]
-                                trimmed_df = old_df.tail(trim_threshold).clone()
-                                self.kline_aggregator.klines[symbol] = trimmed_df
-                                if old_df is not None and old_df is not trimmed_df:
-                                    del old_df
-                                del trimmed_df
-                                preventive_cleaned += 1
-                                preventive_total_trimmed += (old_len - trim_threshold)
+                        if max_klines > 1:
+                            # 如果接近限制，使用更激进的trim阈值（50%而不是60%）
+                            if should_trigger_preventive:
+                                trim_threshold = max(1, int(max_klines * 0.5))  # 接近限制时使用50%
+                            else:
+                                trim_threshold = max(1, int(max_klines * 0.6))  # 正常情况使用60%
+                            # 遍历所有klines中的symbol，确保全面清理
+                            all_kline_symbols = list(self.kline_aggregator.klines.keys())
+                            for symbol in all_kline_symbols:
+                                if symbol not in self.kline_aggregator.klines:
+                                    continue  # 可能已被其他线程删除
+                                df = self.kline_aggregator.klines[symbol]
+                                if df.is_empty():
+                                    continue
+                                current_len = len(df)
+                                if current_len > trim_threshold:
+                                    # 预防性清理：trim到60%限制（从80%降低到60%）
+                                    # 修复内存泄漏：确保旧DataFrame被完全释放
+                                    old_len = current_len
+                                    old_df = self.kline_aggregator.klines[symbol]
+                                    trimmed_df = old_df.tail(trim_threshold).clone()
+                                    self.kline_aggregator.klines[symbol] = trimmed_df
+                                    if old_df is not None and old_df is not trimmed_df:
+                                        del old_df
+                                    del trimmed_df
+                                    preventive_cleaned += 1
+                                    preventive_total_trimmed += (old_len - trim_threshold)
                         if preventive_cleaned > 0:
                             logger.info(
                                 f"Preventive trimmed klines for {preventive_cleaned} symbols "
@@ -1461,26 +1485,45 @@ class DataLayerProcess:
                 if mem_before > memory_critical_threshold and self.kline_aggregator:
                     logger.warning("Memory still high after cleanup, performing aggressive trim...")
                     # 强制trim所有klines到50%限制
-                    # 修复：当max_klines=1时，aggressive_limit至少为1，避免为0
+                    # 修复：当max_klines=1时，不应该进行aggressive trim（因为trim后就没有数据了）
                     max_klines = config.get('data.kline_aggregator_max_klines', 288)
-                    aggressive_limit = max(1, int(max_klines * 0.5))  # 至少保留1条
-                    aggressive_cleaned = 0
-                    for symbol in list(self.kline_aggregator.klines.keys()):
-                        if symbol in self.kline_aggregator.klines:
-                            df = self.kline_aggregator.klines[symbol]
-                            if not df.is_empty() and len(df) > aggressive_limit:
-                                # 修复内存泄漏：确保旧DataFrame被完全释放
-                                old_df = self.kline_aggregator.klines[symbol]
-                                trimmed_df = old_df.tail(aggressive_limit).clone()
-                                self.kline_aggregator.klines[symbol] = trimmed_df
-                                if old_df is not None and old_df is not trimmed_df:
-                                    del old_df
-                                del trimmed_df
-                                aggressive_cleaned += 1
-                    if aggressive_cleaned > 0:
-                        logger.warning(f"Aggressive trim: cleaned {aggressive_cleaned} symbols to {aggressive_limit} klines")
-                    # 再次GC
-                    gc.collect()
+                    if max_klines > 1:
+                        aggressive_limit = max(1, int(max_klines * 0.5))  # 至少保留1条
+                        aggressive_cleaned = 0
+                        for symbol in list(self.kline_aggregator.klines.keys()):
+                            if symbol in self.kline_aggregator.klines:
+                                df = self.kline_aggregator.klines[symbol]
+                                if not df.is_empty() and len(df) > aggressive_limit:
+                                    # 修复内存泄漏：确保旧DataFrame被完全释放
+                                    old_df = self.kline_aggregator.klines[symbol]
+                                    trimmed_df = old_df.tail(aggressive_limit).clone()
+                                    self.kline_aggregator.klines[symbol] = trimmed_df
+                                    if old_df is not None and old_df is not trimmed_df:
+                                        del old_df
+                                    del trimmed_df
+                                    aggressive_cleaned += 1
+                        if aggressive_cleaned > 0:
+                            logger.warning(f"Aggressive trim: cleaned {aggressive_cleaned} symbols to {aggressive_limit} klines")
+                        # 再次GC
+                        gc.collect()
+                    elif max_klines == 1:
+                        # 当max_klines=1时，如果某个symbol超过1条，trim到1条
+                        aggressive_cleaned = 0
+                        for symbol in list(self.kline_aggregator.klines.keys()):
+                            if symbol in self.kline_aggregator.klines:
+                                df = self.kline_aggregator.klines[symbol]
+                                if not df.is_empty() and len(df) > 1:
+                                    old_df = self.kline_aggregator.klines[symbol]
+                                    trimmed_df = old_df.tail(1).clone()
+                                    self.kline_aggregator.klines[symbol] = trimmed_df
+                                    if old_df is not None and old_df is not trimmed_df:
+                                        del old_df
+                                    del trimmed_df
+                                    aggressive_cleaned += 1
+                        if aggressive_cleaned > 0:
+                            logger.warning(f"Aggressive trim: cleaned {aggressive_cleaned} symbols to 1 kline")
+                        # 再次GC
+                        gc.collect()
                 
                 # 5. 清理空的trades_buffer条目（减少字典大小）
                 empty_buffers = [sym for sym, buf in self.trades_buffer.items() if not buf]
@@ -1539,13 +1582,55 @@ class DataLayerProcess:
                         f"Average klines per symbol: {klines_total/klines_symbols:.1f} (max: {max_klines})"
                     )
                 
-                # 如果清理效果不明显（释放内存<1MB且内存仍在增长），发出警告
+                # 如果清理效果不明显（释放内存<1MB且内存仍在增长），触发更激进的清理
                 if mem_freed < 1.0 and mem_before > 200:  # 内存超过200MB但释放很少
                     logger.warning(
                         f"Memory cleanup had limited effect: freed only {mem_freed:.2f}MB. "
                         f"Current memory: {mem_after:.2f}MB. "
-                        f"This may indicate memory growth or insufficient cleanup."
+                        f"Triggering aggressive cleanup..."
                     )
+                    # 触发更激进的清理：trim所有klines到40%限制
+                    if self.kline_aggregator:
+                        max_klines = config.get('data.kline_aggregator_max_klines', 288)
+                        # 修复：当max_klines=1时，不应该进行aggressive cleanup（因为trim后就没有数据了）
+                        if max_klines > 1:
+                            aggressive_limit = max(1, int(max_klines * 0.4))  # 更激进的40%
+                            aggressive_cleaned = 0
+                            for symbol in list(self.kline_aggregator.klines.keys()):
+                                if symbol in self.kline_aggregator.klines:
+                                    df = self.kline_aggregator.klines[symbol]
+                                    if not df.is_empty() and len(df) > aggressive_limit:
+                                        old_df = self.kline_aggregator.klines[symbol]
+                                        trimmed_df = old_df.tail(aggressive_limit).clone()
+                                        self.kline_aggregator.klines[symbol] = trimmed_df
+                                        if old_df is not None and old_df is not trimmed_df:
+                                            del old_df
+                                        del trimmed_df
+                                        aggressive_cleaned += 1
+                            if aggressive_cleaned > 0:
+                                logger.info(f"Aggressive cleanup: trimmed {aggressive_cleaned} symbols to {aggressive_limit} klines")
+                                # 再次GC
+                                import gc
+                                gc.collect()
+                        elif max_klines == 1:
+                            # 当max_klines=1时，如果某个symbol超过1条，trim到1条
+                            aggressive_cleaned = 0
+                            for symbol in list(self.kline_aggregator.klines.keys()):
+                                if symbol in self.kline_aggregator.klines:
+                                    df = self.kline_aggregator.klines[symbol]
+                                    if not df.is_empty() and len(df) > 1:
+                                        old_df = self.kline_aggregator.klines[symbol]
+                                        trimmed_df = old_df.tail(1).clone()
+                                        self.kline_aggregator.klines[symbol] = trimmed_df
+                                        if old_df is not None and old_df is not trimmed_df:
+                                            del old_df
+                                        del trimmed_df
+                                        aggressive_cleaned += 1
+                            if aggressive_cleaned > 0:
+                                logger.info(f"Aggressive cleanup: trimmed {aggressive_cleaned} symbols to 1 kline")
+                                # 再次GC
+                                import gc
+                                gc.collect()
                 
                 # 记录清理详情（INFO级别，便于监控）
                 cleanup_details = []
@@ -1648,11 +1733,11 @@ async def main():
                 
                 # 定期打印统计（每5分钟）
                 if hasattr(process, 'last_stats_time'):
-                    if asyncio.get_event_loop().time() - process.last_stats_time > 300:
+                    if time.time() - process.last_stats_time > 300:
                         process.print_stats()
-                        process.last_stats_time = asyncio.get_event_loop().time()
+                        process.last_stats_time = time.time()
                 else:
-                    process.last_stats_time = asyncio.get_event_loop().time()
+                    process.last_stats_time = time.time()
                     
             except asyncio.CancelledError:
                 logger.info("Main loop cancelled")
