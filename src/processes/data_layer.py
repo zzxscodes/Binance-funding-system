@@ -128,6 +128,11 @@ class DataLayerProcess:
         
         # 性能监控
         self.performance_monitor = get_performance_monitor()
+        # 内存清理状态：用于避免force_rebuild进入“每轮都触发”的正反馈
+        self._cleanup_counter = 0
+        self._last_memory = 0.0
+        self._high_growth_streak = 0
+        self._force_rebuild_cooldown = 0
     
     async def _on_trade_received(self, symbol: str, trade: dict):
         """逐笔成交数据回调：传递给K线聚合器，并缓存用于批量保存"""
@@ -457,21 +462,25 @@ class DataLayerProcess:
             if symbol not in self.trades_buffer or not self.trades_buffer[symbol]:
                 return
             
-            # 获取缓冲区中的数据
+            # 获取缓冲区中的数据（引用），保存后原地清理，减少对象残留
             trades_list = self.trades_buffer[symbol]
             if not trades_list:
                 return
             
+            saved_count = len(trades_list)
+
             # 转换为DataFrame
             trades_df = pd.DataFrame(trades_list)
             
             # 保存到存储
             self.storage.save_trades(symbol, trades_df)
             
-            # 清空缓冲区
-            self.trades_buffer[symbol] = []
+            # 原地清空缓冲区并释放临时对象引用
+            trades_list.clear()
+            self.trades_buffer[symbol] = trades_list
+            del trades_df
             
-            logger.debug(f"Saved {len(trades_list)} trades for {symbol}")
+            logger.debug(f"Saved {saved_count} trades for {symbol}")
             
         except Exception as e:
             logger.error(f"Failed to save trades batch for {symbol}: {e}", exc_info=True)
@@ -793,36 +802,46 @@ class DataLayerProcess:
                 self.last_funding_rate_collect_time = time.time()
                 return
             
-            # 批量采集（降低并发数，避免API限流）
-            max_concurrent = config.get('data.history_collect_max_concurrent', 1)  # 降低并发数，避免限流
-            logger.info(f"Starting bulk funding rate collection for {len(symbols_to_collect)} symbols (missing data) with max_concurrent={max_concurrent}")
-            
-            funding_rates_map = await self.funding_rate_collector.fetch_funding_rates_bulk(
-                symbols=symbols_to_collect,
-                start_time=start_time,
-                end_time=end_time,
-                max_concurrent=max_concurrent
+            # 分批采集与保存，避免一次性在内存中持有全部symbols的历史DataFrame
+            max_concurrent = config.get('data.history_collect_max_concurrent', 1)
+            batch_size = config.get('data.history_collect_batch_size', 25)
+            logger.info(
+                f"Starting bulk funding rate collection for {len(symbols_to_collect)} symbols "
+                f"(missing data) with max_concurrent={max_concurrent}, batch_size={batch_size}"
             )
-            
-            # 保存到存储
+
             saved_count = 0
             empty_count = 0
             error_count = 0
             total_records = 0
-            
-            for symbol, df in funding_rates_map.items():
-                if not df.empty:
-                    try:
-                        self.storage.save_funding_rates(symbol, df)
-                        saved_count += 1
-                        total_records += len(df)
-                        logger.debug(f"Saved {len(df)} funding rates for {symbol}")
-                    except Exception as e:
-                        error_count += 1
-                        logger.error(f"Failed to save funding rates for {symbol}: {e}", exc_info=True)
-                else:
-                    empty_count += 1
-                    logger.warning(f"No funding rate data fetched for {symbol}")
+
+            for i in range(0, len(symbols_to_collect), batch_size):
+                batch_symbols = symbols_to_collect[i:i + batch_size]
+                funding_rates_map = await self.funding_rate_collector.fetch_funding_rates_bulk(
+                    symbols=batch_symbols,
+                    start_time=start_time,
+                    end_time=end_time,
+                    max_concurrent=max_concurrent,
+                )
+
+                for symbol, df in funding_rates_map.items():
+                    if not df.empty:
+                        try:
+                            self.storage.save_funding_rates(symbol, df)
+                            saved_count += 1
+                            total_records += len(df)
+                            logger.debug(f"Saved {len(df)} funding rates for {symbol}")
+                        except Exception as e:
+                            error_count += 1
+                            logger.error(f"Failed to save funding rates for {symbol}: {e}", exc_info=True)
+                    else:
+                        empty_count += 1
+                        logger.warning(f"No funding rate data fetched for {symbol}")
+
+                # 及时释放批次对象，降低RSS上升斜率
+                del funding_rates_map
+                import gc
+                gc.collect()
             
             logger.info(
                 f"Initial funding rate collection completed: "
@@ -858,31 +877,39 @@ class DataLayerProcess:
                 start_time = end_time - timedelta(days=1)
                 
                 symbols = list(universe)
-                max_concurrent = config.get('data.history_collect_max_concurrent', 2)  # 降低并发数，避免限流
-                funding_rates_map = await self.funding_rate_collector.fetch_funding_rates_bulk(
-                    symbols=symbols,
-                    start_time=start_time,
-                    end_time=end_time,
-                    max_concurrent=max_concurrent
-                )
-                
-                # 保存到存储
+                max_concurrent = config.get('data.history_collect_max_concurrent', 2)
+                batch_size = config.get('data.history_collect_batch_size', 25)
+
+                # 分批采集，避免全量map长时间驻留内存
                 saved_count = 0
                 empty_count = 0
                 error_count = 0
                 total_records = 0
-                
-                for symbol, df in funding_rates_map.items():
-                    if not df.empty:
-                        try:
-                            self.storage.save_funding_rates(symbol, df)
-                            saved_count += 1
-                            total_records += len(df)
-                        except Exception as e:
-                            error_count += 1
-                            logger.error(f"Failed to save funding rates for {symbol}: {e}", exc_info=True)
-                    else:
-                        empty_count += 1
+
+                for i in range(0, len(symbols), batch_size):
+                    batch_symbols = symbols[i:i + batch_size]
+                    funding_rates_map = await self.funding_rate_collector.fetch_funding_rates_bulk(
+                        symbols=batch_symbols,
+                        start_time=start_time,
+                        end_time=end_time,
+                        max_concurrent=max_concurrent
+                    )
+
+                    for symbol, df in funding_rates_map.items():
+                        if not df.empty:
+                            try:
+                                self.storage.save_funding_rates(symbol, df)
+                                saved_count += 1
+                                total_records += len(df)
+                            except Exception as e:
+                                error_count += 1
+                                logger.error(f"Failed to save funding rates for {symbol}: {e}", exc_info=True)
+                        else:
+                            empty_count += 1
+
+                    del funding_rates_map
+                    import gc
+                    gc.collect()
                 
                 logger.info(
                     f"Periodic funding rate collection completed: "
@@ -941,29 +968,36 @@ class DataLayerProcess:
                 self.last_premium_index_collect_time = time.time()
                 return
             
-            # 批量采集（降低并发数，避免API限流）
+            # 分批采集（避免全量结果同时驻留内存）
             max_concurrent = config.get('data.history_collect_max_concurrent', 5)
-            logger.info(f"Starting bulk premium index collection for {len(symbols_to_collect)} symbols (missing data) with max_concurrent={max_concurrent}")
-            
-            premium_index_map = await self.premium_index_collector.fetch_premium_index_klines_bulk(
-                symbols=symbols_to_collect,
-                start_time=start_time,
-                end_time=end_time,
-                interval='5m',
-                max_concurrent=max_concurrent
+            batch_size = config.get('data.history_collect_batch_size', 25)
+            logger.info(
+                f"Starting bulk premium index collection for {len(symbols_to_collect)} symbols "
+                f"(missing data) with max_concurrent={max_concurrent}, batch_size={batch_size}"
             )
-            
-            # 保存到存储
+
             saved_count = 0
             error_count = 0
-            for symbol, df in premium_index_map.items():
-                if not df.empty:
-                    try:
-                        self.storage.save_premium_index_klines(symbol, df)
-                        saved_count += 1
-                    except Exception as e:
-                        error_count += 1
-                        logger.error(f"Failed to save premium index klines for {symbol}: {e}", exc_info=True)
+            for i in range(0, len(symbols_to_collect), batch_size):
+                batch_symbols = symbols_to_collect[i:i + batch_size]
+                premium_index_map = await self.premium_index_collector.fetch_premium_index_klines_bulk(
+                    symbols=batch_symbols,
+                    start_time=start_time,
+                    end_time=end_time,
+                    interval='5m',
+                    max_concurrent=max_concurrent
+                )
+                for symbol, df in premium_index_map.items():
+                    if not df.empty:
+                        try:
+                            self.storage.save_premium_index_klines(symbol, df)
+                            saved_count += 1
+                        except Exception as e:
+                            error_count += 1
+                            logger.error(f"Failed to save premium index klines for {symbol}: {e}", exc_info=True)
+                del premium_index_map
+                import gc
+                gc.collect()
             
             logger.info(f"Initial premium index collection completed: saved={saved_count}/{len(symbols_to_collect)}, existing={existing_count}, errors={error_count}")
             self.last_premium_index_collect_time = time.time()
@@ -996,23 +1030,31 @@ class DataLayerProcess:
                 
                 symbols = list(universe)
                 max_concurrent = config.get('data.history_collect_max_concurrent', 5)
-                premium_index_map = await self.premium_index_collector.fetch_premium_index_klines_bulk(
-                    symbols=symbols,
-                    start_time=start_time,
-                    end_time=end_time,
-                    interval='5m',
-                    max_concurrent=max_concurrent
-                )
-                
-                # 保存到存储
+                batch_size = config.get('data.history_collect_batch_size', 25)
+
+                # 分批采集与保存，降低内存峰值
                 saved_count = 0
-                for symbol, df in premium_index_map.items():
-                    if not df.empty:
-                        try:
-                            self.storage.save_premium_index_klines(symbol, df)
-                            saved_count += 1
-                        except Exception as e:
-                            logger.error(f"Failed to save premium index klines for {symbol}: {e}", exc_info=True)
+                for i in range(0, len(symbols), batch_size):
+                    batch_symbols = symbols[i:i + batch_size]
+                    premium_index_map = await self.premium_index_collector.fetch_premium_index_klines_bulk(
+                        symbols=batch_symbols,
+                        start_time=start_time,
+                        end_time=end_time,
+                        interval='5m',
+                        max_concurrent=max_concurrent
+                    )
+
+                    for symbol, df in premium_index_map.items():
+                        if not df.empty:
+                            try:
+                                self.storage.save_premium_index_klines(symbol, df)
+                                saved_count += 1
+                            except Exception as e:
+                                logger.error(f"Failed to save premium index klines for {symbol}: {e}", exc_info=True)
+
+                    del premium_index_map
+                    import gc
+                    gc.collect()
                 
                 logger.info(f"Periodic premium index collection completed: {saved_count}/{len(symbols)} symbols updated")
                 self.last_premium_index_collect_time = time.time()
@@ -1062,21 +1104,26 @@ class DataLayerProcess:
                         # 采集最近7天的数据以确保完整性
                         start_time = end_time - timedelta(days=7)
                         max_concurrent = config.get('data.history_collect_max_concurrent', 2)
-                        funding_rates_map = await self.funding_rate_collector.fetch_funding_rates_bulk(
-                            symbols=missing_funding_rates,
-                            start_time=start_time,
-                            end_time=end_time,
-                            max_concurrent=max_concurrent
-                        )
-                        
+                        batch_size = config.get('data.history_collect_batch_size', 25)
                         saved_count = 0
-                        for symbol, df in funding_rates_map.items():
-                            if not df.empty:
-                                try:
-                                    self.storage.save_funding_rates(symbol, df)
-                                    saved_count += 1
-                                except Exception as e:
-                                    logger.error(f"Failed to save funding rates for {symbol} during auto-completion: {e}")
+                        for i in range(0, len(missing_funding_rates), batch_size):
+                            batch_symbols = missing_funding_rates[i:i + batch_size]
+                            funding_rates_map = await self.funding_rate_collector.fetch_funding_rates_bulk(
+                                symbols=batch_symbols,
+                                start_time=start_time,
+                                end_time=end_time,
+                                max_concurrent=max_concurrent
+                            )
+                            for symbol, df in funding_rates_map.items():
+                                if not df.empty:
+                                    try:
+                                        self.storage.save_funding_rates(symbol, df)
+                                        saved_count += 1
+                                    except Exception as e:
+                                        logger.error(f"Failed to save funding rates for {symbol} during auto-completion: {e}")
+                            del funding_rates_map
+                            import gc
+                            gc.collect()
                         
                         logger.info(f"Auto-completed funding rate data for {saved_count}/{len(missing_funding_rates)} symbols")
                 
@@ -1095,22 +1142,27 @@ class DataLayerProcess:
                         # 采集最近7天的数据以确保完整性
                         start_time = end_time - timedelta(days=7)
                         max_concurrent = config.get('data.history_collect_max_concurrent', 5)
-                        premium_index_map = await self.premium_index_collector.fetch_premium_index_klines_bulk(
-                            symbols=missing_premium_index,
-                            start_time=start_time,
-                            end_time=end_time,
-                            interval='5m',
-                            max_concurrent=max_concurrent
-                        )
-                        
+                        batch_size = config.get('data.history_collect_batch_size', 25)
                         saved_count = 0
-                        for symbol, df in premium_index_map.items():
-                            if not df.empty:
-                                try:
-                                    self.storage.save_premium_index_klines(symbol, df)
-                                    saved_count += 1
-                                except Exception as e:
-                                    logger.error(f"Failed to save premium index klines for {symbol} during auto-completion: {e}")
+                        for i in range(0, len(missing_premium_index), batch_size):
+                            batch_symbols = missing_premium_index[i:i + batch_size]
+                            premium_index_map = await self.premium_index_collector.fetch_premium_index_klines_bulk(
+                                symbols=batch_symbols,
+                                start_time=start_time,
+                                end_time=end_time,
+                                interval='5m',
+                                max_concurrent=max_concurrent
+                            )
+                            for symbol, df in premium_index_map.items():
+                                if not df.empty:
+                                    try:
+                                        self.storage.save_premium_index_klines(symbol, df)
+                                        saved_count += 1
+                                    except Exception as e:
+                                        logger.error(f"Failed to save premium index klines for {symbol} during auto-completion: {e}")
+                            del premium_index_map
+                            import gc
+                            gc.collect()
                         
                         logger.info(f"Auto-completed premium index data for {saved_count}/{len(missing_premium_index)} symbols")
                 
@@ -1258,6 +1310,46 @@ class DataLayerProcess:
                                 f"Cleaned up {pending_cleaned_count} old pending windows "
                                 f"(kept {max_pending_windows} latest windows per symbol)"
                             )
+
+                        # 额外内存保护：限制pending_trades总成交条数，防止总量持续累积
+                        # 高波动下，单窗口交易可能很大；这里优先保留每个窗口最新成交。
+                        pending_total_soft_limit = config.get(
+                            "data.kline_aggregator_pending_trades_total_soft_limit", 200000
+                        )
+                        pending_trim_per_window = config.get(
+                            "data.kline_aggregator_pending_trades_trim_per_window", 1500
+                        )
+                        total_pending_trades = 0
+                        for windows in self.kline_aggregator.pending_trades.values():
+                            for trades in windows.values():
+                                total_pending_trades += len(trades)
+
+                        if (
+                            total_pending_trades > pending_total_soft_limit
+                            or mem_before > memory_warning_threshold
+                        ):
+                            trimmed_trades = 0
+                            for symbol in list(self.kline_aggregator.pending_trades.keys()):
+                                if symbol not in self.kline_aggregator.pending_trades:
+                                    continue
+                                windows = self.kline_aggregator.pending_trades[symbol]
+                                for window_start in list(windows.keys()):
+                                    if window_start not in windows:
+                                        continue
+                                    trades_list = windows[window_start]
+                                    if len(trades_list) > pending_trim_per_window:
+                                        remove_count = len(trades_list) - pending_trim_per_window
+                                        del trades_list[:remove_count]
+                                        trimmed_trades += remove_count
+                            if trimmed_trades > 0:
+                                logger.warning(
+                                    "Pending trades guard triggered: "
+                                    f"total_pending_trades={total_pending_trades}, "
+                                    f"trimmed={trimmed_trades}, "
+                                    f"per_window_limit={pending_trim_per_window}"
+                                )
+                                import gc
+                                gc.collect()
                         
                         # 清理不在universe中的symbol的klines
                         # 修复内存泄漏：确保所有DataFrame被完全释放
@@ -1276,109 +1368,66 @@ class DataLayerProcess:
                             import gc
                             gc.collect()
                         
-                        # 极端优化：强制清理超过限制的klines数据（即使symbol在universe中）
-                        # 确保每个symbol的klines不超过max_klines_per_symbol
+                        # 重新实现：使用kline_aggregator的强制清理方法，确保真正释放内存
                         max_klines = config.get('data.kline_aggregator_max_klines', 288)
-                        cleaned_count = 0
-                        total_trimmed = 0
-                        # 先计算当前klines总数，用于后续检查
-                        current_klines_total = sum(len(df) for df in self.kline_aggregator.klines.values() if not df.is_empty())
-                        expected_max_klines = len(active_symbols) * max_klines if active_symbols else 0
                         
-                        # 遍历所有klines中的symbol（包括不在active_symbols中的，确保全面清理）
-                        all_kline_symbols = list(self.kline_aggregator.klines.keys())
-                        for symbol in all_kline_symbols:
-                            if symbol not in self.kline_aggregator.klines:
-                                continue  # 可能已被其他线程删除
-                            df = self.kline_aggregator.klines[symbol]
-                            if df.is_empty():
-                                continue
-                            current_len = len(df)
-                            # 修复：当max_klines=1时，如果current_len > 1才需要trim
-                            # 当max_klines > 1时，如果current_len > max_klines才需要trim
-                            if max_klines > 1 and current_len > max_klines:
-                                # 只保留最新的klines，使用clone()确保创建新对象
-                                # 修复内存泄漏：确保旧DataFrame被完全释放
-                                old_df = self.kline_aggregator.klines[symbol]
-                                trimmed_df = old_df.tail(max_klines).clone()
-                                # 立即更新并释放旧对象
-                                self.kline_aggregator.klines[symbol] = trimmed_df
-                                if old_df is not None and old_df is not trimmed_df:
-                                    del old_df
-                                del trimmed_df
-                                cleaned_count += 1
-                                total_trimmed += (current_len - max_klines)
-                                logger.info(
-                                    f"Trimmed klines for {symbol}: {current_len} -> {max_klines}"
-                                )
-                            elif max_klines == 1 and current_len > 1:
-                                # 当max_klines=1时，如果超过1条，trim到1条
-                                old_df = self.kline_aggregator.klines[symbol]
-                                trimmed_df = old_df.tail(1).clone()
-                                self.kline_aggregator.klines[symbol] = trimmed_df
-                                if old_df is not None and old_df is not trimmed_df:
-                                    del old_df
-                                del trimmed_df
-                                cleaned_count += 1
-                                total_trimmed += (current_len - 1)
-                                logger.info(
-                                    f"Trimmed klines for {symbol}: {current_len} -> 1"
-                                )
+                        # 关键修复：限制force_rebuild触发频率，避免“重建->内存抬升->再次重建”的正反馈
+                        memory_growth_rate = (
+                            mem_before - self._last_memory if self._last_memory > 0 else 0
+                        )
+                        self._last_memory = mem_before
+                        self._cleanup_counter += 1
+
+                        growth_threshold_mb = 15.0
+                        if memory_growth_rate > growth_threshold_mb:
+                            self._high_growth_streak += 1
+                        else:
+                            self._high_growth_streak = 0
+
+                        force_rebuild = False
+                        # 周期性重建：降低频率，避免每次cleanup都全量重建
+                        if self._cleanup_counter % 12 == 0:
+                            force_rebuild = True
+                        # 高增长触发：需要连续增长且达到一定内存规模，并且不在冷却期
+                        elif (
+                            mem_before > 800
+                            and self._high_growth_streak >= 3
+                            and self._force_rebuild_cooldown <= 0
+                        ):
+                            force_rebuild = True
+
+                        if force_rebuild:
+                            # 冷却窗口：避免连续多次强制重建
+                            self._force_rebuild_cooldown = 4
+                        elif self._force_rebuild_cooldown > 0:
+                            self._force_rebuild_cooldown -= 1
+                        
+                        # 调用kline_aggregator的强制清理方法
+                        cleaned_count, total_trimmed = self.kline_aggregator.force_cleanup_klines(
+                            max_klines, force_rebuild_all=force_rebuild
+                        )
+                        
                         if cleaned_count > 0:
-                            logger.info(
-                                f"Trimmed klines for {cleaned_count} symbols exceeding limit ({max_klines}), "
-                                f"removed {total_trimmed} klines total"
-                            )
-                        
-                        # 如果接近限制但未清理，触发预防性trim
-                        # 修复：当接近限制时，应该触发trim而不是只警告
-                        should_trigger_preventive = False
-                        if expected_max_klines > 1 and current_klines_total > expected_max_klines * 0.9:
-                            should_trigger_preventive = True
-                            logger.info(
-                                f"Klines total ({current_klines_total}) is close to limit ({expected_max_klines:.0f}), "
-                                f"triggering preventive trim..."
-                            )
-                        
-                        # 强制清理：即使没有超过限制，也定期trim到60%限制（从80%降低到60%），确保内存稳定
-                        # 修复配置安全性：降低trim阈值，确保内存不超过1.5-2GB目标
-                        # 修复：当max_klines=1时，不应该进行预防性trim（因为trim后就没有数据了）
-                        # 只有当max_klines > 1时才进行预防性trim
-                        preventive_cleaned = 0
-                        preventive_total_trimmed = 0
-                        if max_klines > 1:
-                            # 如果接近限制，使用更激进的trim阈值（50%而不是60%）
-                            if should_trigger_preventive:
-                                trim_threshold = max(1, int(max_klines * 0.5))  # 接近限制时使用50%
+                            if total_trimmed > 0:
+                                logger.info(
+                                    f"Force cleaned klines: {cleaned_count} symbols processed, "
+                                    f"removed {total_trimmed} klines total (max_klines={max_klines}, "
+                                    f"force_rebuild={force_rebuild})"
+                                )
                             else:
-                                trim_threshold = max(1, int(max_klines * 0.6))  # 正常情况使用60%
-                            # 遍历所有klines中的symbol，确保全面清理
-                            all_kline_symbols = list(self.kline_aggregator.klines.keys())
-                            for symbol in all_kline_symbols:
-                                if symbol not in self.kline_aggregator.klines:
-                                    continue  # 可能已被其他线程删除
-                                df = self.kline_aggregator.klines[symbol]
-                                if df.is_empty():
-                                    continue
-                                current_len = len(df)
-                                if current_len > trim_threshold:
-                                    # 预防性清理：trim到60%限制（从80%降低到60%）
-                                    # 修复内存泄漏：确保旧DataFrame被完全释放
-                                    old_len = current_len
-                                    old_df = self.kline_aggregator.klines[symbol]
-                                    trimmed_df = old_df.tail(trim_threshold).clone()
-                                    self.kline_aggregator.klines[symbol] = trimmed_df
-                                    if old_df is not None and old_df is not trimmed_df:
-                                        del old_df
-                                    del trimmed_df
-                                    preventive_cleaned += 1
-                                    preventive_total_trimmed += (old_len - trim_threshold)
-                        if preventive_cleaned > 0:
-                            logger.info(
-                                f"Preventive trimmed klines for {preventive_cleaned} symbols "
-                                f"(trimmed to {trim_threshold} klines, 60% of max {max_klines}), "
-                                f"removed {preventive_total_trimmed} klines total"
-                            )
+                                if force_rebuild:
+                                    logger.info(
+                                        f"Force cleaned klines: {cleaned_count} symbols rebuilt to release memory fragments "
+                                        f"(max_klines={max_klines}, memory_growth_rate={memory_growth_rate:.2f}MB)"
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"Force cleaned klines: {cleaned_count} symbols checked, "
+                                        f"no trimming needed (all within limit, max_klines={max_klines})"
+                                    )
+                            # 强制GC，确保内存被释放
+                            import gc
+                            gc.collect()
                         
                         # 清理统计信息中不再活跃的symbol
                         # 修复内存泄漏：确保统计信息被及时清理
@@ -1656,14 +1705,50 @@ class DataLayerProcess:
                 await asyncio.sleep(300)  # 5分钟后重试
     
     def print_stats(self):
-        """打印统计信息"""
+        """打印统计信息（轻量摘要，避免构造超大日志对象）"""
         if self.collector:
-            collector_stats = self.collector.get_stats()
-            logger.info(f"Collector stats: {collector_stats}")
+            try:
+                runtime = time.time() - self.collector.stats.get('start_time', time.time())
+                trades_received = self.collector.stats.get('trades_received', {})
+                total_trades = sum(trades_received.values())
+                active_trade_symbols = sum(1 for v in trades_received.values() if v > 0)
+                logger.info(
+                    "Collector stats summary: "
+                    f"running={self.collector.running}, "
+                    f"symbols={len(self.collector.symbols)}, "
+                    f"runtime={runtime:.1f}s, "
+                    f"total_trades={total_trades}, "
+                    f"active_symbols={active_trade_symbols}, "
+                    f"reconnects={self.collector.stats.get('reconnect_count', 0)}"
+                )
+            except Exception as e:
+                logger.debug(f"Failed to print collector stats summary: {e}")
         
         if self.kline_aggregator:
-            aggregator_stats = self.kline_aggregator.get_stats()
-            logger.info(f"Aggregator stats: {aggregator_stats}")
+            try:
+                pending_symbols = len(self.kline_aggregator.pending_trades)
+                pending_windows = sum(len(w) for w in self.kline_aggregator.pending_trades.values())
+                klines_symbols = len(self.kline_aggregator.klines)
+                klines_total = sum(
+                    len(df) for df in self.kline_aggregator.klines.values() if not df.is_empty()
+                )
+                trades_processed_total = sum(
+                    self.kline_aggregator.stats.get("trades_processed", {}).values()
+                )
+                klines_generated_total = sum(
+                    self.kline_aggregator.stats.get("klines_generated", {}).values()
+                )
+                logger.info(
+                    "Aggregator stats summary: "
+                    f"pending_symbols={pending_symbols}, "
+                    f"pending_windows={pending_windows}, "
+                    f"klines_symbols={klines_symbols}, "
+                    f"klines_total={klines_total}, "
+                    f"trades_processed_total={trades_processed_total}, "
+                    f"klines_generated_total={klines_generated_total}"
+                )
+            except Exception as e:
+                logger.debug(f"Failed to print aggregator stats summary: {e}")
 
 
 async def main():

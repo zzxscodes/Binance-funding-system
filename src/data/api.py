@@ -604,51 +604,83 @@ class DataAPI:
                         tail_count = max(1, self._cache_max_klines - 1)
                         cached_df = cached_df.tail(tail_count)
                     
-                    # 合并新数据（使用polars concat，比pandas快）
-                    # 修复内存泄漏：确保所有中间DataFrame被正确释放
+                    # 重新实现：合并新数据，确保真正释放内存
+                    # 使用to_pandas再转回polars，确保完全释放内存
                     old_cached_df = cached_df
                     combined_df = pl.concat([cached_df, new_kline_df])
-                    # 清理中间对象引用，帮助GC
+                    # 清理中间对象引用
                     del cached_df
                     del new_kline_df
                     
                     # 如果数据量大，使用lazy API优化去重和排序
-                    # 优化：降低阈值，更频繁使用lazy API（目标60%-70%系统内存）
                     combined_len = len(combined_df)
                     if combined_len > 50:
+                        # 使用lazy API处理
                         old_combined_df = combined_df
-                        combined_df = (
+                        processed_df = (
                             old_combined_df
                             .lazy()
                             .unique(subset=['open_time'], keep='last')
                             .sort('open_time')
                             .collect()
                         )
+                        # 使用to_pandas再转回polars，确保完全释放内存
+                        try:
+                            df_pd = processed_df.to_pandas()
+                            combined_df = pl.from_pandas(df_pd)
+                            del df_pd
+                        except Exception:
+                            combined_df = processed_df.clone()
+                        del processed_df
                         if old_combined_df is not None and old_combined_df is not combined_df:
                             del old_combined_df
                     elif combined_len > 1:
                         # 去重（按open_time，保留最新的）
                         old_combined_df = combined_df
-                        combined_df = old_combined_df.unique(subset=['open_time'], keep='last')
-                        combined_df = combined_df.sort('open_time')
+                        processed_df = old_combined_df.unique(subset=['open_time'], keep='last')
+                        processed_df = processed_df.sort('open_time')
+                        # 使用to_pandas再转回polars，确保完全释放内存
+                        try:
+                            df_pd = processed_df.to_pandas()
+                            combined_df = pl.from_pandas(df_pd)
+                            del df_pd
+                        except Exception:
+                            combined_df = processed_df.clone()
+                        del processed_df
                         if old_combined_df is not None and old_combined_df is not combined_df:
                             del old_combined_df
                     
                     # 如果超过最大数量，移除最旧的数据（双重检查，确保不超过限制）
                     if len(combined_df) > self._cache_max_klines:
-                        # 保留最新的K线
+                        # 保留最新的K线，使用to_pandas再转回polars确保完全释放内存
                         old_combined_df = combined_df
-                        combined_df = old_combined_df.tail(self._cache_max_klines)
+                        try:
+                            df_pd = old_combined_df.tail(self._cache_max_klines).to_pandas()
+                            combined_df = pl.from_pandas(df_pd)
+                            del df_pd
+                        except Exception:
+                            combined_df = old_combined_df.tail(self._cache_max_klines).clone()
                         if old_combined_df is not None and old_combined_df is not combined_df:
                             del old_combined_df
                     
                     # 更新缓存，确保旧DataFrame被释放
+                    # 使用to_pandas再转回polars，确保完全释放旧DataFrame的内存
                     old_cached = self._memory_cache.get(sys_symbol)
-                    self._memory_cache[sys_symbol] = combined_df
-                    if old_cached is not None and old_cached is not combined_df and old_cached is not old_cached_df:
+                    try:
+                        df_pd = combined_df.to_pandas()
+                        final_df = pl.from_pandas(df_pd)
+                        del df_pd
+                    except Exception:
+                        final_df = combined_df.clone()
+                    
+                    self._memory_cache[sys_symbol] = final_df
+                    # 释放旧引用
+                    if old_cached is not None and old_cached is not final_df and old_cached is not old_cached_df:
                         del old_cached
-                    if old_cached_df is not None and old_cached_df is not combined_df:
+                    if old_cached_df is not None and old_cached_df is not final_df:
                         del old_cached_df
+                    del combined_df  # 临时变量，立即释放
+                    del final_df  # 临时变量，立即释放（但缓存中已有引用）
                 
                 # 检查并清理缓存
                 self._cleanup_cache_if_needed()
