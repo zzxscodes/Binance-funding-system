@@ -276,12 +276,9 @@ class KlineAggregator:
         """
         try:
             # 从pending列表获取trades（现在是List[Dict]）
-            # 修复内存泄漏：确保窗口被完全移除，并立即清理trades_list引用
+            # 修复内存泄漏：确保窗口被完全移除
             if window_start_ms in self.pending_trades.get(symbol, {}):
                 trades_list = self.pending_trades[symbol].pop(window_start_ms, [])
-                # 立即清空列表，释放内存
-                if trades_list:
-                    trades_list.clear()
                 # 修复内存泄漏：如果symbol的pending_trades变为空字典，删除整个条目
                 if symbol in self.pending_trades and not self.pending_trades[symbol]:
                     del self.pending_trades[symbol]
@@ -709,39 +706,65 @@ class KlineAggregator:
                         current_df = trimmed_current
                         current_len = len(current_df)
                 
-                # 合并新K线
-                # 使用concat合并，不立即clone（减少不必要的复制）
+                # 重新实现：合并新K线，确保真正释放内存
+                # 使用concat合并
                 new_df = pl.concat([current_df, kline_df])
-                # 立即释放中间对象引用，帮助GC
+                # 立即释放中间对象引用
                 del current_df
                 del kline_df
                 
                 # 强制检查：如果合并后超过限制，立即trim（在去重前）
                 if len(new_df) > max_klines:
-                    # 先trim到限制值，然后再去重（避免去重后仍超过限制）
-                    trimmed_df = new_df.tail(max_klines).clone()
-                    old_new_df = self.klines.get(symbol)
+                    # 先trim到限制值，使用to_pandas再转回polars确保完全释放内存
+                    old_df_in_dict = self.klines.get(symbol)
+                    try:
+                        # 使用to_pandas再转回polars，确保完全释放内存
+                        df_pd = new_df.tail(max_klines).to_pandas()
+                        trimmed_df = pl.from_pandas(df_pd)
+                        del df_pd
+                    except Exception:
+                        # 如果转换失败，使用clone
+                        trimmed_df = new_df.tail(max_klines).clone()
+                    
+                    # 更新并释放旧DataFrame
                     self.klines[symbol] = trimmed_df
                     del new_df
                     del trimmed_df
-                    if old_new_df is not None and old_new_df is not self.klines[symbol]:
-                        del old_new_df
+                    # 释放旧的DataFrame引用（如果存在且不同）
+                    if old_df_in_dict is not None and old_df_in_dict is not self.klines[symbol]:
+                        del old_df_in_dict
                 else:
                     # 更新klines（在去重前先更新，避免去重过程中数据丢失）
-                    old_new_df = self.klines.get(symbol)
-                    self.klines[symbol] = new_df
-                    if old_new_df is not None and old_new_df is not new_df:
-                        del old_new_df
-                    del new_df  # 临时变量，立即释放
+                    # 使用to_pandas再转回polars，确保完全释放内存
+                    old_df_in_dict = self.klines.get(symbol)
+                    try:
+                        df_pd = new_df.to_pandas()
+                        new_df_clean = pl.from_pandas(df_pd)
+                        del df_pd
+                    except Exception:
+                        new_df_clean = new_df.clone()
+                    
+                    self.klines[symbol] = new_df_clean
+                    del new_df
+                    del new_df_clean
+                    # 释放旧的DataFrame引用（如果存在且不同）
+                    if old_df_in_dict is not None and old_df_in_dict is not self.klines[symbol]:
+                        del old_df_in_dict
 
-            # 去除重复（按open_time去重，保留最新的）
-            # 修复内存泄漏：确保所有中间DataFrame被正确释放
+            # 重新实现：去除重复（按open_time去重，保留最新的），确保真正释放内存
             current_len = len(self.klines[symbol])
             
             # 如果数据量较大，先trim再去重，减少处理量
             if current_len > max_klines:
-                trimmed_df = self.klines[symbol].tail(max_klines).clone()
                 old_df = self.klines[symbol]
+                # 使用to_pandas再转回polars，确保完全释放内存
+                try:
+                    df_pd = old_df.tail(max_klines).to_pandas()
+                    trimmed_df = pl.from_pandas(df_pd)
+                    del df_pd
+                except Exception:
+                    trimmed_df = old_df.tail(max_klines).clone()
+                
                 self.klines[symbol] = trimmed_df
                 # 确保旧DataFrame被完全释放
                 if old_df is not None and old_df is not trimmed_df:
@@ -761,11 +784,20 @@ class KlineAggregator:
                     .sort("open_time")
                     .collect()
                 )
+                # 使用to_pandas再转回polars，确保完全释放内存
+                try:
+                    df_pd = processed_df.to_pandas()
+                    processed_df_clean = pl.from_pandas(df_pd)
+                    del df_pd
+                except Exception:
+                    processed_df_clean = processed_df.clone()
+                
                 # 立即更新并释放旧对象
-                self.klines[symbol] = processed_df
-                if old_df is not None and old_df is not processed_df:
+                self.klines[symbol] = processed_df_clean
+                if old_df is not None and old_df is not processed_df_clean:
                     del old_df
                 del processed_df
+                del processed_df_clean
             elif current_len > 1:  # 只有1条数据时不需要去重
                 # 直接去重和排序
                 old_df = self.klines[symbol]
@@ -775,18 +807,33 @@ class KlineAggregator:
                     .sort("open_time")
                     .clone()
                 )
-                self.klines[symbol] = processed_df
-                if old_df is not None and old_df is not processed_df:
+                # 使用to_pandas再转回polars，确保完全释放内存
+                try:
+                    df_pd = processed_df.to_pandas()
+                    processed_df_clean = pl.from_pandas(df_pd)
+                    del df_pd
+                except Exception:
+                    processed_df_clean = processed_df.clone()
+                
+                self.klines[symbol] = processed_df_clean
+                if old_df is not None and old_df is not processed_df_clean:
                     del old_df
                 del processed_df
+                del processed_df_clean
 
-            # 最终强制检查：确保不超过限制（三重检查，防止内存泄漏）
-            # 修复内存泄漏：确保所有DataFrame引用被正确释放
+            # 重新实现：最终强制检查，确保不超过限制，并真正释放内存
             final_len = len(self.klines[symbol])
             if final_len > max_klines:
                 # 强制trim到限制值（保留最新的）
                 old_df = self.klines[symbol]
-                final_df = old_df.tail(max_klines).clone()
+                # 使用to_pandas再转回polars，确保完全释放内存
+                try:
+                    df_pd = old_df.tail(max_klines).to_pandas()
+                    final_df = pl.from_pandas(df_pd)
+                    del df_pd
+                except Exception:
+                    final_df = old_df.tail(max_klines).clone()
+                
                 self.klines[symbol] = final_df
                 # 确保旧DataFrame被完全释放
                 if old_df is not None and old_df is not final_df:
@@ -809,22 +856,33 @@ class KlineAggregator:
                 import gc
                 gc.collect()
 
-            # 清理临时DataFrame和列表，释放内存
-            # 修复内存泄漏：确保所有临时对象被完全释放
+            # 重新实现：强制清理临时DataFrame和列表，确保真正释放内存
+            # 修复内存泄漏：polars DataFrame的filter操作会创建新的DataFrame，需要强制释放
+            # 在计算完所有统计值后立即释放，避免持有引用
+            trades_count_before_cleanup = len(trades_list) if trades_list else 0
+            
             if has_trades:
-                # 释放所有临时DataFrame引用
-                del buy_trades
-                del sell_trades
-                del buy_tier1
-                del buy_tier2
-                del buy_tier3
-                del buy_tier4
-                del sell_tier1
-                del sell_tier2
-                del sell_tier3
-                del sell_tier4
-                del trades_df
-                del agg_result
+                # 立即释放所有临时DataFrame引用（在计算完成后立即释放）
+                # 使用try-finally确保即使出错也释放内存
+                try:
+                    # 先释放tier DataFrame（它们持有对buy_trades/sell_trades的引用）
+                    del buy_tier1
+                    del buy_tier2
+                    del buy_tier3
+                    del buy_tier4
+                    del sell_tier1
+                    del sell_tier2
+                    del sell_tier3
+                    del sell_tier4
+                    # 再释放buy_trades和sell_trades（它们持有对trades_df的引用）
+                    del buy_trades
+                    del sell_trades
+                    # 最后释放trades_df和agg_result
+                    del trades_df
+                    del agg_result
+                except Exception:
+                    pass  # 忽略删除错误，确保继续执行
+                
                 # 清空trades_list，释放内存
                 if trades_list:
                     trades_list.clear()
@@ -834,6 +892,12 @@ class KlineAggregator:
                 if trades_list:
                     trades_list.clear()
                 del trades_list
+            
+            # 强制GC，确保polars DataFrame的内存被真正释放
+            # 注意：只在数据量大时触发，避免频繁GC影响性能
+            if has_trades and trades_count_before_cleanup > 100:
+                import gc
+                gc.collect()
             
             # 更新统计
             self.stats["klines_generated"][symbol] += 1
@@ -1111,6 +1175,80 @@ class KlineAggregator:
             # 强制垃圾回收，帮助释放内存
             import gc
             gc.collect()
+    
+    def force_cleanup_klines(self, max_klines: int, force_rebuild_all: bool = False) -> tuple[int, int]:
+        """
+        强制清理klines数据，确保真正释放内存
+        
+        Args:
+            max_klines: 每个symbol最多保留的K线数
+            force_rebuild_all: 如果为True，即使数据量在限制内也重建DataFrame以释放内存碎片
+            
+        Returns:
+            (cleaned_count, total_trimmed): 清理的symbol数量和总trim掉的K线数
+        """
+        cleaned_count = 0
+        total_trimmed = 0
+        
+        # 重新实现：清理数据并释放内存碎片
+        # 关键修复：即使数据量在限制内，也要定期重建DataFrame以释放Polars的内存碎片
+        all_symbols = list(self.klines.keys())
+        
+        for symbol in all_symbols:
+            if symbol not in self.klines:
+                continue
+            
+            df = self.klines[symbol]
+            if df.is_empty():
+                # 清理空DataFrame
+                del self.klines[symbol]
+                cleaned_count += 1
+                continue
+            
+            current_len = len(df)
+            
+            # 根据max_klines确定保留的数据量
+            if max_klines > 1:
+                keep_count = min(current_len, max_klines)
+            else:
+                keep_count = min(current_len, 1)
+            
+            # 关键修复：如果数据量超过限制，或者force_rebuild_all为True，都需要重建DataFrame
+            needs_rebuild = current_len > keep_count or force_rebuild_all
+            
+            if needs_rebuild:
+                old_df = self.klines[symbol]
+
+                # 小DataFrame走轻量路径，避免频繁to_pandas引入额外内存抬升
+                if current_len <= 2 and keep_count <= 1:
+                    new_df = old_df.tail(keep_count).rechunk()
+                else:
+                    # 使用to_pandas再转回polars，确保完全释放内存
+                    try:
+                        df_pd = old_df.tail(keep_count).to_pandas()
+                        new_df = pl.from_pandas(df_pd)
+                        del df_pd
+                    except Exception:
+                        new_df = old_df.tail(keep_count).clone()
+                
+                # 更新并释放旧DataFrame
+                # 关键修复：先删除旧引用，再赋值新DataFrame，确保旧DataFrame可以被GC回收
+                if old_df is not None and old_df is not new_df:
+                    # 先删除旧引用（这样old_df就没有其他引用了）
+                    del self.klines[symbol]
+                    # 再赋值新DataFrame
+                    self.klines[symbol] = new_df
+                    # 删除old_df引用（现在old_df应该可以被GC回收了）
+                    del old_df
+                else:
+                    self.klines[symbol] = new_df
+                # 注意：不要删除new_df，因为它已经被赋值给self.klines[symbol]
+                
+                cleaned_count += 1
+                if current_len > keep_count:
+                    total_trimmed += (current_len - keep_count)
+        
+        return cleaned_count, total_trimmed
 
     def get_stats(self) -> Dict:
         """获取统计信息"""
