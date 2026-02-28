@@ -1024,9 +1024,22 @@ class DataLayerProcess:
                 
                 logger.info(f"Starting periodic premium index collection for {len(universe)} symbols...")
                 
-                # 采集最近24小时的数据（确保覆盖最新的溢价指数K线）
+                # 仅做增量采集：避免每轮都回拉24小时全量，降低内存峰值与RSS慢涨
                 end_time = datetime.now(timezone.utc)
-                start_time = end_time - timedelta(days=1)
+                overlap_minutes = int(config.get("data.premium_index_collect_overlap_minutes", 10))
+                fallback_lookback_minutes = int(
+                    config.get("data.premium_index_periodic_lookback_minutes", 60)
+                )
+                if self.last_premium_index_collect_time > 0:
+                    last_collect_dt = datetime.fromtimestamp(
+                        self.last_premium_index_collect_time, timezone.utc
+                    )
+                    start_time = last_collect_dt - timedelta(minutes=overlap_minutes)
+                else:
+                    start_time = end_time - timedelta(minutes=fallback_lookback_minutes)
+
+                if start_time >= end_time:
+                    start_time = end_time - timedelta(minutes=max(overlap_minutes, 5))
                 
                 symbols = list(universe)
                 max_concurrent = config.get('data.history_collect_max_concurrent', 5)
@@ -1385,8 +1398,15 @@ class DataLayerProcess:
                             self._high_growth_streak = 0
 
                         force_rebuild = False
-                        # 周期性重建：降低频率，避免每次cleanup都全量重建
-                        if self._cleanup_counter % 12 == 0:
+                        # 周期性重建：默认降低到更低频，避免慢性RSS抬升
+                        # 说明：0或负值表示禁用周期性重建，仅在高增长触发时执行
+                        periodic_rebuild_interval = int(
+                            config.get("data.memory_force_rebuild_interval", 60)
+                        )
+                        if (
+                            periodic_rebuild_interval > 0
+                            and self._cleanup_counter % periodic_rebuild_interval == 0
+                        ):
                             force_rebuild = True
                         # 高增长触发：需要连续增长且达到一定内存规模，并且不在冷却期
                         elif (

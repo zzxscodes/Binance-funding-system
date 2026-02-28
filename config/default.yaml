@@ -57,6 +57,7 @@ data:
   # 内存清理配置（极端优化：更频繁的清理以确保整套系统内存占用在目标范围内）
   memory_cleanup_interval: 60  # 定期内存清理间隔（秒，1分钟，极端优化：更频繁的清理以控制内存峰值）
   stats_cleanup_interval: 120  # 统计信息清理间隔（秒，2分钟，极端优化：更频繁的清理）
+  memory_force_rebuild_interval: 60  # kline全量重建周期（cleanup轮次）。<=0禁用周期重建，仅高增长触发
   
   # 资金费率采集配置
   funding_rate_collect_interval: 28800  # 8小时（资金费率每8小时更新一次）
@@ -65,6 +66,8 @@ data:
   # 溢价指数K线采集配置
   premium_index_collect_interval: 300  # 5分钟
   premium_index_collect_days: 30  # 采集最近N天的历史数据
+  premium_index_collect_overlap_minutes: 10  # 定期增量采集时向前重叠窗口，避免边界漏数
+  premium_index_periodic_lookback_minutes: 60  # 无上次采集时间时的回看窗口（分钟）
   
   # 数据完整性检查配置
   completeness_threshold: 0.95  # 数据完整性阈值（95%）
