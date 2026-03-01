@@ -417,10 +417,11 @@ class DataAPI:
             
             logger.info(f"Initializing memory cache for {len(symbols)} symbols...")
             
-            # 计算时间范围（最近1天，极端优化）
-            # 注意：30天缓存无法实现，已减少到1天以确保整套系统内存占用在目标范围内
+            # 计算时间范围：与策略历史窗口保持一致
             end_time = datetime.now(timezone.utc)
-            start_time = end_time - timedelta(days=1)
+            cache_days = int(config.get('strategy.history_days', self.strategy_history_days))
+            cache_days = max(1, cache_days)
+            start_time = end_time - timedelta(days=cache_days)
             
             # 批量加载数据
             storage_map = self.storage.load_klines_bulk(
@@ -760,7 +761,7 @@ class DataAPI:
         
         Bar表字段包括：
             - 基础字段: symbol, open_time, close_time, open, high, low, close, volume, quote_volume, trade_count
-            - bar表专用字段: microsecond_since_trad, span_begin_datetime, span_end_datetime, span_status,
+            - bar表专用字段: microsecond_since_trade, span_begin_datetime, span_end_datetime, span_status,
                             last, vwap, dolvol, buydolvol, selldolvol, buyvolume, sellvolume,
                             buytradecount, selltradecount, time_lable
         """
@@ -843,7 +844,7 @@ class DataAPI:
                                 bar_fields = [
                                     'symbol', 'open_time', 'close_time', 'open', 'high', 'low', 'close',
                                     'volume', 'quote_volume', 'trade_count',
-                                    'microsecond_since_trad', 'span_begin_datetime', 'span_end_datetime',
+                                    'microsecond_since_trade', 'span_begin_datetime', 'span_end_datetime',
                                     'span_status', 'last', 'vwap', 'dolvol', 'buydolvol', 'selldolvol',
                                     'buyvolume', 'sellvolume', 'tradecount', 'buytradecount', 'selltradecount', 'time_lable'
                                 ]
@@ -991,6 +992,77 @@ class DataAPI:
             except Exception as e:
                 logger.error(f"Error in get_tran_stats_between: {e}", exc_info=True)
                 raise
+
+    def get_kline_between(
+        self,
+        begin_date_time_label: str,
+        end_date_time_label: str,
+        mode: str = '5min'
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        统一获取K线数据（bar + tran_stats字段），供研究侧单接口使用。
+        """
+        if mode != '5min':
+            # 非5分钟模式聚合路径较复杂，复用现有实现做字段并集
+            bar_map = self.get_bar_between(begin_date_time_label, end_date_time_label, mode=mode)
+            tran_map = self.get_tran_stats_between(begin_date_time_label, end_date_time_label, mode=mode)
+            result: Dict[str, pd.DataFrame] = {}
+            all_symbols = set(bar_map.keys()) | set(tran_map.keys())
+            for sym in all_symbols:
+                bar_df = bar_map.get(sym, pd.DataFrame())
+                tran_df = tran_map.get(sym, pd.DataFrame())
+                if bar_df.empty and tran_df.empty:
+                    continue
+                if bar_df.empty:
+                    result[sym] = tran_df
+                    continue
+                if tran_df.empty:
+                    result[sym] = bar_df
+                    continue
+                join_keys = [k for k in ['symbol', 'open_time', 'time_lable'] if k in bar_df.columns and k in tran_df.columns]
+                if join_keys:
+                    merged = bar_df.merge(tran_df, on=join_keys, how='left', suffixes=('', '_tran'))
+                else:
+                    merged = bar_df
+                result[sym] = merged
+            return result
+
+        # 5分钟模式直接从缓存一次过滤返回全部字段
+        begin_time = self._parse_date_time_label(begin_date_time_label)
+        end_time = self._parse_date_time_label(end_date_time_label)
+        if begin_time >= end_time:
+            logger.warning(f"Invalid time range: begin >= end ({begin_date_time_label} >= {end_date_time_label})")
+            return {}
+
+        if not self._ensure_cache_loaded(begin_time, end_time):
+            logger.warning("Failed to load data into cache, returning empty result")
+            return {}
+
+        with self._cache_lock:
+            cached_symbols = list(self._memory_cache.keys())
+
+        result: Dict[str, pd.DataFrame] = {}
+        import time
+        current_time = time.time()
+        for sys_symbol in cached_symbols:
+            try:
+                with self._cache_lock:
+                    if sys_symbol not in self._memory_cache:
+                        continue
+                    cached_df_pl = self._memory_cache[sys_symbol]
+                    self._cache_access_time[sys_symbol] = current_time
+                if cached_df_pl.is_empty() or 'open_time' not in cached_df_pl.columns:
+                    continue
+                filtered_df_pl = cached_df_pl.filter(
+                    (pl.col('open_time') >= begin_time) &
+                    (pl.col('open_time') <= end_time)
+                )
+                if filtered_df_pl.is_empty():
+                    continue
+                result[sys_symbol] = filtered_df_pl.to_pandas()
+            except Exception as e:
+                logger.error(f"Failed to get kline data for {sys_symbol}: {e}", exc_info=True)
+        return result
     
     def get_funding_rate_between(self, begin_date_time_label: str, end_date_time_label: str) -> Dict[str, pd.DataFrame]:
         """

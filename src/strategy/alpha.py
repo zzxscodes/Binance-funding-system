@@ -68,11 +68,22 @@ class AlphaEngine:
         self.performance_monitor = get_performance_monitor()
 
     def _get_labels(self, history_days: int) -> tuple[str, str]:
-        end_time = datetime.now(timezone.utc)
+        # 使用“已完成窗口”的末端标签，避免请求当前尚未生成的K线窗口
+        now_utc = datetime.now(timezone.utc)
+        current_window_start = now_utc.replace(second=0, microsecond=0) - timedelta(
+            minutes=now_utc.minute % 5
+        )
+        end_time = current_window_start - timedelta(minutes=5)
         begin_time = end_time - timedelta(days=history_days)
         begin_label = self.data_api._get_date_time_label_from_datetime(begin_time)
         end_label = self.data_api._get_date_time_label_from_datetime(end_time)
         return begin_label, end_label
+
+    @staticmethod
+    def _scale_weights(vec: Dict[str, float], factor: float) -> Dict[str, float]:
+        if abs(factor - 1.0) < 1e-12:
+            return vec
+        return {k: (float(v) * factor) for k, v in vec.items()}
 
     def fetch_snapshot(
         self,
@@ -162,15 +173,21 @@ class AlphaEngine:
         if self.concurrency == "none" or len(self.calculators) == 1:
             with self.performance_monitor.measure('alpha_engine', 'calculators_execution', {'mode': 'serial', 'count': len(self.calculators)}):
                 per_calc: Dict[str, Dict[str, float]] = {}
+                weighted_vectors: List[Dict[str, float]] = []
+                calc_weights = config.get("strategy.calculators.weights", {}) or {}
                 for calc in self.calculators:
                     with self.performance_monitor.measure('alpha_engine', f'calculator_{calc.name}'):
                         view = base_view.with_copy_on_read(calc.mutates_inputs)
-                        per_calc[calc.name] = calc.run(view)
-            return AlphaResult(weights=self._sum_weights(per_calc.values()), per_calculator=per_calc)
+                        raw_vec = calc.run(view)
+                        per_calc[calc.name] = raw_vec
+                        calc_weight = float(calc_weights.get(calc.name, 1.0))
+                        weighted_vectors.append(self._scale_weights(raw_vec, calc_weight))
+            return AlphaResult(weights=self._sum_weights(weighted_vectors), per_calculator=per_calc)
 
         # 并发路径
         per_calc = {}
-        vectors = []
+        weighted_vectors = []
+        calc_weights = config.get("strategy.calculators.weights", {}) or {}
         executor = self._executor()
         assert executor is not None
 
@@ -190,14 +207,15 @@ class AlphaEngine:
                         logger.error(f"Calculator failed: {name}: {e}", exc_info=True)
                         vec = {}
                     per_calc[name] = vec
-                    vectors.append(vec)
+                    calc_weight = float(calc_weights.get(name, 1.0))
+                    weighted_vectors.append(self._scale_weights(vec, calc_weight))
             finally:
                 executor.shutdown(wait=True, cancel_futures=False)
 
         dt = (datetime.now(timezone.utc) - t0).total_seconds()
         logger.info(f"Alpha calculators completed: {len(self.calculators)} calcs in {dt:.2f}s")
 
-        return AlphaResult(weights=self._sum_weights(vectors), per_calculator=per_calc)
+        return AlphaResult(weights=self._sum_weights(weighted_vectors), per_calculator=per_calc)
 
 
 _alpha_engine: Optional[AlphaEngine] = None

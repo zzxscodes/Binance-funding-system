@@ -10,6 +10,8 @@
 import json
 import time
 import asyncio
+import random
+import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 from typing import Dict, List, Set, Optional, Callable
@@ -20,7 +22,7 @@ import pandas as pd
 from ..common.config import config
 from ..common.logger import get_logger
 from ..common.utils import format_symbol
-from ..common.network_utils import log_network_error, ConnectionTimeoutError
+from ..common.network_utils import safe_http_request, log_network_error, ConnectionTimeoutError
 
 logger = get_logger('data_collector')
 
@@ -42,13 +44,18 @@ class TradeCollector:
         
         # WebSocket配置（根据 execution.mode 自动选择正确的地址，数据层支持testnet回退到live）
         self.ws_base = config.get_binance_ws_base_for_data_layer()
+        self.api_base = config.get_binance_api_base_for_data_layer()
         self.reconnect_delay = 5
-        # Binance要求30秒内必须有活动，我们使用20秒ping间隔确保连接稳定
-        # 使用websockets库的自动ping机制，更可靠
-        # 增加ping间隔和超时时间，减少频繁断开
-        self.ping_interval = 20  # 每20秒自动发送ping（Binance建议10-30秒）
-        self.ping_timeout = 10  # ping超时时间增加到10秒，避免网络延迟导致的误判
-        self.open_timeout = 30  # 连接超时时间
+        # Binance要求30秒内必须有活动，使用可配置ping参数以适配不同网络质量
+        self.ping_interval = int(config.get("data.collector_ping_interval_seconds", 20))
+        self.ping_timeout = int(config.get("data.collector_ping_timeout_seconds", 20))
+        self.open_timeout = int(config.get("data.collector_open_timeout_seconds", 30))
+        self.ping_interval_jitter_seconds = float(
+            config.get("data.collector_ping_interval_jitter_seconds", 2.5)
+        )
+        self.batch_connect_stagger_seconds = float(
+            config.get("data.collector_batch_connect_stagger_seconds", 0.6)
+        )
         
         # 统计信息
         self.stats = {
@@ -62,10 +69,57 @@ class TradeCollector:
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.ws_task: Optional[asyncio.Task] = None
         self.ws_connections: List[asyncio.Task] = []  # 多个WebSocket连接任务
+        self.callback_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=int(config.get("data.collector_callback_queue_maxsize", 20000))
+        )
+        self.callback_queues: List[asyncio.Queue] = []
+        self.callback_workers: List[asyncio.Task] = []
+        self.callback_worker_count = int(config.get("data.collector_callback_workers", 16))
+        self.recover_on_reconnect = bool(config.get("data.collector_recover_on_reconnect", True))
+        self.recover_max_pages = int(config.get("data.collector_recover_max_pages", 3))
+        self.recover_page_limit = int(config.get("data.collector_recover_page_limit", 1000))
+        self.recover_max_trades_per_reconnect = int(
+            config.get("data.collector_recover_max_trades_per_reconnect", 2000)
+        )
+        self.recover_active_window_seconds = int(
+            config.get("data.collector_recover_active_window_seconds", 120)
+        )
+        self.recover_max_symbols_per_reconnect = int(
+            config.get("data.collector_recover_max_symbols_per_reconnect", 12)
+        )
+        self.recover_symbol_request_delay_ms = int(
+            config.get("data.collector_recover_symbol_request_delay_ms", 80)
+        )
+        self.recover_max_requests_per_minute = int(
+            config.get("data.collector_recover_max_requests_per_minute", 20)
+        )
+        self._recover_requests_remaining = self.recover_max_requests_per_minute
+        self._recover_requests_window_start = time.time()
+        self.recover_suspended_until = 0.0
+        self._recover_lock = asyncio.Lock()
+        self.last_agg_trade_id: Dict[str, int] = {}
+        self.gap_recover_enabled = bool(config.get("data.collector_gap_recover_enabled", True))
+        self.gap_recover_max_trades = int(config.get("data.collector_gap_recover_max_trades", 2000))
+        self.gap_recover_page_limit = int(config.get("data.collector_gap_recover_page_limit", 500))
+        self.gap_recover_cooldown_seconds = float(
+            config.get("data.collector_gap_recover_cooldown_seconds", 5.0)
+        )
+        self.gap_recover_inflight: Set[str] = set()
+        self.gap_recover_last_ts: Dict[str, float] = {}
+        self.gap_recover_global_budget_per_minute = int(
+            config.get("data.collector_gap_recover_global_budget_per_minute", 3000)
+        )
+        self._gap_recover_budget_remaining = self.gap_recover_global_budget_per_minute
+        self._gap_recover_budget_window_start = time.time()
+        self.recent_agg_id_cache_size = int(
+            config.get("data.collector_recent_agg_id_cache_size", 500)
+        )
+        self.recent_agg_ids: Dict[str, Set[int]] = defaultdict(set)
+        self.recent_agg_id_order: Dict[str, deque] = defaultdict(deque)
         
         # WebSocket URL长度限制（Binance建议每个连接最多200个stream）
-        # 为了安全，我们使用更小的批次（100个symbols/连接）
-        self.max_symbols_per_connection = 100
+        # 为了安全，我们使用更小的批次，减轻单连接流量压力
+        self.max_symbols_per_connection = int(config.get("data.collector_max_symbols_per_connection", 50))
     
     def _split_symbols_into_batches(self) -> List[List[str]]:
         """
@@ -74,10 +128,16 @@ class TradeCollector:
         Returns:
             交易对批次列表
         """
-        batches = []
-        for i in range(0, len(self.symbols_lower), self.max_symbols_per_connection):
-            batch = self.symbols_lower[i:i + self.max_symbols_per_connection]
-            batches.append(batch)
+        if not self.symbols_lower:
+            return []
+
+        # 采用轮询分配而不是顺序切片，避免高活跃symbol集中在同一连接造成过载
+        batch_count = max(
+            1, (len(self.symbols_lower) + self.max_symbols_per_connection - 1) // self.max_symbols_per_connection
+        )
+        batches: List[List[str]] = [[] for _ in range(batch_count)]
+        for idx, symbol in enumerate(self.symbols_lower):
+            batches[idx % batch_count].append(symbol)
         return batches
     
     def _get_ws_url(self, symbols_batch: List[str]) -> str:
@@ -102,7 +162,7 @@ class TradeCollector:
         """将毫秒时间戳转换为微秒"""
         return ts_ms * 1000
     
-    async def _process_trade(self, symbol: str, data: dict):
+    async def _process_trade(self, symbol: str, data: dict, from_recovery: bool = False):
         """
         处理归集逐笔成交数据（Aggregate Trades）
         
@@ -117,6 +177,10 @@ class TradeCollector:
             # 提取关键字段
             # 归集逐笔和逐笔成交的字段名相同
             trade_id = data.get('a') or data.get('t')  # aggregate trade ID (a) 或 trade ID (t)
+            try:
+                trade_id_int = int(trade_id) if trade_id is not None else None
+            except Exception:
+                trade_id_int = None
             price = float(data.get('p', 0))  # price
             qty = float(data.get('q', 0))  # quantity (归集逐笔中这是合并后的总数量)
             quote_qty = float(data.get('Q', 0))  # quote quantity (归集逐笔中这是合并后的总成交额)
@@ -152,11 +216,56 @@ class TradeCollector:
             # 更新统计
             self.stats['trades_received'][symbol] += 1
             self.stats['last_message_time'][symbol] = time.time()
+            if trade_id_int is not None:
+                prev_id = self.last_agg_trade_id.get(symbol)
+                # 实时流中出现小于等于已处理ID的消息，多为重连重放/乱序回放，直接丢弃。
+                # 恢复流(from_recovery=True)允许补旧ID，不在这里拦截。
+                if (not from_recovery) and prev_id is not None and trade_id_int <= prev_id:
+                    return
+
+                # 内存级去重：避免重连补缺/网络重放导致同一aggTrade重复进入聚合器
+                id_set = self.recent_agg_ids[symbol]
+                if trade_id_int in id_set:
+                    return
+                id_set.add(trade_id_int)
+                id_queue = self.recent_agg_id_order[symbol]
+                id_queue.append(trade_id_int)
+                while len(id_queue) > self.recent_agg_id_cache_size:
+                    old_id = id_queue.popleft()
+                    id_set.discard(old_id)
+
+                # 若检测到ID跳跃，说明该symbol在实时链路出现缺口，触发受控补缺
+                if (
+                    (not from_recovery)
+                    and self.gap_recover_enabled
+                    and prev_id is not None
+                    and trade_id_int > prev_id + 1
+                ):
+                    now_ts = time.time()
+                    can_recover = (
+                        symbol not in self.gap_recover_inflight
+                        and now_ts - self.gap_recover_last_ts.get(symbol, 0.0)
+                        >= self.gap_recover_cooldown_seconds
+                    )
+                    if can_recover:
+                        from_id = prev_id + 1
+                        to_id = trade_id_int - 1
+                        self.gap_recover_inflight.add(symbol)
+                        self.gap_recover_last_ts[symbol] = now_ts
+                        asyncio.create_task(
+                            self._recover_symbol_gap(symbol, from_id, to_id)
+                        )
+                if prev_id is None or trade_id_int > prev_id:
+                    self.last_agg_trade_id[symbol] = trade_id_int
             
             # 调用回调函数（传递给K线聚合器）
             if self.on_trade_callback:
                 try:
-                    await self.on_trade_callback(symbol, trade_record)
+                    if self.callback_queues:
+                        idx = hash(symbol) % len(self.callback_queues)
+                        await self.callback_queues[idx].put((symbol, trade_record))
+                    else:
+                        await self.callback_queue.put((symbol, trade_record))
                 except Exception as e:
                     logger.error(f"Error in trade callback for {symbol}: {e}", exc_info=True)
             
@@ -170,6 +279,144 @@ class TradeCollector:
         except Exception as e:
             logger.error(f"Process trade data failed for {symbol}: {e}", exc_info=True)
             logger.error(f"Problem data: {json.dumps(data)[:500]}")
+
+    async def _schedule_gap_recover_continuation(
+        self, symbol: str, from_id: int, to_id: int, delay_seconds: float
+    ):
+        """延迟继续单symbol缺口补齐，避免预算耗尽时形成任务风暴。"""
+        try:
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+            if not self.running:
+                self.gap_recover_inflight.discard(symbol)
+                return
+            await self._recover_symbol_gap(symbol, from_id, to_id)
+        except asyncio.CancelledError:
+            self.gap_recover_inflight.discard(symbol)
+        except Exception as e:
+            logger.warning(
+                f"Failed to continue gap recover for {symbol} "
+                f"(fromId={from_id}, toId={to_id}): {e}"
+            )
+            self.gap_recover_inflight.discard(symbol)
+
+    async def _recover_symbol_gap(self, symbol: str, from_id: int, to_id: int):
+        """针对单symbol检测到的aggTrade ID缺口做受控补缺。"""
+        recovered = 0
+        rescheduled = False
+        remaining_from: Optional[int] = None
+        retry_delay_seconds = 0.0
+        try:
+            if time.time() < self.recover_suspended_until:
+                return
+            async with self._recover_lock:
+                # 全局预算按分钟重置，避免高并发symbol同时补缺触发请求洪峰
+                now_ts = time.time()
+                elapsed = now_ts - self._gap_recover_budget_window_start
+                if elapsed >= 60:
+                    self._gap_recover_budget_window_start = now_ts
+                    self._gap_recover_budget_remaining = self.gap_recover_global_budget_per_minute
+                    elapsed = 0.0
+                if self._gap_recover_budget_remaining <= 0:
+                    # 预算耗尽时保留未完成区间，等待下一分钟窗口继续补缺，避免“半截恢复后永远丢失”
+                    remaining_from = from_id
+                    retry_delay_seconds = max(1.0, 60.0 - elapsed + 0.2)
+                else:
+                    headers = {"User-Agent": "data-collector-gap-recover/1.0"}
+                    async with aiohttp.ClientSession(headers=headers) as session:
+                        next_id = from_id
+                        while (
+                            next_id <= to_id
+                            and recovered < self.gap_recover_max_trades
+                            and self._gap_recover_budget_remaining > 0
+                        ):
+                            params = {
+                                "symbol": symbol,
+                                "fromId": next_id,
+                                "limit": self.gap_recover_page_limit,
+                            }
+                            try:
+                                rows = await safe_http_request(
+                                    session,
+                                    "GET",
+                                    f"{self.api_base}/fapi/v1/aggTrades",
+                                    params=params,
+                                    max_retries=0,
+                                    timeout=10.0,
+                                    return_json=True,
+                                    use_rate_limit=True,
+                                )
+                            except Exception:
+                                self.recover_suspended_until = time.time() + 600
+                                break
+                            if not rows:
+                                break
+                            reached_to_id = False
+                            processed_full_page = True
+                            for r in rows:
+                                try:
+                                    agg_id = int(r.get("a"))
+                                except Exception:
+                                    continue
+                                if agg_id < from_id:
+                                    continue
+                                if agg_id > to_id:
+                                    next_id = to_id + 1
+                                    reached_to_id = True
+                                    break
+                                await self._process_trade(symbol, r, from_recovery=True)
+                                recovered += 1
+                                self._gap_recover_budget_remaining -= 1
+                                next_id = agg_id + 1
+                                if (
+                                    recovered >= self.gap_recover_max_trades
+                                    or self._gap_recover_budget_remaining <= 0
+                                ):
+                                    # 这里是页内提前中断，next_id 已指向“下一条未处理ID”。
+                                    # 不能在后面覆盖为 rows[-1]+1，否则会跳过当前页剩余未处理ID。
+                                    processed_full_page = False
+                                    break
+                            if reached_to_id:
+                                break
+                            if processed_full_page:
+                                # 当前页被完整处理，next_id 直接推进到本页最后ID之后
+                                if rows:
+                                    try:
+                                        next_id = int(rows[-1].get("a", next_id)) + 1
+                                    except Exception:
+                                        next_id += self.gap_recover_page_limit
+                            if len(rows) < self.gap_recover_page_limit:
+                                break
+
+                        # 若触及单次上限或预算上限且区间尚未覆盖，继续分段补缺
+                        if next_id <= to_id and (
+                            recovered >= self.gap_recover_max_trades
+                            or self._gap_recover_budget_remaining <= 0
+                        ):
+                            remaining_from = next_id
+                            if self._gap_recover_budget_remaining <= 0:
+                                elapsed = time.time() - self._gap_recover_budget_window_start
+                                retry_delay_seconds = max(1.0, 60.0 - elapsed + 0.2)
+                            else:
+                                retry_delay_seconds = max(
+                                    0.2, min(self.gap_recover_cooldown_seconds, 5.0)
+                                )
+
+            if recovered > 0:
+                logger.info(
+                    f"Recovered {recovered} gap aggTrades for {symbol} "
+                    f"(fromId={from_id}, toId={to_id})"
+                )
+            if remaining_from is not None and self.running:
+                rescheduled = True
+                asyncio.create_task(
+                    self._schedule_gap_recover_continuation(
+                        symbol, remaining_from, to_id, retry_delay_seconds
+                    )
+                )
+        finally:
+            if not rescheduled:
+                self.gap_recover_inflight.discard(symbol)
     
     async def _process_message(self, msg: dict):
         """处理WebSocket消息"""
@@ -214,15 +461,23 @@ class TradeCollector:
         
         while self.running:
             try:
+                ping_jitter = random.uniform(
+                    -self.ping_interval_jitter_seconds, self.ping_interval_jitter_seconds
+                )
+                effective_ping_interval = max(5.0, float(self.ping_interval) + ping_jitter)
+                effective_ping_timeout = max(
+                    float(self.ping_timeout), effective_ping_interval + 5.0
+                )
                 logger.info(
                     f"Connecting to WebSocket batch {batch_index + 1} "
-                    f"({len(symbols_batch)} symbols): {ws_url[:100]}..."
+                    f"({len(symbols_batch)} symbols, ping={effective_ping_interval:.1f}/"
+                    f"{effective_ping_timeout:.1f}s): {ws_url[:100]}..."
                 )
                 
                 async with websockets.connect(
                     ws_url,
-                    ping_interval=self.ping_interval,
-                    ping_timeout=self.ping_timeout,
+                    ping_interval=effective_ping_interval,
+                    ping_timeout=effective_ping_timeout,
                     close_timeout=10,
                     open_timeout=self.open_timeout
                 ) as websocket:
@@ -230,30 +485,20 @@ class TradeCollector:
                         f"WebSocket batch {batch_index + 1} connected successfully "
                         f"({len(symbols_batch)} symbols)"
                     )
+                    if self.recover_on_reconnect:
+                        await self._recover_batch_missing_agg_trades(batch_symbols_upper, batch_index)
                     
                     # 连接成功后重置该批次的重连计数
                     batch_reconnect_count = 0
                     
-                    # 使用websockets库的自动ping机制（ping_interval=10秒）
-                    # 不需要手动ping任务，避免冲突
-                    # recv()超时设置为略大于ping_interval，确保能及时收到消息或触发超时
+                    # 使用websockets库的自动ping机制，不对recv做wait_for取消，
+                    # 避免底层传输对象在取消后进入不一致状态（会触发resume_reading错误）
                     while self.running:
                         try:
-                            # 接收消息，超时时间略大于ping_interval
-                            # 这样即使没有消息，也能在ping_interval内触发超时，让自动ping工作
-                            # 超时时间设置为ping_interval的1.5倍，确保有足够时间接收消息
-                            msg_str = await asyncio.wait_for(
-                                websocket.recv(),
-                                timeout=self.ping_interval * 1.5  # 30秒超时，确保在20秒ping间隔内能处理
-                            )
+                            msg_str = await websocket.recv()
                             
                             msg = json.loads(msg_str)
                             await self._process_message(msg)
-                            
-                        except asyncio.TimeoutError:
-                            # 超时是正常的，websockets库的自动ping会保持连接
-                            # 继续接收消息
-                            continue
                                 
                         except ConnectionClosed as e:
                             log_network_error(
@@ -318,6 +563,7 @@ class TradeCollector:
                     await asyncio.sleep(total_delay)
                 else:
                     break
+
             except (ConnectionTimeoutError, asyncio.TimeoutError) as e:
                 if self.running:
                     batch_reconnect_count += 1
@@ -416,7 +662,7 @@ class TradeCollector:
             task = asyncio.create_task(self._websocket_handler_single(batch, i))
             self.ws_connections.append(task)
             # 稍微错开连接时间，避免同时连接
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(max(0.1, self.batch_connect_stagger_seconds))
         
         # 等待所有连接任务完成
         # 使用 return_exceptions=True 确保即使某个任务失败，也不会导致整个方法退出
@@ -438,6 +684,110 @@ class TradeCollector:
             logger.error(f"Error in WebSocket connections: {e}", exc_info=True)
         finally:
             self.websocket = None
+
+    async def _recover_batch_missing_agg_trades(self, symbols_upper: List[str], batch_index: int):
+        """重连后按fromId补齐断线期间丢失的aggTrades（修聚合链路根因）。"""
+        if time.time() < self.recover_suspended_until:
+            return
+        if not symbols_upper:
+            return
+        now_ts = time.time()
+        active_symbols = []
+        for symbol in symbols_upper:
+            last_msg_time = float(self.stats["last_message_time"].get(symbol, 0.0) or 0.0)
+            if now_ts - last_msg_time <= self.recover_active_window_seconds:
+                active_symbols.append(symbol)
+        if not active_symbols:
+            return
+        active_symbols.sort(
+            key=lambda s: float(self.stats["last_message_time"].get(s, 0.0) or 0.0),
+            reverse=True,
+        )
+        recover_symbols = active_symbols[: self.recover_max_symbols_per_reconnect]
+
+        headers = {"User-Agent": "data-collector-recover/1.0"}
+        async with self._recover_lock:
+            now_ts = time.time()
+            if now_ts - self._recover_requests_window_start >= 60:
+                self._recover_requests_window_start = now_ts
+                self._recover_requests_remaining = self.recover_max_requests_per_minute
+            if self._recover_requests_remaining <= 0:
+                return
+            async with aiohttp.ClientSession(headers=headers) as session:
+                recovered_total = 0
+                for symbol in recover_symbols:
+                    last_id = self.last_agg_trade_id.get(symbol)
+                    if last_id is None:
+                        continue
+
+                    from_id = last_id + 1
+                    pages = 0
+                    while pages < self.recover_max_pages:
+                        if recovered_total >= self.recover_max_trades_per_reconnect:
+                            break
+                        if self._recover_requests_remaining <= 0:
+                            break
+                        params = {
+                            "symbol": symbol,
+                            "fromId": from_id,
+                            "limit": self.recover_page_limit,
+                        }
+                        try:
+                            rows = await safe_http_request(
+                                session,
+                                "GET",
+                                f"{self.api_base}/fapi/v1/aggTrades",
+                                params=params,
+                                max_retries=0,
+                                timeout=10.0,
+                                return_json=True,
+                                use_rate_limit=True,
+                            )
+                            self._recover_requests_remaining -= 1
+                        except Exception:
+                            # 命中高风险错误时暂停恢复，避免放大请求压力
+                            self.recover_suspended_until = time.time() + 600
+                            break
+
+                        if not rows:
+                            break
+
+                        for r in rows:
+                            await self._process_trade(symbol, r)
+                            try:
+                                from_id = int(r.get("a", from_id)) + 1
+                            except Exception:
+                                pass
+
+                        recovered_total += len(rows)
+                        pages += 1
+                        if len(rows) < self.recover_page_limit:
+                            break
+                    if self.recover_symbol_request_delay_ms > 0:
+                        await asyncio.sleep(self.recover_symbol_request_delay_ms / 1000.0)
+
+                if recovered_total > 0:
+                    logger.info(
+                        f"WebSocket batch {batch_index + 1} recovered {recovered_total} missing aggTrades "
+                        f"after reconnect from {len(recover_symbols)} active symbols"
+                    )
+
+    async def _callback_worker(self, worker_idx: int, queue: asyncio.Queue):
+        """异步回调worker：解耦WebSocket接收与下游处理。"""
+        while self.running or (not queue.empty()):
+            try:
+                symbol, trade_record = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                continue
+
+            try:
+                await self.on_trade_callback(symbol, trade_record)
+            except Exception as e:
+                logger.error(f"Callback worker {worker_idx} failed for {symbol}: {e}", exc_info=True)
+            finally:
+                queue.task_done()
     
     async def update_symbols(self, new_symbols: List[str]):
         """
@@ -501,6 +851,15 @@ class TradeCollector:
         self.running = True
         self.stats['start_time'] = time.time()
         logger.info(f"Starting trade collector for {len(self.symbols)} symbols")
+
+        self.callback_workers = []
+        worker_count = max(1, self.callback_worker_count)
+        self.callback_queues = [
+            asyncio.Queue(maxsize=max(1000, int(self.callback_queue.maxsize / worker_count)))
+            for _ in range(worker_count)
+        ]
+        for i in range(worker_count):
+            self.callback_workers.append(asyncio.create_task(self._callback_worker(i, self.callback_queues[i])))
         
         self.ws_task = asyncio.create_task(self._websocket_handler())
     
@@ -541,6 +900,19 @@ class TradeCollector:
                     await asyncio.wait_for(self.websocket.close(), timeout=5.0)
             except (asyncio.TimeoutError, Exception) as e:
                 logger.warning(f"关闭WebSocket连接时出错: {e}")
+
+        for q in self.callback_queues:
+            try:
+                await asyncio.wait_for(q.join(), timeout=8.0)
+            except Exception:
+                pass
+        for task in self.callback_workers:
+            if not task.done():
+                task.cancel()
+        if self.callback_workers:
+            await asyncio.gather(*self.callback_workers, return_exceptions=True)
+        self.callback_workers = []
+        self.callback_queues = []
         
         # 打印统计信息
         runtime = time.time() - self.stats['start_time']

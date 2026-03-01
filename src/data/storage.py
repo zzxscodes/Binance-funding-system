@@ -93,6 +93,30 @@ class DataStorage:
         symbol_dir.mkdir(parents=True, exist_ok=True)
         return symbol_dir / f"{date_str}.{self.storage_format}"
 
+    def ensure_funding_rate_placeholder(self, symbol: str, date: Optional[datetime] = None):
+        """
+        确保资金费率占位文件存在（空数据也落盘），用于区分“无数据”和“采集流程未执行”。
+        只在文件不存在时创建，避免覆盖已有有效数据。
+        """
+        try:
+            target_date = date or datetime.now(timezone.utc)
+            file_path = self._get_funding_rate_file_path(symbol, target_date)
+            if file_path.exists():
+                return
+
+            empty_df = pl.DataFrame(
+                schema={
+                    "symbol": pl.Utf8,
+                    "fundingTime": pl.Datetime("ns", time_zone="UTC"),
+                    "fundingRate": pl.Float64,
+                    "markPrice": pl.Float64,
+                }
+            )
+            self._save_dataframe_polars(empty_df, file_path)
+            logger.debug(f"Created empty funding-rate placeholder: {file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to create funding-rate placeholder for {symbol}: {e}")
+
     def _get_premium_index_file_path(self, symbol: str, date: datetime) -> Path:
         """
         获取溢价指数K线数据文件路径
@@ -661,14 +685,25 @@ class DataStorage:
                 file_size_mb = file_path.stat().st_size / 1024 / 1024
                 if file_size_mb > 1.0:
                     # 使用lazy API，减少内存占用
-                    df = (
-                        pl.scan_parquet(file_path)
-                        .with_columns([
-                            pl.col("open_time").cast(pl.Datetime("ns", time_zone="UTC")),
-                            pl.col("close_time").cast(pl.Datetime("ns", time_zone="UTC"))
-                        ])
-                        .collect()
-                    )
+                    lazy_df = pl.scan_parquet(file_path)
+                    # 仅在列存在时做时间列转换，避免trade/funding等文件误用kline列导致读取失败
+                    try:
+                        schema = lazy_df.collect_schema()
+                        cast_exprs = []
+                        if "open_time" in schema:
+                            cast_exprs.append(
+                                pl.col("open_time").cast(pl.Datetime("ns", time_zone="UTC"))
+                            )
+                        if "close_time" in schema:
+                            cast_exprs.append(
+                                pl.col("close_time").cast(pl.Datetime("ns", time_zone="UTC"))
+                            )
+                        if cast_exprs:
+                            lazy_df = lazy_df.with_columns(cast_exprs)
+                    except Exception:
+                        # schema读取失败时保持原样加载，避免因为元数据异常导致整文件不可读
+                        pass
+                    df = lazy_df.collect()
                 else:
                     # 小文件直接加载
                     df = pl.read_parquet(file_path)

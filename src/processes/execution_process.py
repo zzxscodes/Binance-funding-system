@@ -161,7 +161,11 @@ class ExecutionProcess:
             self.dry_run = self.dry_run_flag
         
         # 初始化订单管理器
-        self.order_manager = OrderManager(self.binance_client, dry_run=self.dry_run)
+        self.order_manager = OrderManager(
+            self.binance_client,
+            dry_run=self.dry_run,
+            account_id=self.account_id,
+        )
         
         # 初始化目标持仓加载器
         self.position_generator = get_position_generator()

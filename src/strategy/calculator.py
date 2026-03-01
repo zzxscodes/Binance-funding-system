@@ -122,6 +122,18 @@ class AlphaDataView:
         """
         data_api = get_data_api()
         return data_api.get_tran_stats_between(begin_date_time_label, end_date_time_label, mode=mode)
+
+    def get_kline_between(
+        self,
+        begin_date_time_label: str,
+        end_date_time_label: str,
+        mode: str = '5min'
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        统一获取K线数据（bar + tran_stats字段）。
+        """
+        data_api = get_data_api()
+        return data_api.get_kline_between(begin_date_time_label, end_date_time_label, mode=mode)
     
     def get_funding_rate_between(
         self, 
