@@ -20,7 +20,7 @@ network:
 
 data:
   universe_update_time: "23:55"
-  timezone: Asia/Shanghai
+  timezone: UTC
   kline_interval: 5m
   max_history_days: 30
   
@@ -43,16 +43,17 @@ data:
   universe_check_interval: 300  # Universe更新检查间隔（秒，5分钟）
   
   # K线聚合器内存限制
-  kline_aggregator_max_klines: 1  # 每个symbol最多缓存K线数
-  kline_aggregator_max_pending_windows: 1  # 每个symbol最多保留的pending窗口数
-  kline_aggregator_max_trades_per_window: 1  # 每个窗口内最多保留的trades数量
+  kline_aggregator_max_klines: 8  # 每个symbol最多缓存K线数（需覆盖grace窗口，避免晚到成交回补时丢失基线）
+  kline_aggregator_max_pending_windows: 8  # 每个symbol最多保留的pending窗口数（精度优先，配合grace窗口）
+  kline_aggregator_max_trades_per_window: 0  # 每窗口成交上限；0表示不截断（保证聚合口径一致）
+  kline_close_grace_windows: 6  # 延迟关窗窗口数（允许最近6个窗口接收晚到成交）
   
   # DataStorage缓存配置
   storage_schema_cache_max_size: 1  # Schema缓存最大数量
   
   # Trades缓冲区配置（极端优化）
-  trades_buffer_max_size: 1  # 每个symbol最多缓存条数
-  trades_buffer_total_max_size: 1  # 所有symbol的总缓冲区大小限制
+  trades_buffer_max_size: 200  # 每个symbol缓存上限（降低I/O频率，避免逐笔写盘）
+  trades_buffer_total_max_size: 80000  # 全局缓存上限（超过阈值会触发主动刷盘）
   
   # 内存清理配置（极端优化：更频繁的清理以确保整套系统内存占用在目标范围内）
   memory_cleanup_interval: 60  # 定期内存清理间隔（秒，1分钟，极端优化：更频繁的清理以控制内存峰值）
@@ -60,8 +61,10 @@ data:
   memory_force_rebuild_interval: 60  # kline全量重建周期（cleanup轮次）。<=0禁用周期重建，仅高增长触发
   
   # 资金费率采集配置
-  funding_rate_collect_interval: 28800  # 8小时（资金费率每8小时更新一次）
+  funding_rate_collect_interval: 300  # 5分钟轮询一次（交易所可能非固定时点更新）
   funding_rate_collect_days: 30  # 采集最近N天的历史数据
+  funding_rate_collect_overlap_minutes: 60  # 定时增量拉取时的重叠窗口，防漏数
+  funding_rate_periodic_lookback_minutes: 480  # 无历史状态时的回看窗口（分钟）
   
   # 溢价指数K线采集配置
   premium_index_collect_interval: 300  # 5分钟
@@ -75,6 +78,37 @@ data:
   data_complete_retry_attempts: 3  # data_complete重试次数
   data_complete_retry_delays: [0.05, 0.2, 0.5]  # data_complete重试延迟（秒）
   incomplete_symbols_log_interval: 5.0  # 不完整symbol日志记录间隔（秒）
+
+  # 官方K线对齐（默认关闭；优先修复聚合链路本身）
+  kline_reconcile_enabled: false
+  kline_reconcile_workers: 4
+  kline_reconcile_queue_maxsize: 20000
+  kline_reconcile_timeout_seconds: 10.0
+  # trades缓冲压力检查节流（秒），避免高频全量排序导致吞吐下降
+  trades_buffer_pressure_check_interval: 1.0
+  # 采集器并发与分流配置（提升高并发场景下稳定性）
+  collector_callback_workers: 24
+  collector_max_symbols_per_connection: 35
+  collector_ping_interval_seconds: 20
+  collector_ping_timeout_seconds: 35
+  collector_open_timeout_seconds: 30
+  collector_ping_interval_jitter_seconds: 2.5
+  collector_batch_connect_stagger_seconds: 0.6
+  collector_recover_on_reconnect: false
+  collector_recover_max_pages: 1
+  collector_recover_page_limit: 200
+  collector_recover_max_trades_per_reconnect: 400
+  collector_recover_max_requests_per_minute: 20
+  collector_recover_active_window_seconds: 90
+  collector_recover_max_symbols_per_reconnect: 8
+  collector_recover_symbol_request_delay_ms: 120
+  # 实时检测aggTrade ID缺口并受控补缺（精度优先，仍走全局限流）
+  collector_gap_recover_enabled: true
+  collector_gap_recover_max_trades: 3000
+  collector_gap_recover_page_limit: 1000
+  collector_gap_recover_cooldown_seconds: 15.0
+  collector_gap_recover_global_budget_per_minute: 15000
+  collector_recent_agg_id_cache_size: 500
   
   # Tran_stats阈值配置（人民币）
   tran_stats_tier1_threshold_rmb: 40000  # 第一档阈值（人民币）
@@ -117,6 +151,13 @@ strategy:
     #   - "完整模块路径" (如 "src.strategy.calculators.researcher1_factor1")
     enabled:
     #  - "mean_buy_dolvol4_over_dolvol_rank"
+    # calculator权重（未配置时默认1.0）
+    # 写法示例：
+    # weights:
+    #   mean_buy_dolvol4_over_dolvol_rank: 0.03
+    #   some_other_calculator: 0.12
+    # 计算时会先按各calculator权重加权求和，再做统一归一化
+    weights: {}
   
   # 回测系统配置
   backtest:
@@ -182,7 +223,16 @@ execution:
   contract_settings:
     margin_type: CROSSED      # 保证金模式: CROSSED (全仓) 或 ISOLATED (逐仓)
     position_mode: one_way    # 持仓模式: one_way (单向持仓) 或 dual_side (双向持仓)
+    allow_single_order_reverse: true  # 单向持仓下允许一笔订单直接翻仓
     leverage: 20              # 杠杆倍数: 1-125
+  # 账户级杠杆（可选）
+  # 写法示例：
+  # account_leverage:
+  #   account1: 1.0
+  #   account2: 2.0
+  # 仓位换算使用公式：qty = M * account_leverage * alpha / price
+  # 其中 M = 账户总资产(totalWalletBalance)，不是availableBalance
+  account_leverage: {}
   
   # 订单执行配置
   order:
@@ -314,8 +364,8 @@ execution:
       - account_id: account1
         # 优先级：环境变量 {ACCOUNT_ID}_API_KEY/SECRET > 配置文件
         # 环境变量示例：ACCOUNT1_API_KEY, ACCOUNT1_API_SECRET
-        api_key: your_account1_api_key_here
-        api_secret: your_account1_api_secret_here
+        api_key: pE8xqJ6UDr2BiIXwH4QMwHyCZxS8jdM4MWVyMf9oDEkrK2z1PJ0axsotUMf1Ri7A
+        api_secret: IJAS4zzmNpxmFky8R8oZQX08OsaoEz0wkTWu8w2quuFvrBb8s4zWerkVeCnBV6o1
       # 以下账户配置不完整，不会被启动。如需启用，请取消注释并填写API密钥
       # - account_id: account2
       #   api_key: your_account2_api_key_here

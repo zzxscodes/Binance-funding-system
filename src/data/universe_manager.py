@@ -6,6 +6,7 @@ import os
 import csv
 import asyncio
 import aiohttp
+import pytz
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Set, Optional
@@ -13,7 +14,7 @@ import time
 
 from ..common.config import config
 from ..common.logger import get_logger
-from ..common.utils import beijing_now, beijing_to_utc, parse_time_str, format_symbol
+from ..common.utils import parse_time_str, format_symbol
 from ..common.network_utils import safe_http_request, log_network_error
 
 logger = get_logger('universe_manager')
@@ -25,11 +26,16 @@ class UniverseManager:
     def __init__(self):
         # 根据 execution.mode 自动选择正确的地址（数据层支持testnet回退到live）
         self.api_base = config.get_binance_api_base_for_data_layer()
+        self.update_timezone = config.get('data.timezone', 'UTC')
+        self._update_tz = pytz.timezone(self.update_timezone)
         self.universe_dir = Path(config.get('data.universe_directory', 'data/universe'))
         self.universe_dir.mkdir(parents=True, exist_ok=True)
         self.current_universe: Set[str] = set()
         self.running = False
         self.update_task: Optional[asyncio.Task] = None
+
+    def _now_update_tz(self) -> datetime:
+        return datetime.now(self._update_tz)
     
     def _get_universe_file_path(self, date: datetime, version: str = 'v1') -> Path:
         """
@@ -40,10 +46,10 @@ class UniverseManager:
             date: 日期
             version: 版本号，如 'v1', 'v2' 等
         """
-        # 如果是晚上23:55之后获取，文件应该是第二天的
-        beijing_time = beijing_now()
-        if beijing_time.hour >= 23:
-            date = beijing_time + timedelta(days=1)
+        # 如果在配置时区的23点后获取，文件按“下一交易日”归档
+        now_local = self._now_update_tz()
+        if now_local.hour >= 23:
+            date = now_local + timedelta(days=1)
         
         date_str = date.strftime('%Y-%m-%d')
         date_dir = self.universe_dir / date_str / version
@@ -214,7 +220,7 @@ class UniverseManager:
         try:
             logger.info(f"Starting universe update (version: {version})...")
             symbols_info = await self.fetch_universe_from_binance()
-            file_path = self._get_universe_file_path(beijing_now(), version)
+            file_path = self._get_universe_file_path(self._now_update_tz(), version)
             self.save_universe(symbols_info, file_path)
             logger.info(f"Universe update completed successfully (version: {version})")
             return list(self.current_universe)
@@ -228,16 +234,19 @@ class UniverseManager:
         
         while self.running:
             try:
-                now_beijing = beijing_now()
-                next_update = parse_time_str(update_time_str, 'Asia/Shanghai')
+                now_local = self._now_update_tz()
+                next_update = parse_time_str(update_time_str, self.update_timezone)
                 
                 # 如果今天的时间已过，计算下次更新时间
-                if next_update <= now_beijing:
+                if next_update <= now_local:
                     next_update = next_update + timedelta(days=1)
                 
                 # 等待到更新时间
-                wait_seconds = (next_update - now_beijing).total_seconds()
-                logger.info(f"Next universe update scheduled at {next_update} (in {wait_seconds/3600:.2f} hours)")
+                wait_seconds = (next_update - now_local).total_seconds()
+                logger.info(
+                    f"Next universe update scheduled at {next_update} "
+                    f"(timezone={self.update_timezone}, in {wait_seconds/3600:.2f} hours)"
+                )
                 
                 # 等待
                 await asyncio.sleep(min(wait_seconds, 86400))  # 最多等待24小时

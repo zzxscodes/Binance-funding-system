@@ -44,8 +44,11 @@ class KlineAggregator:
         self.pending_trades: Dict[str, Dict[int, List[Dict]]] = defaultdict(
             lambda: defaultdict(list)
         )
+        self.latest_seen_window_start: Dict[str, int] = {}
         # 批量处理阈值：当列表达到此大小时，转换为DataFrame
         self._pending_trades_batch_size = 100
+        # 延迟关窗：允许最近N个窗口继续接收晚到成交，减少因网络抖动导致的漏算
+        self.close_grace_windows = int(config.get("data.kline_close_grace_windows", 3))
 
         # 每个交易对的最新K线数据
         # 格式: {symbol: pl.DataFrame}
@@ -71,6 +74,7 @@ class KlineAggregator:
             "trades_processed": defaultdict(int),
             "klines_generated": defaultdict(int),
             "last_kline_time": defaultdict(Optional[datetime]),
+            "invalid_trades": 0,
         }
         
         # 统计信息清理：定期清理不再活跃的symbol的统计信息
@@ -79,6 +83,14 @@ class KlineAggregator:
         self._last_stats_cleanup_time = time.time()
 
         self.running = False
+        self._pending_trade_columns = [
+            "price",
+            "qty",
+            "quote_qty",
+            "ts_ms",
+            "is_buyer_maker",
+            "trade_count",
+        ]
 
     def _get_window_start(self, timestamp_ms: int) -> int:
         """
@@ -134,12 +146,41 @@ class KlineAggregator:
             if quote_qty <= 0:
                 quote_qty = price * qty
 
+        last_trade_id_raw = (
+            trade.get("lastTradeId")
+            if trade.get("lastTradeId") is not None
+            else trade.get("l")
+        )
+        first_trade_id_raw = (
+            trade.get("firstTradeId")
+            if trade.get("firstTradeId") is not None
+            else trade.get("f")
+        )
+        try:
+            last_trade_id = (
+                int(last_trade_id_raw) if last_trade_id_raw is not None else None
+            )
+        except Exception:
+            last_trade_id = None
+        try:
+            first_trade_id = (
+                int(first_trade_id_raw) if first_trade_id_raw is not None else None
+            )
+        except Exception:
+            first_trade_id = None
+        if first_trade_id is not None and last_trade_id is not None:
+            underlying_trade_count = max(1, last_trade_id - first_trade_id + 1)
+        else:
+            underlying_trade_count = 1
+
         normalized = {
             "price": price,
             "qty": qty,
             "quoteQty": float(quote_qty),
             "ts_ms": ts_ms,
             "isBuyerMaker": bool(trade.get("isBuyerMaker", False)),
+            # aggTrade可用 [f, l] 还原底层真实成交笔数；无该字段时按1计
+            "underlyingTradeCount": underlying_trade_count,
         }
         return normalized
 
@@ -150,7 +191,7 @@ class KlineAggregator:
         # 检查窗口内trades数量，防止单个窗口内trades无限增长
         # 极端优化：强制限制，确保不超过配置值
         window_trades = self.pending_trades[symbol][window_start_ms]
-        if len(window_trades) >= self.max_trades_per_window:
+        if self.max_trades_per_window > 0 and len(window_trades) >= self.max_trades_per_window:
             # 如果达到限制，只保留最新的trades（FIFO策略）
             # 移除最旧的，保留最新的(max-1)条
             target_size = self.max_trades_per_window - 1
@@ -164,13 +205,15 @@ class KlineAggregator:
                 )
         
         # 添加到列表（比频繁concat DataFrame快得多）
-        trade_record = {
-            "price": normalized_trade["price"],
-            "qty": normalized_trade["qty"],
-            "quote_qty": normalized_trade["quoteQty"],
-            "ts_ms": normalized_trade["ts_ms"],
-            "is_buyer_maker": normalized_trade["isBuyerMaker"],
-        }
+        # 使用元组而非dict保存逐笔，显著降低大规模pending窗口的Python对象开销
+        trade_record = (
+            normalized_trade["price"],
+            normalized_trade["qty"],
+            normalized_trade["quoteQty"],
+            normalized_trade["ts_ms"],
+            normalized_trade["isBuyerMaker"],
+            int(normalized_trade.get("underlyingTradeCount", 1)),
+        )
         self.pending_trades[symbol][window_start_ms].append(trade_record)
 
     async def add_trade(self, symbol: str, trade: Dict):
@@ -192,22 +235,32 @@ class KlineAggregator:
 
             # 计算窗口起始时间
             window_start_ms = self._get_window_start(ts_ms)
+            prev_seen = self.latest_seen_window_start.get(symbol, window_start_ms)
+            if window_start_ms > prev_seen:
+                self.latest_seen_window_start[symbol] = window_start_ms
+                current_window_start_ms = window_start_ms
+            else:
+                current_window_start_ms = prev_seen
+            if symbol not in self.latest_seen_window_start:
+                self.latest_seen_window_start[symbol] = window_start_ms
+
+            close_before_ms = current_window_start_ms - (self.close_grace_windows * self.interval_seconds * 1000)
+            if window_start_ms < close_before_ms:
+                # 超过grace窗口的极晚成交直接丢弃，避免用零散迟到数据反复覆盖旧窗口
+                self.stats["invalid_trades"] += 1
+                return
 
             # 将交易添加到对应窗口（使用Polars DataFrame）
             self._add_trade_to_pending(symbol, normalized_trade, window_start_ms)
             self.stats["trades_processed"][symbol] += 1
 
-            # 检查是否需要关闭旧的K线窗口并生成新K线
-            # 如果当前窗口已关闭（时间已过下一个窗口），则聚合旧窗口
-            current_window_start_ms = self._get_window_start(
-                int(datetime.now(timezone.utc).timestamp() * 1000)
-            )
-
+            # 检查是否需要关闭旧窗口：
+            # 使用“当前成交自身时间戳”推进窗口，避免因处理延迟导致同一窗口被反复部分聚合
             # 找出所有已关闭的窗口（窗口起始时间 < 当前窗口）
             windows_to_close = [
                 window_start
                 for window_start in self.pending_trades[symbol].keys()
-                if window_start < current_window_start_ms
+                if window_start < close_before_ms
             ]
 
             # 聚合已关闭的窗口（批量处理，减少开销）
@@ -217,11 +270,13 @@ class KlineAggregator:
             # 检查pending_trades窗口数，如果超过限制则清理最旧的窗口
             # 极端优化：强制限制，确保不超过配置值
             pending_windows_count = len(self.pending_trades[symbol])
-            if pending_windows_count > self.max_pending_windows_per_symbol:
-                # 按窗口时间排序，删除最旧的
-                sorted_windows = sorted(self.pending_trades[symbol].keys())
-                # 强制清理到配置限制（保留最新的N个窗口）
-                to_remove = pending_windows_count - self.max_pending_windows_per_symbol
+            keep_windows = max(self.max_pending_windows_per_symbol, self.close_grace_windows + 2)
+            if pending_windows_count > keep_windows:
+                # 仅清理已经超过grace边界的旧窗口，避免提前关窗损伤精度
+                sorted_windows = sorted(
+                    w for w in self.pending_trades[symbol].keys() if w < close_before_ms
+                )
+                to_remove = min(len(sorted_windows), pending_windows_count - keep_windows)
                 removed_count = 0
                 for window_start in sorted_windows[:to_remove]:
                     if window_start not in self.pending_trades[symbol]:
@@ -248,7 +303,7 @@ class KlineAggregator:
                 if removed_count > 0:
                     logger.debug(
                         f"{symbol}: cleaned up {removed_count} pending windows "
-                        f"(kept {self.max_pending_windows_per_symbol} latest, "
+                        f"(kept {keep_windows} latest, "
                         f"was {pending_windows_count})"
                     )
                 
@@ -265,6 +320,7 @@ class KlineAggregator:
         symbol: str,
         window_start_ms: int,
         trades_override: Optional[List[Dict]] = None,
+        preserve_pending: bool = False,
     ):
         """
         聚合指定窗口的所有交易，生成K线（使用Polars向量化操作）
@@ -275,42 +331,43 @@ class KlineAggregator:
             trades_override: 可选，直接使用传入的成交列表进行聚合（用于离线校验）
         """
         try:
-            # 从pending列表获取trades（现在是List[Dict]）
-            # 修复内存泄漏：确保窗口被完全移除
-            if window_start_ms in self.pending_trades.get(symbol, {}):
-                trades_list = self.pending_trades[symbol].pop(window_start_ms, [])
-                # 修复内存泄漏：如果symbol的pending_trades变为空字典，删除整个条目
-                if symbol in self.pending_trades and not self.pending_trades[symbol]:
-                    del self.pending_trades[symbol]
+            if trades_override is None:
+                # 从pending列表获取trades（现在是List[Dict]）
+                # 修复内存泄漏：确保窗口被完全移除
+                if window_start_ms in self.pending_trades.get(symbol, {}):
+                    trades_list = self.pending_trades[symbol].pop(window_start_ms, [])
+                    # 修复内存泄漏：如果symbol的pending_trades变为空字典，删除整个条目
+                    if symbol in self.pending_trades and not self.pending_trades[symbol]:
+                        del self.pending_trades[symbol]
+                else:
+                    trades_list = []
             else:
-                trades_list = []
-
-            if trades_override is not None:
                 # 覆盖使用外部提供的成交
                 trades_list = trades_override
-                # 移除可能残留的pending，并清理
-                if symbol in self.pending_trades:
-                    if window_start_ms in self.pending_trades[symbol]:
-                        old_trades = self.pending_trades[symbol].pop(window_start_ms, None)
-                        if old_trades:
-                            old_trades.clear()
-                            del old_trades
+                if not preserve_pending:
+                    # 移除可能残留的pending，并清理
+                    if symbol in self.pending_trades:
+                        if window_start_ms in self.pending_trades[symbol]:
+                            old_trades = self.pending_trades[symbol].pop(window_start_ms, None)
+                            if old_trades:
+                                old_trades.clear()
+                                del old_trades
 
             # 检查是否有交易
             has_trades = len(trades_list) > 0
 
             # 批量转换为Polars DataFrame（比频繁concat快）
-            # 优化：如果trades_list太大，只使用最新的部分（防止内存爆炸）
+            # 注意：聚合阶段不能再做截断，否则会引入口径误差
             if has_trades:
-                max_trades_for_aggregation = self.max_trades_per_window
-                if len(trades_list) > max_trades_for_aggregation:
-                    # 只使用最新的trades（保留最新的数据）
-                    trades_list = trades_list[-max_trades_for_aggregation:]
-                    logger.warning(
-                        f"{symbol} window {window_start_ms} has {len(trades_list)} trades, "
-                        f"using latest {max_trades_for_aggregation} for aggregation"
+                first_row = trades_list[0]
+                if isinstance(first_row, dict):
+                    trades_df = pl.DataFrame(trades_list)
+                else:
+                    trades_df = pl.DataFrame(
+                        trades_list,
+                        schema=self._pending_trade_columns,
+                        orient="row",
                     )
-                trades_df = pl.DataFrame(trades_list)
             else:
                 trades_df = pl.DataFrame()
 
@@ -327,7 +384,7 @@ class KlineAggregator:
                         pl.last("price").alias("close"),
                         pl.sum("qty").alias("volume"),
                         pl.sum("quote_qty").alias("quote_volume"),
-                        pl.len().alias("trade_count"),
+                        pl.sum("trade_count").alias("trade_count"),
                         # 买卖方向统计（向量化）
                         pl.when(pl.col("is_buyer_maker") == False)
                         .then(pl.col("qty"))
@@ -350,12 +407,12 @@ class KlineAggregator:
                         .sum()
                         .alias("sell_dolvol"),
                         pl.when(pl.col("is_buyer_maker") == False)
-                        .then(1)
+                        .then(pl.col("trade_count"))
                         .otherwise(0)
                         .sum()
                         .alias("buy_trade_count"),
                         pl.when(pl.col("is_buyer_maker") == True)
-                        .then(1)
+                        .then(pl.col("trade_count"))
                         .otherwise(0)
                         .sum()
                         .alias("sell_trade_count"),
@@ -469,7 +526,7 @@ class KlineAggregator:
                     if not buy_tier1.is_empty()
                     else 0.0
                 )
-                buy_trade_count1 = len(buy_tier1)
+                buy_trade_count1 = int(buy_tier1["trade_count"].sum()) if not buy_tier1.is_empty() else 0
                 buy_volume2 = (
                     float(buy_tier2["qty"].sum()) if not buy_tier2.is_empty() else 0.0
                 )
@@ -478,7 +535,7 @@ class KlineAggregator:
                     if not buy_tier2.is_empty()
                     else 0.0
                 )
-                buy_trade_count2 = len(buy_tier2)
+                buy_trade_count2 = int(buy_tier2["trade_count"].sum()) if not buy_tier2.is_empty() else 0
                 buy_volume3 = (
                     float(buy_tier3["qty"].sum()) if not buy_tier3.is_empty() else 0.0
                 )
@@ -487,7 +544,7 @@ class KlineAggregator:
                     if not buy_tier3.is_empty()
                     else 0.0
                 )
-                buy_trade_count3 = len(buy_tier3)
+                buy_trade_count3 = int(buy_tier3["trade_count"].sum()) if not buy_tier3.is_empty() else 0
                 buy_volume4 = (
                     float(buy_tier4["qty"].sum()) if not buy_tier4.is_empty() else 0.0
                 )
@@ -496,7 +553,7 @@ class KlineAggregator:
                     if not buy_tier4.is_empty()
                     else 0.0
                 )
-                buy_trade_count4 = len(buy_tier4)
+                buy_trade_count4 = int(buy_tier4["trade_count"].sum()) if not buy_tier4.is_empty() else 0
 
                 sell_volume1 = (
                     float(sell_tier1["qty"].sum()) if not sell_tier1.is_empty() else 0.0
@@ -506,7 +563,7 @@ class KlineAggregator:
                     if not sell_tier1.is_empty()
                     else 0.0
                 )
-                sell_trade_count1 = len(sell_tier1)
+                sell_trade_count1 = int(sell_tier1["trade_count"].sum()) if not sell_tier1.is_empty() else 0
                 sell_volume2 = (
                     float(sell_tier2["qty"].sum()) if not sell_tier2.is_empty() else 0.0
                 )
@@ -515,7 +572,7 @@ class KlineAggregator:
                     if not sell_tier2.is_empty()
                     else 0.0
                 )
-                sell_trade_count2 = len(sell_tier2)
+                sell_trade_count2 = int(sell_tier2["trade_count"].sum()) if not sell_tier2.is_empty() else 0
                 sell_volume3 = (
                     float(sell_tier3["qty"].sum()) if not sell_tier3.is_empty() else 0.0
                 )
@@ -524,7 +581,7 @@ class KlineAggregator:
                     if not sell_tier3.is_empty()
                     else 0.0
                 )
-                sell_trade_count3 = len(sell_tier3)
+                sell_trade_count3 = int(sell_tier3["trade_count"].sum()) if not sell_tier3.is_empty() else 0
                 sell_volume4 = (
                     float(sell_tier4["qty"].sum()) if not sell_tier4.is_empty() else 0.0
                 )
@@ -533,7 +590,7 @@ class KlineAggregator:
                     if not sell_tier4.is_empty()
                     else 0.0
                 )
-                sell_trade_count4 = len(sell_tier4)
+                sell_trade_count4 = int(sell_tier4["trade_count"].sum()) if not sell_tier4.is_empty() else 0
             else:
                 # 无成交时，所有分档统计都为0
                 buy_volume1 = buy_volume2 = buy_volume3 = buy_volume4 = 0.0
@@ -575,92 +632,81 @@ class KlineAggregator:
             # span_status: 如果有交易则为空字符串，无交易则为"NoTrade"
             span_status = "" if trade_count > 0 else "NoTrade"
 
-            # 根据图片要求，字段类型和命名需要调整：
-            # - low应该是int类型（但实际存储为float，转换为int）
-            # - dolvol应该是int类型（但实际存储为float，转换为int）
-            # - 所有价格和数量字段应该是varchar类型（字符串格式）
-            # - tradecount字段名需要添加（当前只有buytradecount和selltradecount）
-            
-            # 转换数据类型以匹配要求
-            low_int = int(low_price) if not math.isnan(low_price) else 0
-            dolvol_int = int(quote_volume) if not math.isnan(quote_volume) else 0
-            
-            # 将数值字段转换为字符串（varchar类型）
-            open_str = str(open_price) if not math.isnan(open_price) else "0"
-            high_str = str(high_price) if not math.isnan(high_price) else "0"
-            close_str = str(close_price) if not math.isnan(close_price) else "0"
-            last_str = str(close_price) if not math.isnan(close_price) else "0"
-            vwap_str = str(vwap) if not math.isnan(vwap) else "0"
-            dolvol_str = str(dolvol_int)
-            buydolvol_str = str(buy_dolvol) if not math.isnan(buy_dolvol) else "0"
-            selldolvol_str = str(sell_dolvol) if not math.isnan(sell_dolvol) else "0"
-            volume_str = str(volume) if not math.isnan(volume) else "0"
-            buyvolume_str = str(buy_volume) if not math.isnan(buy_volume) else "0"
-            sellvolume_str = str(sell_volume) if not math.isnan(sell_volume) else "0"
+            # 统一数值类型：价格/成交额/成交量使用float，成交笔数使用int
+            open_f = float(open_price) if not math.isnan(open_price) else 0.0
+            high_f = float(high_price) if not math.isnan(high_price) else 0.0
+            low_f = float(low_price) if not math.isnan(low_price) else 0.0
+            close_f = float(close_price) if not math.isnan(close_price) else 0.0
+            last_f = close_f
+            vwap_f = float(vwap) if not math.isnan(vwap) else float("nan")
+            quote_volume_f = float(quote_volume) if not math.isnan(quote_volume) else 0.0
+            buy_dolvol_f = float(buy_dolvol) if not math.isnan(buy_dolvol) else 0.0
+            sell_dolvol_f = float(sell_dolvol) if not math.isnan(sell_dolvol) else 0.0
+            volume_f = float(volume) if not math.isnan(volume) else 0.0
+            buy_volume_f = float(buy_volume) if not math.isnan(buy_volume) else 0.0
+            sell_volume_f = float(sell_volume) if not math.isnan(sell_volume) else 0.0
 
             kline_data = {
                 # 基础字段（兼容现有代码，保留原始数值类型用于计算）
                 "symbol": symbol,
                 "open_time": window_start_dt,
                 "close_time": window_end_dt,
-                "quote_volume": quote_volume,  # 保留原始float类型用于计算
-                "trade_count": trade_count,
+                "quote_volume": quote_volume_f,
+                "trade_count": int(trade_count),
                 "interval_minutes": self.interval_minutes,
-                # bar表字段（按照图片要求，使用正确的类型）
-                "microsecond_since_trad": window_end_ms,  # bigint: 时间戳，即span_end_datetime的时间戳
+                # bar字段
+                "microsecond_since_trade": window_end_ms,  # bigint: 时间戳，即span_end_datetime的时间戳
                 "span_begin_datetime": window_start_ms,  # bigint: 交易数据开始的时间，分钟必须被5整除，秒
-                "span_end_datetime": window_end_ms,  # bigint: 交易数据结束时间 ✅ 已添加
-                "span_status": span_status,  # varchar(32): NoTrade - 无交易(过滤掉)
-                "last": last_str,  # varchar(32): 最新一笔交易
-                "high": high_str,  # varchar(32): 最高价
-                "low": low_int,  # int: 最低价
-                "open": open_str,  # varchar(32): 第一笔价格
-                "close": close_str,  # varchar(32): 最后一笔价格 ✅ 已添加
-                "vwap": vwap_str,  # varchar(32): dolvol / volume
-                "dolvol": dolvol_int,  # int(32): 成交额
-                "buydolvol": buydolvol_str,  # varchar(32): 主动买成交额
-                "selldolvol": selldolvol_str,  # varchar(32): 主动卖成交额
-                "volume": volume_str,  # varchar(32): 成交量
-                "buyvolume": buyvolume_str,  # varchar(32): 主动买成交量
-                "sellvolume": sellvolume_str,  # varchar(32): 主动卖成交量
-                "tradecount": trade_count,  # 成交笔数（添加此字段）
-                "buytradecount": buy_trade_count,  # 主动买成交笔数
-                "selltradecount": sell_trade_count,  # 主动卖成交笔数
+                "span_end_datetime": window_end_ms,
+                "span_status": span_status,
+                "last": last_f,
+                "high": high_f,
+                "low": low_f,
+                "open": open_f,
+                "close": close_f,
+                "vwap": vwap_f,
+                "dolvol": quote_volume_f,
+                "buydolvol": buy_dolvol_f,
+                "selldolvol": sell_dolvol_f,
+                "volume": volume_f,
+                "buyvolume": buy_volume_f,
+                "sellvolume": sell_volume_f,
+                "tradecount": int(trade_count),
+                "buytradecount": int(buy_trade_count),
+                "selltradecount": int(sell_trade_count),
                 "time_lable": time_lable,  # short: 每天的第几个span
-                # 注意：根据图片要求，bar表字段使用varchar/int类型
-                # 如果需要数值类型进行计算，需要在使用时进行类型转换
-                # tran_stats表字段（总体统计，非分档）- 根据第二张图片要求
-                "buy_volume": buyvolume_str,  # varchar(32): 5分钟数据列表中，所有买方的总成交
-                "buy_dolvol": buydolvol_str,  # varchar(32): 5分钟数据列表中，所有买方的总成交额
-                "buy_trade_count": buy_trade_count,  # int: 5分钟数据列表中，所有买方的记录数
-                "sell_volume": sellvolume_str,  # varchar(32): 5分钟数据列表中，所有卖方的总成交
-                "sell_dolvol": selldolvol_str,  # varchar(32): 5分钟数据列表中，所有卖方的总成交额
-                "sell_trade_count": sell_trade_count,  # int(32): 5分钟数据列表中，所有卖方的记录数
-                # tran_stats表字段（按金额分档统计）- 根据图片要求，这些字段应该是varchar类型
-                "buy_volume1": str(buy_volume1) if not math.isnan(buy_volume1) else "0",
-                "buy_volume2": str(buy_volume2) if not math.isnan(buy_volume2) else "0",
-                "buy_volume3": str(buy_volume3) if not math.isnan(buy_volume3) else "0",
-                "buy_volume4": str(buy_volume4) if not math.isnan(buy_volume4) else "0",
-                "buy_dolvol1": str(buy_dolvol1) if not math.isnan(buy_dolvol1) else "0",
-                "buy_dolvol2": str(buy_dolvol2) if not math.isnan(buy_dolvol2) else "0",
-                "buy_dolvol3": str(buy_dolvol3) if not math.isnan(buy_dolvol3) else "0",
-                "buy_dolvol4": str(buy_dolvol4) if not math.isnan(buy_dolvol4) else "0",
-                "buy_trade_count1": buy_trade_count1,  # int类型
-                "buy_trade_count2": buy_trade_count2,  # int类型
-                "buy_trade_count3": buy_trade_count3,  # int类型
-                "buy_trade_count4": buy_trade_count4,  # int类型
-                "sell_volume1": str(sell_volume1) if not math.isnan(sell_volume1) else "0",
-                "sell_volume2": str(sell_volume2) if not math.isnan(sell_volume2) else "0",
-                "sell_volume3": str(sell_volume3) if not math.isnan(sell_volume3) else "0",
-                "sell_volume4": str(sell_volume4) if not math.isnan(sell_volume4) else "0",
-                "sell_dolvol1": str(sell_dolvol1) if not math.isnan(sell_dolvol1) else "0",
-                "sell_dolvol2": str(sell_dolvol2) if not math.isnan(sell_dolvol2) else "0",
-                "sell_dolvol3": str(sell_dolvol3) if not math.isnan(sell_dolvol3) else "0",
-                "sell_dolvol4": str(sell_dolvol4) if not math.isnan(sell_dolvol4) else "0",
-                "sell_trade_count1": sell_trade_count1,  # int类型
-                "sell_trade_count2": sell_trade_count2,  # int类型
-                "sell_trade_count3": sell_trade_count3,  # int类型
-                "sell_trade_count4": sell_trade_count4,  # int类型
+                # tran_stats字段（总体统计）
+                "buy_volume": buy_volume_f,
+                "buy_dolvol": buy_dolvol_f,
+                "buy_trade_count": int(buy_trade_count),
+                "sell_volume": sell_volume_f,
+                "sell_dolvol": sell_dolvol_f,
+                "sell_trade_count": int(sell_trade_count),
+                # tran_stats字段（金额分档）
+                "buy_volume1": float(buy_volume1),
+                "buy_volume2": float(buy_volume2),
+                "buy_volume3": float(buy_volume3),
+                "buy_volume4": float(buy_volume4),
+                "buy_dolvol1": float(buy_dolvol1),
+                "buy_dolvol2": float(buy_dolvol2),
+                "buy_dolvol3": float(buy_dolvol3),
+                "buy_dolvol4": float(buy_dolvol4),
+                "buy_trade_count1": int(buy_trade_count1),
+                "buy_trade_count2": int(buy_trade_count2),
+                "buy_trade_count3": int(buy_trade_count3),
+                "buy_trade_count4": int(buy_trade_count4),
+                "sell_volume1": float(sell_volume1),
+                "sell_volume2": float(sell_volume2),
+                "sell_volume3": float(sell_volume3),
+                "sell_volume4": float(sell_volume4),
+                "sell_dolvol1": float(sell_dolvol1),
+                "sell_dolvol2": float(sell_dolvol2),
+                "sell_dolvol3": float(sell_dolvol3),
+                "sell_dolvol4": float(sell_dolvol4),
+                "sell_trade_count1": int(sell_trade_count1),
+                "sell_trade_count2": int(sell_trade_count2),
+                "sell_trade_count3": int(sell_trade_count3),
+                "sell_trade_count4": int(sell_trade_count4),
             }
 
             # 使用Polars DataFrame存储（比pandas快）
@@ -849,7 +895,7 @@ class KlineAggregator:
                     f"{symbol} klines count ({final_len}) is close to limit ({max_klines}), "
                     f"will be trimmed in next cleanup cycle"
                 )
-            
+
             # 强制垃圾回收：在关键路径上触发GC，帮助释放内存
             # 注意：只在数据量大时触发，避免频繁GC影响性能
             if final_len > 100:
@@ -948,6 +994,54 @@ class KlineAggregator:
                 continue
 
             windows_to_close = list(self.pending_trades[sym].keys())
+            for window_start_ms in windows_to_close:
+                await self._aggregate_window(sym, window_start_ms)
+
+    async def flush_pending_snapshot(self, symbol: Optional[str] = None):
+        """
+        按当前pending快照聚合并更新K线，但不移除pending。
+        用于周期性落盘，避免将活跃窗口分段覆盖。
+        """
+        symbols_to_process = [format_symbol(symbol)] if symbol else list(self.pending_trades.keys())
+        for sym in symbols_to_process:
+            if sym not in self.pending_trades:
+                continue
+            windows = self.pending_trades.get(sym, {})
+            if not windows:
+                continue
+            for window_start_ms, window_trades in list(windows.items()):
+                if not window_trades:
+                    continue
+                await self._aggregate_window(
+                    sym,
+                    window_start_ms,
+                    trades_override=list(window_trades),
+                    preserve_pending=True,
+                )
+
+    async def flush_closed_windows(self, now_ms: Optional[int] = None, symbol: Optional[str] = None):
+        """
+        仅聚合已跨过grace边界的窗口，避免对当前活跃窗口做提前聚合。
+
+        Args:
+            now_ms: 当前时间戳（毫秒），默认使用系统当前UTC时间
+            symbol: 如果指定，仅处理该交易对
+        """
+        if now_ms is None:
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        current_window_start_ms = self._get_window_start(now_ms)
+        close_before_ms = current_window_start_ms - (
+            self.close_grace_windows * self.interval_seconds * 1000
+        )
+
+        symbols_to_process = [format_symbol(symbol)] if symbol else list(self.pending_trades.keys())
+        for sym in symbols_to_process:
+            if sym not in self.pending_trades:
+                continue
+            windows_to_close = sorted(
+                ws for ws in list(self.pending_trades[sym].keys()) if ws < close_before_ms
+            )
             for window_start_ms in windows_to_close:
                 await self._aggregate_window(sym, window_start_ms)
 

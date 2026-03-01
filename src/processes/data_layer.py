@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Set, Optional, Dict, List
 from datetime import datetime, timedelta, timezone
 
+import aiohttp
 import pandas as pd
 try:
     import psutil
@@ -20,6 +21,7 @@ except ImportError:
 from ..common.config import config
 from ..common.logger import get_logger
 from ..common.ipc import IPCClient, MessageType
+from ..common.network_utils import safe_http_request
 from ..common.utils import beijing_now
 from ..monitoring.performance import get_performance_monitor
 from ..data.universe_manager import get_universe_manager
@@ -72,6 +74,16 @@ class DataLayerProcess:
         # 用于批量保存trades数据的缓冲区
         # 格式: {symbol: [trade1, trade2, ...]}
         self.trades_buffer: Dict[str, List[dict]] = {}
+        # 官方K线对齐队列：异步回填OHLCV/trade_count，提升与Binance一致性
+        self._kline_reconcile_enabled = bool(config.get('data.kline_reconcile_enabled', True))
+        self._kline_reconcile_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=int(config.get('data.kline_reconcile_queue_maxsize', 20000))
+        )
+        self._kline_reconcile_pending_keys: Set[str] = set()
+        self._kline_reconcile_workers = int(config.get('data.kline_reconcile_workers', 4))
+        self._kline_reconcile_timeout = float(config.get('data.kline_reconcile_timeout_seconds', 10.0))
+        self._kline_reconcile_stats = {"enqueued": 0, "applied": 0, "failed": 0}
+        self._kline_reconcile_api_base = config.get('binance.api_base', 'https://fapi.binance.com')
     
     def _add_task_with_error_handler(self, task: asyncio.Task, task_name: str):
         """添加任务并设置异常处理回调"""
@@ -105,9 +117,14 @@ class DataLayerProcess:
         self.tasks.add(task)
         self.trades_buffer_max_size = config.get('data.trades_buffer_max_size', 1000)  # 每个symbol最多缓存条数
         self.trades_buffer_total_max_size = config.get('data.trades_buffer_total_max_size', 100000)  # 所有symbol的总缓冲区大小限制
+        self._trades_buffer_total_size = 0
+        self._last_trades_buffer_pressure_check = 0.0
+        self._trades_buffer_pressure_check_interval = float(
+            config.get("data.trades_buffer_pressure_check_interval", 1.0)
+        )
         
         # 资金费率采集配置
-        self.funding_rate_collect_interval = config.get('data.funding_rate_collect_interval', 28800)  # 8小时
+        self.funding_rate_collect_interval = config.get('data.funding_rate_collect_interval', 300)  # 5分钟
         self.last_funding_rate_collect_time = 0
         self.funding_rate_collect_days = config.get('data.funding_rate_collect_days', 30)  # 采集最近N天的历史数据
         
@@ -145,71 +162,48 @@ class DataLayerProcess:
             self.trades_buffer[symbol] = []
         
         self.trades_buffer[symbol].append(trade)
-        
-        # 检查总缓冲区大小，防止内存溢出（更激进的清理策略，提前清理）
-        total_buffer_size = sum(len(buf) for buf in self.trades_buffer.values())
+        self._trades_buffer_total_size += 1
         
         # 如果单个symbol的缓冲区达到阈值，立即保存
         if len(self.trades_buffer[symbol]) >= self.trades_buffer_max_size:
             await self._save_trades_batch(symbol)
-        # 如果总缓冲区接近限制（10%），提前清理（更激进的阈值）
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.1):
-            # 保存最大的5个缓冲区，防止接近限制
-            sorted_symbols = sorted(
-                self.trades_buffer.items(),
-                key=lambda x: len(x[1]),
-                reverse=True
-            )
-            for sym, _ in sorted_symbols[:5]:
-                if len(self.trades_buffer[sym]) >= int(self.trades_buffer_max_size * 0.2):
-                    await self._save_trades_batch(sym)
-        # 如果总缓冲区超过限制（20%），强制保存更多
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.2):
-            # 强制保存所有缓冲区中最大的几个symbol
-            logger.warning(f"Trades buffer total size ({total_buffer_size}) exceeds 20% limit, forcing save...")
-            # 按缓冲区大小排序，优先保存最大的
-            sorted_symbols = sorted(
-                self.trades_buffer.items(),
-                key=lambda x: len(x[1]),
-                reverse=True
-            )
-            # 保存前10个最大的缓冲区（更及时清理）
-            for sym, _ in sorted_symbols[:10]:
-                if self.trades_buffer[sym]:
-                    await self._save_trades_batch(sym)
-        # 如果总缓冲区超过限制（40%），强制保存更多
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.4):
-            # 强制保存所有缓冲区中最大的symbol
-            logger.error(f"Trades buffer total size ({total_buffer_size}) exceeds 40% limit, forcing save...")
-            sorted_symbols = sorted(
-                self.trades_buffer.items(),
-                key=lambda x: len(x[1]),
-                reverse=True
-            )
-            # 保存前20个最大的缓冲区
-            for sym, _ in sorted_symbols[:20]:
-                if self.trades_buffer[sym]:
-                    await self._save_trades_batch(sym)
-        # 如果总缓冲区超过限制（70%），强制保存更多
-        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.7):
-            # 强制保存所有缓冲区中最大的symbol
-            logger.error(f"Trades buffer total size ({total_buffer_size}) exceeds 70% limit, forcing save...")
-            sorted_symbols = sorted(
-                self.trades_buffer.items(),
-                key=lambda x: len(x[1]),
-                reverse=True
-            )
-            # 保存前30个最大的缓冲区
-            for sym, _ in sorted_symbols[:30]:
-                if self.trades_buffer[sym]:
-                    await self._save_trades_batch(sym)
-        # 如果总缓冲区超过限制，强制保存所有
-        elif total_buffer_size >= self.trades_buffer_total_max_size:
-            # 强制保存所有缓冲区
-            logger.error(f"Trades buffer total size ({total_buffer_size}) exceeds limit, forcing save all...")
-            for sym in list(self.trades_buffer.keys()):
-                if self.trades_buffer[sym]:
-                    await self._save_trades_batch(sym)
+
+        # 全局缓冲压力检查做时间节流，避免每笔成交都全量排序造成吞吐下降
+        now = time.monotonic()
+        if now - self._last_trades_buffer_pressure_check < self._trades_buffer_pressure_check_interval:
+            return
+        self._last_trades_buffer_pressure_check = now
+
+        total_buffer_size = self._trades_buffer_total_size
+        if total_buffer_size < int(self.trades_buffer_total_max_size * 0.5):
+            return
+
+        # 仅在压力较大时，分层刷盘最大缓冲symbol，控制CPU开销
+        items = sorted(
+            self.trades_buffer.items(),
+            key=lambda x: len(x[1]),
+            reverse=True
+        )
+        if total_buffer_size >= self.trades_buffer_total_max_size:
+            flush_top_n = len(items)
+            log_level = logger.error
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.8):
+            flush_top_n = 40
+            log_level = logger.warning
+        elif total_buffer_size >= int(self.trades_buffer_total_max_size * 0.65):
+            flush_top_n = 20
+            log_level = logger.warning
+        else:
+            flush_top_n = 8
+            log_level = logger.info
+
+        log_level(
+            f"Trades buffer pressure: total={total_buffer_size}, limit={self.trades_buffer_total_max_size}, "
+            f"flush_top_n={flush_top_n}"
+        )
+        for sym, _ in items[:flush_top_n]:
+            if self.trades_buffer.get(sym):
+                await self._save_trades_batch(sym)
     
     async def _on_kline_generated(self, symbol: str, kline):
         """K线生成回调：保存K线数据"""
@@ -248,9 +242,154 @@ class DataLayerProcess:
                 if current_time - self._last_completeness_check_time >= self._completeness_check_interval:
                     self._last_completeness_check_time = current_time
                     await self._check_and_notify_data_complete()
+
+                if self._kline_reconcile_enabled and isinstance(kline, dict):
+                    self._enqueue_kline_reconcile(symbol, kline.get("open_time"))
                 
             except Exception as e:
                 logger.error(f"Error in kline callback for {symbol}: {e}", exc_info=True)
+
+    def _enqueue_kline_reconcile(self, symbol: str, open_time_value):
+        """将K线窗口加入官方对齐队列（去重、限流）。"""
+        if open_time_value is None:
+            return
+        try:
+            open_time_ts = pd.to_datetime(open_time_value, utc=True)
+            open_ms = int(open_time_ts.timestamp() * 1000)
+        except Exception:
+            return
+
+        key = f"{symbol}:{open_ms}"
+        if key in self._kline_reconcile_pending_keys:
+            return
+        self._kline_reconcile_pending_keys.add(key)
+        try:
+            self._kline_reconcile_queue.put_nowait((symbol, open_ms, key))
+            self._kline_reconcile_stats["enqueued"] += 1
+        except asyncio.QueueFull:
+            self._kline_reconcile_pending_keys.discard(key)
+            logger.warning("Kline reconcile queue is full, skip one reconcile task")
+
+    async def _fetch_official_5m_kline(self, session: aiohttp.ClientSession, symbol: str, open_ms: int):
+        """拉取官方5分钟K线（单symbol单窗口）。"""
+        url = f"{self._kline_reconcile_api_base}/fapi/v1/klines"
+        params = {
+            "symbol": symbol,
+            "interval": "5m",
+            "startTime": open_ms,
+            "endTime": open_ms + 1,
+            "limit": 1,
+        }
+
+        last_error = None
+        for i in range(4):
+            try:
+                data = await safe_http_request(
+                    session,
+                    "GET",
+                    url,
+                    params=params,
+                    timeout=self._kline_reconcile_timeout,
+                    max_retries=0,
+                    return_json=True,
+                    use_rate_limit=True,
+                )
+                if data:
+                    return data[0]
+                return None
+            except Exception as e:
+                last_error = e
+                await asyncio.sleep(0.3 * (i + 1))
+        if last_error:
+            raise last_error
+        return None
+
+    async def _reconcile_one_kline(self, session: aiohttp.ClientSession, symbol: str, open_ms: int):
+        """对齐本地K线与官方K线重叠字段。"""
+        open_dt = datetime.fromtimestamp(open_ms / 1000, tz=timezone.utc)
+        close_dt = open_dt + timedelta(minutes=5)
+        local_df = self.storage.load_klines(symbol, open_dt, close_dt)
+        if local_df.empty or "open_time" not in local_df.columns:
+            return
+
+        local_df = local_df[local_df["open_time"] == pd.Timestamp(open_dt)]
+        if local_df.empty:
+            return
+
+        remote = await self._fetch_official_5m_kline(session, symbol, open_ms)
+        if not remote:
+            return
+
+        row = local_df.iloc[-1].to_dict()
+        row["open"] = float(remote[1])
+        row["high"] = float(remote[2])
+        row["low"] = float(remote[3])
+        row["close"] = float(remote[4])
+        row["volume"] = float(remote[5])
+        row["quote_volume"] = float(remote[7])
+        row["trade_count"] = int(remote[8])
+        # 保持内部别名字段同步
+        row["last"] = row["close"]
+        row["dolvol"] = row["quote_volume"]
+        row["tradecount"] = row["trade_count"]
+
+        import polars as pl
+        reconciled_df = pl.DataFrame([row])
+        self.storage.save_klines(symbol, reconciled_df)
+        # 同步更新内存中的kline缓存，避免后续periodic_save用旧值回写覆盖
+        if self.kline_aggregator and symbol in self.kline_aggregator.klines:
+            try:
+                mem_df = self.kline_aggregator.klines[symbol]
+                if not mem_df.is_empty() and "open_time" in mem_df.columns:
+                    open_time_val = pd.to_datetime(row["open_time"], utc=True)
+                    mem_df_new = (
+                        pl.concat(
+                            [
+                                mem_df.filter(pl.col("open_time") != open_time_val),
+                                reconciled_df,
+                            ]
+                        )
+                        .unique(subset=["open_time"], keep="last")
+                        .sort("open_time")
+                    )
+                    self.kline_aggregator.klines[symbol] = mem_df_new
+            except Exception:
+                pass
+        self._kline_reconcile_stats["applied"] += 1
+
+    async def _kline_reconcile_worker(self, worker_id: int):
+        """后台worker：持续消费对齐队列。"""
+        headers = {"User-Agent": "data-layer-kline-reconcile/1.0"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            while self.running:
+                try:
+                    symbol, open_ms, key = await asyncio.wait_for(self._kline_reconcile_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    continue
+
+                try:
+                    await self._reconcile_one_kline(session, symbol, open_ms)
+                except Exception as e:
+                    self._kline_reconcile_stats["failed"] += 1
+                    logger.debug(
+                        f"Kline reconcile worker-{worker_id} failed for {symbol}@{open_ms}: {e}"
+                    )
+                finally:
+                    self._kline_reconcile_pending_keys.discard(key)
+                    self._kline_reconcile_queue.task_done()
+                    applied = self._kline_reconcile_stats["applied"]
+                    if applied > 0 and applied % 200 == 0:
+                        logger.info(
+                            "Kline reconcile stats: "
+                            f"enqueued={self._kline_reconcile_stats['enqueued']}, "
+                            f"applied={self._kline_reconcile_stats['applied']}, "
+                            f"failed={self._kline_reconcile_stats['failed']}, "
+                            f"queue_size={self._kline_reconcile_queue.qsize()}"
+                        )
     
     async def _check_and_notify_data_complete(self):
         """
@@ -478,6 +617,7 @@ class DataLayerProcess:
             # 原地清空缓冲区并释放临时对象引用
             trades_list.clear()
             self.trades_buffer[symbol] = trades_list
+            self._trades_buffer_total_size = max(0, self._trades_buffer_total_size - saved_count)
             del trades_df
             
             logger.debug(f"Saved {saved_count} trades for {symbol}")
@@ -494,9 +634,10 @@ class DataLayerProcess:
                 if not self.running:
                     break
                 
-                # 刷新所有待处理的K线
+                # 周期任务先基于pending快照更新K线（不弹出pending），再关闭已过grace窗口
                 if self.kline_aggregator:
-                    await self.kline_aggregator.flush_pending()
+                    await self.kline_aggregator.flush_pending_snapshot()
+                    await self.kline_aggregator.flush_closed_windows()
                     
                     # 检查并生成无交易的窗口K线
                     universe = self.universe_manager.current_universe
@@ -506,7 +647,7 @@ class DataLayerProcess:
                 # 定期保存聚合好的K线
                 # 优化：直接使用polars DataFrame，避免转换为pandas DataFrame造成内存泄漏
                 # 极端优化：分批保存，避免一次性处理所有symbol造成内存峰值
-                if self.kline_aggregator:
+                if self.kline_aggregator and not self._kline_reconcile_enabled:
                     saved_count = 0
                     symbols_to_save = list(self.kline_aggregator.klines.keys())
                     batch_size = 50  # 每批处理50个symbol，避免内存峰值
@@ -532,6 +673,9 @@ class DataLayerProcess:
                         gc.collect()
                     
                     logger.debug(f"Periodic save completed, {saved_count} symbols")
+                elif self.kline_aggregator and self._kline_reconcile_enabled:
+                    # 已启用官方回填时，K线在生成回调中已实时落盘，避免周期保存用内存旧值覆盖回填结果
+                    logger.debug("Periodic kline save skipped because reconcile mode is enabled")
                 
                 # 定期保存trades数据（保存所有缓冲区中的数据）
                 for symbol in list(self.trades_buffer.keys()):
@@ -602,8 +746,14 @@ class DataLayerProcess:
                 api_base = await config.get_binance_api_base_for_data_layer_async()
                 ws_base = await config.get_binance_ws_base_for_data_layer_async()
                 logger.info(f"Data layer endpoints: API={api_base}, WS={ws_base}")
+                self._kline_reconcile_api_base = api_base
             except Exception as e:
                 logger.warning(f"Failed to check endpoint connectivity, using default: {e}")
+        else:
+            try:
+                self._kline_reconcile_api_base = await config.get_binance_api_base_for_data_layer_async()
+            except Exception:
+                pass
         
         # 1. 初始化Universe管理器并加载Universe
         try:
@@ -685,29 +835,42 @@ class DataLayerProcess:
             api_base = await config.get_binance_api_base_for_data_layer_async()
             self.funding_rate_collector = FundingRateCollector(api_base=api_base)
             logger.info(f"Funding rate collector initialized with API: {api_base}")
-            # 启动资金费率采集任务
-            funding_rate_task = asyncio.create_task(self._periodic_collect_funding_rates())
-            self._add_task_with_error_handler(funding_rate_task, "funding_rate_collector")
-            # 立即执行一次初始采集
-            asyncio.create_task(self._collect_funding_rates_initial())
+            if config.get("data.enable_background_rest_collectors", False):
+                # 启动资金费率采集任务
+                funding_rate_task = asyncio.create_task(self._periodic_collect_funding_rates())
+                self._add_task_with_error_handler(funding_rate_task, "funding_rate_collector")
+                # 立即执行一次初始采集
+                asyncio.create_task(self._collect_funding_rates_initial())
+            else:
+                logger.info("Background funding-rate REST collectors disabled by config")
         
         # 10. 初始化溢价指数K线采集器（非mock模式）
         if not self.is_mock_mode:
             self.premium_index_collector = get_premium_index_collector()
-            # 启动溢价指数K线采集任务
-            premium_index_task = asyncio.create_task(self._periodic_collect_premium_index())
-            self._add_task_with_error_handler(premium_index_task, "premium_index_collector")
-            # 立即执行一次初始采集
-            asyncio.create_task(self._collect_premium_index_initial())
+            if config.get("data.enable_background_rest_collectors", False):
+                # 启动溢价指数K线采集任务
+                premium_index_task = asyncio.create_task(self._periodic_collect_premium_index())
+                self._add_task_with_error_handler(premium_index_task, "premium_index_collector")
+                # 立即执行一次初始采集
+                asyncio.create_task(self._collect_premium_index_initial())
+            else:
+                logger.info("Background premium-index REST collectors disabled by config")
         
         # 11. 启动数据完整性检查和自动补全任务（每1小时检查一次）
         if not self.is_mock_mode:
-            data_integrity_task = asyncio.create_task(self._check_and_complete_data())
-            self._add_task_with_error_handler(data_integrity_task, "data_integrity_check")
+            if config.get("data.enable_background_rest_collectors", False):
+                data_integrity_task = asyncio.create_task(self._check_and_complete_data())
+                self._add_task_with_error_handler(data_integrity_task, "data_integrity_check")
         
         # 12. 启动定期内存清理任务（每30分钟清理一次）
         memory_cleanup_task = asyncio.create_task(self._periodic_memory_cleanup())
         self._add_task_with_error_handler(memory_cleanup_task, "memory_cleanup")
+
+        # 13. 启动官方K线对齐worker（提升与官方一致性）
+        if self._kline_reconcile_enabled and not self.is_mock_mode:
+            for i in range(max(1, self._kline_reconcile_workers)):
+                reconcile_task = asyncio.create_task(self._kline_reconcile_worker(i))
+                self._add_task_with_error_handler(reconcile_task, f"kline_reconcile_{i}")
         
         logger.info("Data layer process started successfully")
     
@@ -837,6 +1000,7 @@ class DataLayerProcess:
                     else:
                         empty_count += 1
                         logger.warning(f"No funding rate data fetched for {symbol}")
+                        self.storage.ensure_funding_rate_placeholder(symbol, end_time)
 
                 # 及时释放批次对象，降低RSS上升斜率
                 del funding_rates_map
@@ -854,10 +1018,10 @@ class DataLayerProcess:
             logger.error(f"Error in initial funding rate collection: {e}", exc_info=True)
     
     async def _periodic_collect_funding_rates(self):
-        """定期采集资金费率数据（每8小时一次）"""
+        """定期采集资金费率数据（默认每5分钟一次，增量拉取）"""
         while self.running:
             try:
-                # 等待8小时
+                # 等待配置间隔（默认5分钟）
                 await asyncio.sleep(self.funding_rate_collect_interval)
                 
                 if not self.running:
@@ -872,9 +1036,22 @@ class DataLayerProcess:
                 
                 logger.info(f"Starting periodic funding rate collection for {len(universe)} symbols...")
                 
-                # 采集最近24小时的数据（确保覆盖最新的资金费率）
+                # 增量采集：避免每轮都回拉整天数据，降低内存和API压力
                 end_time = datetime.now(timezone.utc)
-                start_time = end_time - timedelta(days=1)
+                overlap_minutes = int(config.get("data.funding_rate_collect_overlap_minutes", 60))
+                fallback_lookback_minutes = int(
+                    config.get("data.funding_rate_periodic_lookback_minutes", 480)
+                )
+                if self.last_funding_rate_collect_time > 0:
+                    last_collect_dt = datetime.fromtimestamp(
+                        self.last_funding_rate_collect_time, timezone.utc
+                    )
+                    start_time = last_collect_dt - timedelta(minutes=overlap_minutes)
+                else:
+                    start_time = end_time - timedelta(minutes=fallback_lookback_minutes)
+
+                if start_time >= end_time:
+                    start_time = end_time - timedelta(minutes=max(overlap_minutes, 5))
                 
                 symbols = list(universe)
                 max_concurrent = config.get('data.history_collect_max_concurrent', 2)
@@ -906,6 +1083,8 @@ class DataLayerProcess:
                                 logger.error(f"Failed to save funding rates for {symbol}: {e}", exc_info=True)
                         else:
                             empty_count += 1
+                            # 空结果也写入占位文件，区分“确实无新数据”和“采集未执行”
+                            self.storage.ensure_funding_rate_placeholder(symbol, end_time)
 
                     del funding_rates_map
                     import gc
@@ -922,7 +1101,7 @@ class DataLayerProcess:
                 break
             except Exception as e:
                 logger.error(f"Error in periodic funding rate collection: {e}", exc_info=True)
-                retry_delay = config.get('data.funding_rate_collect_interval', 28800)  # 出错后等待配置的间隔再重试
+                retry_delay = config.get('data.funding_rate_collect_interval', 300)  # 出错后等待配置的间隔再重试
                 await asyncio.sleep(min(retry_delay, 3600))  # 最多等待1小时
     
     async def _collect_premium_index_initial(self):
@@ -1134,6 +1313,8 @@ class DataLayerProcess:
                                         saved_count += 1
                                     except Exception as e:
                                         logger.error(f"Failed to save funding rates for {symbol} during auto-completion: {e}")
+                                else:
+                                    self.storage.ensure_funding_rate_placeholder(symbol, end_time)
                             del funding_rates_map
                             import gc
                             gc.collect()
@@ -1276,93 +1457,23 @@ class DataLayerProcess:
                             import gc
                             gc.collect()
                         
-                        # 增强：强制清理所有symbol的旧pending窗口（即使symbol在universe中）
-                        # 清理超过时间窗口的pending_trades（保留最近2个窗口）
-                        current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                        current_window_start_ms = self.kline_aggregator._get_window_start(current_time_ms)
-                        max_pending_windows = config.get('data.kline_aggregator_max_pending_windows', 2)
-                        
-                        pending_cleaned_count = 0
-                        for symbol in list(self.kline_aggregator.pending_trades.keys()):
-                            if symbol not in self.kline_aggregator.pending_trades:
-                                continue
-                            windows = self.kline_aggregator.pending_trades[symbol]
-                            if not windows:
-                                continue
-                            
-                            # 找出所有旧的窗口（超过max_pending_windows个）
-                            window_starts = sorted(windows.keys())
-                            if len(window_starts) > max_pending_windows:
-                                # 保留最新的max_pending_windows个窗口，删除最旧的
-                                # 注意：window_starts[:-max_pending_windows] 会保留除了最后N个之外的所有窗口（这是要删除的）
-                                windows_to_remove = window_starts[:len(window_starts) - max_pending_windows]
-                                for window_start in windows_to_remove:
-                                    if window_start not in windows:
-                                        continue  # 可能已被其他线程删除
-                                    # 先尝试聚合，如果失败则直接删除
-                                    # 修复内存泄漏：确保窗口和trades列表被完全清理
-                                    try:
-                                        await self.kline_aggregator._aggregate_window(symbol, window_start)
-                                        # 聚合成功，窗口已被_aggregate_window内部的pop移除
-                                        pending_cleaned_count += 1
-                                    except Exception as e:
-                                        # 如果聚合失败，直接删除并清理
-                                        if window_start in windows:
-                                            window_trades = windows.pop(window_start, None)
-                                            if window_trades:
-                                                window_trades.clear()
-                                                del window_trades
-                                        pending_cleaned_count += 1
-                                        logger.debug(
-                                            f"Failed to aggregate window {window_start} for {symbol}, "
-                                            f"deleted directly: {e}"
-                                        )
-                        
-                        if pending_cleaned_count > 0:
-                            logger.info(
-                                f"Cleaned up {pending_cleaned_count} old pending windows "
-                                f"(kept {max_pending_windows} latest windows per symbol)"
-                            )
-
-                        # 额外内存保护：限制pending_trades总成交条数，防止总量持续累积
-                        # 高波动下，单窗口交易可能很大；这里优先保留每个窗口最新成交。
+                        # 注意：不要在data_layer内越权关闭/裁剪pending窗口。
+                        # 窗口生命周期与晚到成交处理统一由kline_aggregator负责，
+                        # 这里仅做观测，不做“提前聚合/截断”以避免损伤聚合精度。
                         pending_total_soft_limit = config.get(
                             "data.kline_aggregator_pending_trades_total_soft_limit", 200000
-                        )
-                        pending_trim_per_window = config.get(
-                            "data.kline_aggregator_pending_trades_trim_per_window", 1500
                         )
                         total_pending_trades = 0
                         for windows in self.kline_aggregator.pending_trades.values():
                             for trades in windows.values():
                                 total_pending_trades += len(trades)
 
-                        if (
-                            total_pending_trades > pending_total_soft_limit
-                            or mem_before > memory_warning_threshold
-                        ):
-                            trimmed_trades = 0
-                            for symbol in list(self.kline_aggregator.pending_trades.keys()):
-                                if symbol not in self.kline_aggregator.pending_trades:
-                                    continue
-                                windows = self.kline_aggregator.pending_trades[symbol]
-                                for window_start in list(windows.keys()):
-                                    if window_start not in windows:
-                                        continue
-                                    trades_list = windows[window_start]
-                                    if len(trades_list) > pending_trim_per_window:
-                                        remove_count = len(trades_list) - pending_trim_per_window
-                                        del trades_list[:remove_count]
-                                        trimmed_trades += remove_count
-                            if trimmed_trades > 0:
-                                logger.warning(
-                                    "Pending trades guard triggered: "
-                                    f"total_pending_trades={total_pending_trades}, "
-                                    f"trimmed={trimmed_trades}, "
-                                    f"per_window_limit={pending_trim_per_window}"
-                                )
-                                import gc
-                                gc.collect()
+                        if total_pending_trades > pending_total_soft_limit:
+                            logger.warning(
+                                "Pending trades soft-limit exceeded (observation only): "
+                                f"total_pending_trades={total_pending_trades}, "
+                                f"soft_limit={pending_total_soft_limit}"
+                            )
                         
                         # 清理不在universe中的symbol的klines
                         # 修复内存泄漏：确保所有DataFrame被完全释放

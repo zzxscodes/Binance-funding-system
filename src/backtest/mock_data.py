@@ -201,7 +201,7 @@ class MockKlineGenerator:
                 "sell_volume": sell_volume,
                 "interval_minutes": interval_minutes,
                 # bar表字段
-                "microsecond_since_trad": window_end_ms,
+                "microsecond_since_trade": window_end_ms,
                 "span_begin_datetime": window_start_ms,
                 "span_end_datetime": window_end_ms,
                 "span_status": span_status,

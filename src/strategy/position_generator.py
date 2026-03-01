@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from ..common.config import config
 from ..common.logger import get_logger
 from ..common.utils import ensure_directory
-from ..common.utils import to_exchange_symbol
+from ..common.utils import to_exchange_symbol, format_symbol
 
 logger = get_logger('position_generator')
 
@@ -209,6 +209,69 @@ class PositionGenerator:
             else:
                 out[account_id] = pd.DataFrame(columns=["symbol", "target_position", "timestamp"])
         return out
+
+    async def convert_weights_to_quantities(
+        self,
+        client,
+        target_positions_weights: Dict[str, float],
+        account_id: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """
+        将权重转换为币种数量：qty = M * leverage * alpha / price
+        其中 M 为账户总资产 totalWalletBalance（USDT），alpha 为归一化后的权重。
+        """
+        if not target_positions_weights:
+            return {}
+
+        try:
+            account_info = await client.get_account_info()
+            if not account_info:
+                logger.warning("No account info available, fallback to raw target positions")
+                return target_positions_weights
+
+            total_wallet_balance = float(account_info.get('totalWalletBalance', 0) or 0)
+            if total_wallet_balance <= 0:
+                logger.warning(
+                    f"Invalid total wallet balance: {total_wallet_balance}, fallback to raw target positions"
+                )
+                return target_positions_weights
+
+            default_leverage = int(config.get('execution.contract_settings.leverage', 20))
+            leverage = default_leverage
+            if account_id:
+                leverage = int(config.get(f'execution.account_leverage.{account_id}', default_leverage))
+            leverage = max(1, min(125, leverage))
+
+            total_abs = sum(abs(float(v)) for v in target_positions_weights.values() if v is not None)
+            if total_abs <= 1e-12:
+                return {}
+
+            normalized = {
+                sym: float(w) / total_abs
+                for sym, w in target_positions_weights.items()
+                if w is not None and abs(float(w)) > 1e-12
+            }
+
+            notional_capital = total_wallet_balance * leverage
+            result: Dict[str, float] = {}
+            for symbol, alpha in normalized.items():
+                try:
+                    current_price = await client.get_symbol_price(symbol)
+                    if not current_price or current_price <= 0:
+                        continue
+                    qty = (abs(alpha) * notional_capital) / float(current_price)
+                    result[format_symbol(symbol)] = qty if alpha > 0 else -qty
+                except Exception as e:
+                    logger.warning(f"Failed to convert weight for {symbol}: {e}")
+
+            logger.info(
+                f"Converted weights to quantities via PositionGenerator: symbols={len(result)}, "
+                f"total_wallet_balance={total_wallet_balance:.4f}, leverage={leverage}"
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Failed to convert weights to quantities: {e}", exc_info=True)
+            return target_positions_weights
     
     def load_target_positions(self, file_path: str) -> Dict:
         """

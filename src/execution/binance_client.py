@@ -1093,6 +1093,25 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to change position mode: {e}", exc_info=True)
             raise
+
+    async def get_position_mode(self) -> bool:
+        """
+        获取持仓模式。
+
+        Returns:
+            True: 双向持仓模式
+            False: 单向持仓模式
+        """
+        try:
+            data = await self._request('GET', '/fapi/v1/positionSide/dual', signed=True)
+            # Binance返回: {'dualSidePosition': true/false} 或字符串
+            v = data.get('dualSidePosition', False)
+            if isinstance(v, str):
+                return v.lower() == 'true'
+            return bool(v)
+        except Exception as e:
+            logger.error(f"Failed to get position mode: {e}", exc_info=True)
+            raise
     
     async def change_leverage(self, symbol: str, leverage: int) -> Dict:
         """

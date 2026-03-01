@@ -6,6 +6,7 @@ import pandas as pd
 from typing import Dict, List, Optional
 from datetime import datetime
 
+from ..common.config import config
 from ..common.logger import get_logger
 from ..common.utils import format_symbol, round_qty
 from .binance_client import BinanceClient
@@ -25,6 +26,10 @@ class PositionManager:
         """
         self.client = binance_client
         self.current_positions: Dict[str, Dict] = {}  # symbol -> position info
+        # 单向持仓下支持一笔翻仓（实验已验证 Binance 可直接翻仓）
+        self.allow_single_order_reverse = bool(
+            config.get("execution.contract_settings.allow_single_order_reverse", True)
+        )
     
     async def update_current_positions(self):
         """更新当前持仓"""
@@ -87,10 +92,9 @@ class PositionManager:
                     continue
                 
                 # 检测反向开仓：当前持仓和目标持仓方向相反
-                # 在单向持仓模式下，反向开仓需要先平仓，再开仓（两个订单）
                 is_reverse = (current_pos > 0 and target_pos < 0) or (current_pos < 0 and target_pos > 0)
                 
-                if is_reverse:
+                if is_reverse and not self.allow_single_order_reverse:
                     # 反向开仓：需要先平仓，再开仓（两个订单）
                     # 订单1：平掉当前持仓
                     close_quantity = abs(current_pos)
