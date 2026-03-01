@@ -230,3 +230,9 @@
 {"ts": "2026-03-01 06:01:34", "settled_window": "2026-03-01 05:25:00+00:00", "first_reliable_window": "2026-03-01 03:30:00+00:00", "status": "skipped_same_window"}
 {"ts": "2026-03-01 06:01:39", "settled_window": "2026-03-01 05:25:00+00:00", "first_reliable_window": "2026-03-01 02:45:00+00:00", "status": "skipped_same_window"}
 {"ts": "2026-03-01 06:01:52", "settled_window": "2026-03-01 05:25:00+00:00", "first_reliable_window": "2026-03-01 03:30:00+00:00", "status": "skipped_same_window"}
+{"ts": "2026-03-01 06:02:34", "settled_window": "2026-03-01 05:25:00+00:00", "first_reliable_window": "2026-03-01 03:30:00+00:00", "status": "skipped_same_window"}
+{"ts": "2026-03-01 06:02:39", "settled_window": "2026-03-01 05:25:00+00:00", "first_reliable_window": "2026-03-01 02:45:00+00:00", "status": "skipped_same_window"}
+{"ts": "2026-03-01 06:02:52", "settled_window": "2026-03-01 05:25:00+00:00", "first_reliable_window": "2026-03-01 03:30:00+00:00", "status": "skipped_same_window"}
+{"ts": "2026-03-01 06:03:35", "settled_window": "2026-03-01 05:25:00+00:00", "first_reliable_window": "2026-03-01 03:30:00+00:00", "status": "skipped_same_window"}
+{"ts": "2026-03-01 06:03:39", "settled_window": "2026-03-01 05:25:00+00:00", "first_reliable_window": "2026-03-01 02:45:00+00:00", "status": "skipped_same_window"}
+{"ts": "2026-03-01 06:03:52", "settled_window": "2026-03-01 05:25:00+00:00", "first_reliable_window": "2026-03-01 03:30:00+00:00", "status": "skipped_same_window"}

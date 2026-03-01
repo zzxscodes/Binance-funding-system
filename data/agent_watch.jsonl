@@ -472,3 +472,13 @@
 {"ts": "2026-03-01 06:01:35", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
 {"ts": "2026-03-01 06:02:00", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
 {"ts": "2026-03-01 06:02:02", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
+{"ts": "2026-03-01 06:02:05", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
+{"ts": "2026-03-01 06:02:30", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
+{"ts": "2026-03-01 06:02:32", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
+{"ts": "2026-03-01 06:02:35", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
+{"ts": "2026-03-01 06:03:00", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
+{"ts": "2026-03-01 06:03:02", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
+{"ts": "2026-03-01 06:03:05", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
+{"ts": "2026-03-01 06:03:30", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
+{"ts": "2026-03-01 06:03:32", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
+{"ts": "2026-03-01 06:03:35", "rate_limit_hits": 0, "ws_disconnect_hits": 0, "gap_recover_hits": 0, "cleanup_points": 0, "last_cleanup": null, "trades_files": 0, "klines_files": 0, "data_layer_pid": null}
