@@ -7,6 +7,7 @@
 
 import os
 import time
+import shutil
 import pandas as pd
 import polars as pl
 from pathlib import Path
@@ -53,6 +54,34 @@ class DataStorage:
         # 格式: {symbol: schema_dict}，schema_dict包含schema和最后更新时间
         self._schema_cache: Dict[str, Dict] = {}
         self._schema_cache_max_size = config.get('data.storage_schema_cache_max_size', 1000)
+        self._corrupted_dir = self.data_dir / "corrupted_parquet"
+        self._corrupted_dir.mkdir(parents=True, exist_ok=True)
+
+    def _is_corrupted_parquet_error(self, err: Exception) -> bool:
+        msg = str(err).lower()
+        return (
+            "out of specification" in msg
+            or "invalid thrift" in msg
+            or "wrong page size" in msg
+            or "parquet" in msg and "protocol error" in msg
+        )
+
+    def _quarantine_corrupted_file(self, file_path: Path, reason: str):
+        """将疑似损坏的parquet文件隔离，避免后续反复读取报错。"""
+        try:
+            if not file_path.exists():
+                return
+            symbol = file_path.parent.name
+            target_dir = self._corrupted_dir / symbol
+            target_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            target = target_dir / f"{file_path.stem}.{ts}.corrupted{file_path.suffix}"
+            shutil.move(str(file_path), str(target))
+            logger.warning(
+                f"Quarantined corrupted parquet file: {file_path} -> {target} (reason: {reason})"
+            )
+        except Exception as move_err:
+            logger.error(f"Failed to quarantine corrupted file {file_path}: {move_err}")
 
     def _get_kline_file_path(self, symbol: str, date: datetime) -> Path:
         """
@@ -417,7 +446,9 @@ class DataStorage:
                         if not df_pl.is_empty():
                             lazy_dfs.append(df_pl.lazy())
                 except Exception as e:
-                    logger.warning(f"Failed to load {file_path}: {e}")
+                    logger.warning(f"Failed to prepare lazy load for {file_path}: {e}")
+                    if file_path.suffix == ".parquet" and self._is_corrupted_parquet_error(e):
+                        self._quarantine_corrupted_file(file_path, str(e))
             
             if not lazy_dfs:
                 return pd.DataFrame()
@@ -452,7 +483,22 @@ class DataStorage:
                     combined_lazy = combined_lazy.filter(pl.col("close_time") <= end_date)
             
             # 一次性collect，减少中间对象
-            combined_df_pl = combined_lazy.collect()
+            try:
+                combined_df_pl = combined_lazy.collect()
+            except Exception as collect_err:
+                logger.warning(
+                    f"Lazy collect failed for {symbol}, fallback to per-file loading: {collect_err}"
+                )
+                fallback_dfs = []
+                for file_path in all_files:
+                    df_pl = self._load_dataframe_polars(file_path)
+                    if not df_pl.is_empty():
+                        fallback_dfs.append(df_pl)
+                if not fallback_dfs:
+                    return pd.DataFrame()
+                combined_df_pl = pl.concat(fallback_dfs).unique(
+                    subset=["open_time"], keep="last"
+                ).sort("open_time")
             # 清理lazy引用
             del combined_lazy
             
@@ -719,22 +765,12 @@ class DataStorage:
         except PanicException as e:
             logger.error(f"Polars panic when loading {file_path}: {e}")
             # Polars panic通常表示文件损坏，尝试删除损坏的文件
-            try:
-                logger.warning(f"Corrupted parquet file detected (Polars panic), removing: {file_path}")
-                file_path.unlink()
-            except Exception as del_err:
-                logger.error(f"Failed to remove corrupted file: {del_err}")
+            self._quarantine_corrupted_file(file_path, f"polars panic: {e}")
             return pl.DataFrame()
         except Exception as e:
             logger.error(f"Failed to load {file_path}: {e}")
-            if file_path.suffix == ".parquet" and "out of specification" in str(e):
-                try:
-                    logger.warning(
-                        f"Corrupted parquet file detected, removing: {file_path}"
-                    )
-                    file_path.unlink()
-                except Exception as del_err:
-                    logger.error(f"Failed to remove corrupted file: {del_err}")
+            if file_path.suffix == ".parquet" and self._is_corrupted_parquet_error(e):
+                self._quarantine_corrupted_file(file_path, str(e))
             return pl.DataFrame()
 
     def _save_dataframe(self, df: pd.DataFrame, file_path: Path):

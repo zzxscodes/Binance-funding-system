@@ -102,6 +102,35 @@ execution:
         api_secret: your_testnet_secret
 ```
 
+常用的数据层参数（`data.*`）：
+
+```yaml
+data:
+  # K线聚合与内存控制
+  kline_aggregator_max_klines: 8
+  kline_aggregator_max_pending_windows: 8
+  kline_aggregator_max_trades_per_window: 0
+  kline_close_grace_windows: 6
+  kline_snapshot_max_windows_per_symbol: 2
+
+  # pending逐笔压缩（按窗口新旧分层）
+  kline_aggregator_pending_compact_old_window_threshold: 120
+  kline_aggregator_pending_compact_old_window_keep_tail: 20
+  kline_aggregator_pending_compact_current_window_threshold: 260
+  kline_aggregator_pending_compact_current_window_keep_tail: 40
+  kline_aggregator_pending_compact_trades_soft_limit: 2000000
+
+  # 内存清理
+  memory_cleanup_interval: 60
+  memory_force_rebuild_interval: 60
+  memory_aggressive_cleanup_threshold_mb: 900
+
+  # 网络抖动下的补缺与限流
+  collector_gap_recover_enabled: true
+  collector_gap_recover_max_trades: 3000
+  collector_gap_recover_global_budget_per_minute: 15000
+```
+
 **配置优先级**: 环境变量 > 配置文件
 - Testnet: `{ACCOUNT_ID}_TESTNET_API_KEY` / `{ACCOUNT_ID}_TESTNET_API_SECRET`
 - Live: `{ACCOUNT_ID}_API_KEY` / `{ACCOUNT_ID}_API_SECRET`
@@ -319,6 +348,30 @@ universe = strategy_api.get_last_universe(version='v1')
 - **Transtats阈值**: 人民币阈值自动转换为USD（除以7.0）
 
 使用Polars进行高性能向量化计算，支持bar表和tran_stats表两种数据格式。
+
+## 聚合准确性校验（临时脚本）
+
+项目提供了临时校验脚本：`scripts/temp_validate_data_layer_vs_binance.py`，用于对比本地聚合结果与 Binance 官方 `fapi/v1/klines` 的重合字段一致性。
+
+- 对比字段：`open/high/low/close/volume/quote_volume/trade_count`
+- 对比口径：同一 `symbol + 5m window`
+- 本地路径：复用聚合器实时路径（`add_trade -> _aggregate_window`）
+
+示例：
+
+```bash
+python scripts/temp_validate_data_layer_vs_binance.py \
+  --symbols 40 \
+  --window-count 2 \
+  --skip-recent-windows 2 \
+  --concurrency 4 \
+  --max-pages 30
+```
+
+说明：
+- `skip-recent-windows` 建议 >=2，避免比较到仍在收敛的近端窗口；
+- Binance 可能返回 `429`，可降低 `--concurrency` 或缩小 `--symbols` 重试；
+- 脚本退出码为 0 表示本轮样本全部通过。
 
 ## 数据存储结构
 

@@ -9,7 +9,7 @@ K线聚合器模块
 import polars as pl
 import pandas as pd  # 保留用于兼容性（时间戳转换等）
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Callable, Union
+from typing import Any, Dict, List, Optional, Callable, Union
 from collections import defaultdict
 import asyncio
 import time
@@ -44,6 +44,9 @@ class KlineAggregator:
         self.pending_trades: Dict[str, Dict[int, List[Dict]]] = defaultdict(
             lambda: defaultdict(list)
         )
+        # 对超大pending窗口做增量压缩，避免在grace窗口期间无限持有逐笔列表。
+        # 结构: {symbol: {window_start_ms: compact_state_dict}}
+        self.pending_compact: Dict[str, Dict[int, Dict[str, Any]]] = defaultdict(dict)
         self.latest_seen_window_start: Dict[str, int] = {}
         # 批量处理阈值：当列表达到此大小时，转换为DataFrame
         self._pending_trades_batch_size = 100
@@ -67,6 +70,13 @@ class KlineAggregator:
         # 每个窗口内trades列表的最大大小限制（防止单个窗口内trades无限增长）
         self.max_trades_per_window = config.get(
             "data.kline_aggregator_max_trades_per_window", 10000
+        )
+        # 当pending窗口逐笔过大时，将旧逐笔压缩为窗口级统计，仅保留最近部分逐笔用于增量聚合。
+        self.pending_compact_threshold = int(
+            config.get("data.kline_aggregator_pending_compact_threshold", 300)
+        )
+        self.pending_compact_keep_tail = int(
+            config.get("data.kline_aggregator_pending_compact_keep_tail", 60)
         )
 
         # 统计信息
@@ -216,6 +226,243 @@ class KlineAggregator:
         )
         self.pending_trades[symbol][window_start_ms].append(trade_record)
 
+    def _empty_compact_state(self) -> Dict[str, Any]:
+        return {
+            "min_ts": None,
+            "max_ts": None,
+            "open": 0.0,
+            "high": 0.0,
+            "low": 0.0,
+            "close": 0.0,
+            "volume": 0.0,
+            "quote_volume": 0.0,
+            "trade_count": 0,
+            "buy_volume": 0.0,
+            "sell_volume": 0.0,
+            "buy_dolvol": 0.0,
+            "sell_dolvol": 0.0,
+            "buy_trade_count": 0,
+            "sell_trade_count": 0,
+            "buy_volume1": 0.0,
+            "buy_volume2": 0.0,
+            "buy_volume3": 0.0,
+            "buy_volume4": 0.0,
+            "buy_dolvol1": 0.0,
+            "buy_dolvol2": 0.0,
+            "buy_dolvol3": 0.0,
+            "buy_dolvol4": 0.0,
+            "buy_trade_count1": 0,
+            "buy_trade_count2": 0,
+            "buy_trade_count3": 0,
+            "buy_trade_count4": 0,
+            "sell_volume1": 0.0,
+            "sell_volume2": 0.0,
+            "sell_volume3": 0.0,
+            "sell_volume4": 0.0,
+            "sell_dolvol1": 0.0,
+            "sell_dolvol2": 0.0,
+            "sell_dolvol3": 0.0,
+            "sell_dolvol4": 0.0,
+            "sell_trade_count1": 0,
+            "sell_trade_count2": 0,
+            "sell_trade_count3": 0,
+            "sell_trade_count4": 0,
+        }
+
+    def _build_compact_state_from_records(self, records: List[Any]) -> Optional[Dict[str, Any]]:
+        if not records:
+            return None
+
+        tier1_threshold_rmb = config.get("data.tran_stats_tier1_threshold_rmb", 40000)
+        tier2_threshold_rmb = config.get("data.tran_stats_tier2_threshold_rmb", 200000)
+        tier3_threshold_rmb = config.get("data.tran_stats_tier3_threshold_rmb", 1000000)
+        usd_rmb_rate = config.get("data.usd_rmb_rate", 7.0)
+        tier1_threshold = tier1_threshold_rmb / usd_rmb_rate
+        tier2_threshold = tier2_threshold_rmb / usd_rmb_rate
+        tier3_threshold = tier3_threshold_rmb / usd_rmb_rate
+
+        state = self._empty_compact_state()
+        for rec in records:
+            price, qty, quote_qty, ts_ms, is_buyer_maker, trade_count = rec
+            price_f = float(price)
+            qty_f = float(qty)
+            quote_f = float(quote_qty)
+            ts_i = int(ts_ms)
+            tc_i = int(trade_count)
+            is_sell = bool(is_buyer_maker)
+
+            if state["min_ts"] is None or ts_i < state["min_ts"]:
+                state["min_ts"] = ts_i
+                state["open"] = price_f
+            if state["max_ts"] is None or ts_i >= state["max_ts"]:
+                state["max_ts"] = ts_i
+                state["close"] = price_f
+
+            if state["trade_count"] == 0:
+                state["high"] = price_f
+                state["low"] = price_f
+            else:
+                state["high"] = max(float(state["high"]), price_f)
+                state["low"] = min(float(state["low"]), price_f)
+
+            state["volume"] += qty_f
+            state["quote_volume"] += quote_f
+            state["trade_count"] += tc_i
+
+            if is_sell:
+                state["sell_volume"] += qty_f
+                state["sell_dolvol"] += quote_f
+                state["sell_trade_count"] += tc_i
+                if quote_f <= tier1_threshold:
+                    state["sell_volume1"] += qty_f
+                    state["sell_dolvol1"] += quote_f
+                    state["sell_trade_count1"] += tc_i
+                elif quote_f <= tier2_threshold:
+                    state["sell_volume2"] += qty_f
+                    state["sell_dolvol2"] += quote_f
+                    state["sell_trade_count2"] += tc_i
+                elif quote_f <= tier3_threshold:
+                    state["sell_volume3"] += qty_f
+                    state["sell_dolvol3"] += quote_f
+                    state["sell_trade_count3"] += tc_i
+                else:
+                    state["sell_volume4"] += qty_f
+                    state["sell_dolvol4"] += quote_f
+                    state["sell_trade_count4"] += tc_i
+            else:
+                state["buy_volume"] += qty_f
+                state["buy_dolvol"] += quote_f
+                state["buy_trade_count"] += tc_i
+                if quote_f <= tier1_threshold:
+                    state["buy_volume1"] += qty_f
+                    state["buy_dolvol1"] += quote_f
+                    state["buy_trade_count1"] += tc_i
+                elif quote_f <= tier2_threshold:
+                    state["buy_volume2"] += qty_f
+                    state["buy_dolvol2"] += quote_f
+                    state["buy_trade_count2"] += tc_i
+                elif quote_f <= tier3_threshold:
+                    state["buy_volume3"] += qty_f
+                    state["buy_dolvol3"] += quote_f
+                    state["buy_trade_count3"] += tc_i
+                else:
+                    state["buy_volume4"] += qty_f
+                    state["buy_dolvol4"] += quote_f
+                    state["buy_trade_count4"] += tc_i
+        return state
+
+    def _merge_compact_states(
+        self, base: Optional[Dict[str, Any]], incr: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if base is None:
+            return incr
+        if incr is None:
+            return base
+
+        merged = dict(base)
+        if merged["min_ts"] is None or (
+            incr["min_ts"] is not None and incr["min_ts"] < merged["min_ts"]
+        ):
+            merged["min_ts"] = incr["min_ts"]
+            merged["open"] = incr["open"]
+        if merged["max_ts"] is None or (
+            incr["max_ts"] is not None and incr["max_ts"] >= merged["max_ts"]
+        ):
+            merged["max_ts"] = incr["max_ts"]
+            merged["close"] = incr["close"]
+
+        if merged["trade_count"] == 0:
+            merged["high"] = incr["high"]
+            merged["low"] = incr["low"]
+        elif incr["trade_count"] > 0:
+            merged["high"] = max(float(merged["high"]), float(incr["high"]))
+            merged["low"] = min(float(merged["low"]), float(incr["low"]))
+
+        for key in [
+            "volume",
+            "quote_volume",
+            "trade_count",
+            "buy_volume",
+            "sell_volume",
+            "buy_dolvol",
+            "sell_dolvol",
+            "buy_trade_count",
+            "sell_trade_count",
+            "buy_volume1",
+            "buy_volume2",
+            "buy_volume3",
+            "buy_volume4",
+            "buy_dolvol1",
+            "buy_dolvol2",
+            "buy_dolvol3",
+            "buy_dolvol4",
+            "buy_trade_count1",
+            "buy_trade_count2",
+            "buy_trade_count3",
+            "buy_trade_count4",
+            "sell_volume1",
+            "sell_volume2",
+            "sell_volume3",
+            "sell_volume4",
+            "sell_dolvol1",
+            "sell_dolvol2",
+            "sell_dolvol3",
+            "sell_dolvol4",
+            "sell_trade_count1",
+            "sell_trade_count2",
+            "sell_trade_count3",
+            "sell_trade_count4",
+        ]:
+            merged[key] = merged.get(key, 0) + incr.get(key, 0)
+        return merged
+
+    def _compact_pending_window_if_needed(
+        self,
+        symbol: str,
+        window_start_ms: int,
+        threshold_override: Optional[int] = None,
+        keep_tail_override: Optional[int] = None,
+    ) -> int:
+        if self.pending_compact_threshold <= 0:
+            return 0
+        if symbol not in self.pending_trades:
+            return 0
+        if window_start_ms not in self.pending_trades[symbol]:
+            return 0
+        window_trades = self.pending_trades[symbol][window_start_ms]
+        threshold = (
+            int(threshold_override)
+            if threshold_override is not None
+            else self.pending_compact_threshold
+        )
+        if threshold <= 0:
+            return 0
+        if len(window_trades) <= threshold:
+            return 0
+
+        # 仅保留尾部少量逐笔用于处理晚到/乱序成交；其余转为紧凑统计态
+        # 不再硬编码到100，确保配置可生效（例如60）
+        keep_tail_base = (
+            int(keep_tail_override)
+            if keep_tail_override is not None
+            else self.pending_compact_keep_tail
+        )
+        keep_tail = max(5, keep_tail_base)
+        keep_tail = min(keep_tail, len(window_trades))
+        compact_count = len(window_trades) - keep_tail
+        if compact_count <= 0:
+            return 0
+
+        compact_state = self._build_compact_state_from_records(window_trades[:compact_count])
+        if compact_state:
+            prev_state = self.pending_compact[symbol].get(window_start_ms)
+            self.pending_compact[symbol][window_start_ms] = self._merge_compact_states(
+                prev_state, compact_state
+            )
+            del window_trades[:compact_count]
+            return compact_count
+        return 0
+
     async def add_trade(self, symbol: str, trade: Dict):
         """
         添加一笔成交数据，自动聚合到对应的K线窗口
@@ -252,6 +499,7 @@ class KlineAggregator:
 
             # 将交易添加到对应窗口（使用Polars DataFrame）
             self._add_trade_to_pending(symbol, normalized_trade, window_start_ms)
+            self._compact_pending_window_if_needed(symbol, window_start_ms)
             self.stats["trades_processed"][symbol] += 1
 
             # 检查是否需要关闭旧窗口：
@@ -294,6 +542,10 @@ class KlineAggregator:
                             if window_trades:
                                 window_trades.clear()
                                 del window_trades
+                        if symbol in self.pending_compact and window_start in self.pending_compact[symbol]:
+                            self.pending_compact[symbol].pop(window_start, None)
+                            if not self.pending_compact[symbol]:
+                                del self.pending_compact[symbol]
                         removed_count += 1
                         logger.debug(
                             f"Failed to aggregate window {window_start} for {symbol} during limit check, "
@@ -311,6 +563,8 @@ class KlineAggregator:
                 if symbol in self.pending_trades and not self.pending_trades[symbol]:
                     del self.pending_trades[symbol]
                     logger.debug(f"Removed empty pending_trades entry for {symbol}")
+                if symbol in self.pending_compact and not self.pending_compact[symbol]:
+                    del self.pending_compact[symbol]
 
         except Exception as e:
             logger.error(f"Error adding trade for {symbol}: {e}", exc_info=True)
@@ -331,6 +585,7 @@ class KlineAggregator:
             trades_override: 可选，直接使用传入的成交列表进行聚合（用于离线校验）
         """
         try:
+            compact_state: Optional[Dict[str, Any]] = None
             if trades_override is None:
                 # 从pending列表获取trades（现在是List[Dict]）
                 # 修复内存泄漏：确保窗口被完全移除
@@ -341,6 +596,9 @@ class KlineAggregator:
                         del self.pending_trades[symbol]
                 else:
                     trades_list = []
+                compact_state = self.pending_compact.get(symbol, {}).pop(window_start_ms, None)
+                if symbol in self.pending_compact and not self.pending_compact[symbol]:
+                    del self.pending_compact[symbol]
             else:
                 # 覆盖使用外部提供的成交
                 trades_list = trades_override
@@ -352,6 +610,11 @@ class KlineAggregator:
                             if old_trades:
                                 old_trades.clear()
                                 del old_trades
+                    compact_state = self.pending_compact.get(symbol, {}).pop(window_start_ms, None)
+                    if symbol in self.pending_compact and not self.pending_compact[symbol]:
+                        del self.pending_compact[symbol]
+                else:
+                    compact_state = self.pending_compact.get(symbol, {}).get(window_start_ms)
 
             # 检查是否有交易
             has_trades = len(trades_list) > 0
@@ -374,6 +637,8 @@ class KlineAggregator:
             if has_trades:
                 # 按时间排序（Polars的sort很快）
                 trades_df = trades_df.sort("ts_ms")
+                live_min_ts = int(trades_df["ts_ms"][0])
+                live_max_ts = int(trades_df["ts_ms"][-1])
 
                 # 使用Polars向量化计算OHLCV（比pandas快10-100倍）
                 agg_result = trades_df.select(
@@ -435,6 +700,8 @@ class KlineAggregator:
                 buy_trade_count = row[11]
                 sell_trade_count = row[12]
             else:
+                live_min_ts = None
+                live_max_ts = None
                 # 无成交情况：获取上一个K线的close作为ohlc
                 prev_close = None
                 if symbol in self.klines and not self.klines[symbol].is_empty():
@@ -604,6 +871,66 @@ class KlineAggregator:
                     sell_trade_count4
                 ) = 0
 
+            # 合并被压缩的pending统计，保证精度不受内存压缩影响
+            if compact_state:
+                compact_trade_count = int(compact_state.get("trade_count", 0))
+                if compact_trade_count > 0:
+                    compact_min_ts = compact_state.get("min_ts")
+                    compact_max_ts = compact_state.get("max_ts")
+
+                    if has_trades:
+                        if compact_min_ts is not None and (
+                            live_min_ts is None or compact_min_ts <= live_min_ts
+                        ):
+                            open_price = float(compact_state.get("open", open_price))
+                        if compact_max_ts is not None and (
+                            live_max_ts is None or compact_max_ts > live_max_ts
+                        ):
+                            close_price = float(compact_state.get("close", close_price))
+                        high_price = max(float(high_price), float(compact_state.get("high", high_price)))
+                        low_price = min(float(low_price), float(compact_state.get("low", low_price)))
+                    else:
+                        open_price = float(compact_state.get("open", open_price))
+                        high_price = float(compact_state.get("high", high_price))
+                        low_price = float(compact_state.get("low", low_price))
+                        close_price = float(compact_state.get("close", close_price))
+
+                    volume += float(compact_state.get("volume", 0.0))
+                    quote_volume += float(compact_state.get("quote_volume", 0.0))
+                    trade_count += compact_trade_count
+                    buy_volume += float(compact_state.get("buy_volume", 0.0))
+                    sell_volume += float(compact_state.get("sell_volume", 0.0))
+                    buy_dolvol += float(compact_state.get("buy_dolvol", 0.0))
+                    sell_dolvol += float(compact_state.get("sell_dolvol", 0.0))
+                    buy_trade_count += int(compact_state.get("buy_trade_count", 0))
+                    sell_trade_count += int(compact_state.get("sell_trade_count", 0))
+
+                    buy_volume1 += float(compact_state.get("buy_volume1", 0.0))
+                    buy_volume2 += float(compact_state.get("buy_volume2", 0.0))
+                    buy_volume3 += float(compact_state.get("buy_volume3", 0.0))
+                    buy_volume4 += float(compact_state.get("buy_volume4", 0.0))
+                    buy_dolvol1 += float(compact_state.get("buy_dolvol1", 0.0))
+                    buy_dolvol2 += float(compact_state.get("buy_dolvol2", 0.0))
+                    buy_dolvol3 += float(compact_state.get("buy_dolvol3", 0.0))
+                    buy_dolvol4 += float(compact_state.get("buy_dolvol4", 0.0))
+                    buy_trade_count1 += int(compact_state.get("buy_trade_count1", 0))
+                    buy_trade_count2 += int(compact_state.get("buy_trade_count2", 0))
+                    buy_trade_count3 += int(compact_state.get("buy_trade_count3", 0))
+                    buy_trade_count4 += int(compact_state.get("buy_trade_count4", 0))
+
+                    sell_volume1 += float(compact_state.get("sell_volume1", 0.0))
+                    sell_volume2 += float(compact_state.get("sell_volume2", 0.0))
+                    sell_volume3 += float(compact_state.get("sell_volume3", 0.0))
+                    sell_volume4 += float(compact_state.get("sell_volume4", 0.0))
+                    sell_dolvol1 += float(compact_state.get("sell_dolvol1", 0.0))
+                    sell_dolvol2 += float(compact_state.get("sell_dolvol2", 0.0))
+                    sell_dolvol3 += float(compact_state.get("sell_dolvol3", 0.0))
+                    sell_dolvol4 += float(compact_state.get("sell_dolvol4", 0.0))
+                    sell_trade_count1 += int(compact_state.get("sell_trade_count1", 0))
+                    sell_trade_count2 += int(compact_state.get("sell_trade_count2", 0))
+                    sell_trade_count3 += int(compact_state.get("sell_trade_count3", 0))
+                    sell_trade_count4 += int(compact_state.get("sell_trade_count4", 0))
+
             # 计算VWAP：有成交时计算，无成交时为nan
             # 根据需求：无成交时vwap因为volume为0，所以vwap为nan
             import math
@@ -722,179 +1049,19 @@ class KlineAggregator:
                     pl.col("close_time").cast(pl.Datetime("ns", time_zone="UTC"))
                 )
 
-            # 更新klines DataFrame
-            # 修复内存泄漏：确保所有DataFrame引用被正确释放，使用更激进的清理策略
-            max_klines = self.max_klines_per_symbol
-            
+            # 更新klines DataFrame（纯Polars路径）
+            # 说明：高频路径避免to_pandas/from_pandas，降低大规模symbol场景下的内存峰值与碎片化。
+            max_klines = max(1, int(self.max_klines_per_symbol))
             if symbol not in self.klines or self.klines[symbol].is_empty():
-                self.klines[symbol] = kline_df
+                merged_df = kline_df
             else:
-                # 获取当前DataFrame
-                current_df = self.klines[symbol]
-                current_len = len(current_df)
-                
-                # 修复内存泄漏：更激进的清理策略，提前trim到60%限制（从80%降低到60%），避免内存峰值
-                # 修复配置安全性：降低trim阈值，确保内存不超过1.5-2GB目标
-                # 修复：当max_klines=1时，不应该提前trim（因为trim后就没有数据了）
-                # 只有当max_klines > 1时才进行提前trim
-                if max_klines > 1:
-                    trim_threshold = max(1, int(max_klines * 0.6))  # 从80%降低到60%，更激进的清理，但至少保留1条
-                    if current_len >= trim_threshold:
-                        # 提前trim到60%限制，为新K线腾出空间
-                        # 使用clone()确保创建新对象，然后删除旧引用
-                        # 修复：保留trim_threshold条，而不是trim_threshold-1条（避免tail(0)导致空DataFrame）
-                        trimmed_current = current_df.tail(trim_threshold).clone()
-                        # 立即更新klines，释放旧的DataFrame
-                        old_df = self.klines[symbol]
-                        self.klines[symbol] = trimmed_current
-                        del old_df
-                        del current_df
-                        current_df = trimmed_current
-                        current_len = len(current_df)
-                
-                # 重新实现：合并新K线，确保真正释放内存
-                # 使用concat合并
-                new_df = pl.concat([current_df, kline_df])
-                # 立即释放中间对象引用
-                del current_df
-                del kline_df
-                
-                # 强制检查：如果合并后超过限制，立即trim（在去重前）
-                if len(new_df) > max_klines:
-                    # 先trim到限制值，使用to_pandas再转回polars确保完全释放内存
-                    old_df_in_dict = self.klines.get(symbol)
-                    try:
-                        # 使用to_pandas再转回polars，确保完全释放内存
-                        df_pd = new_df.tail(max_klines).to_pandas()
-                        trimmed_df = pl.from_pandas(df_pd)
-                        del df_pd
-                    except Exception:
-                        # 如果转换失败，使用clone
-                        trimmed_df = new_df.tail(max_klines).clone()
-                    
-                    # 更新并释放旧DataFrame
-                    self.klines[symbol] = trimmed_df
-                    del new_df
-                    del trimmed_df
-                    # 释放旧的DataFrame引用（如果存在且不同）
-                    if old_df_in_dict is not None and old_df_in_dict is not self.klines[symbol]:
-                        del old_df_in_dict
-                else:
-                    # 更新klines（在去重前先更新，避免去重过程中数据丢失）
-                    # 使用to_pandas再转回polars，确保完全释放内存
-                    old_df_in_dict = self.klines.get(symbol)
-                    try:
-                        df_pd = new_df.to_pandas()
-                        new_df_clean = pl.from_pandas(df_pd)
-                        del df_pd
-                    except Exception:
-                        new_df_clean = new_df.clone()
-                    
-                    self.klines[symbol] = new_df_clean
-                    del new_df
-                    del new_df_clean
-                    # 释放旧的DataFrame引用（如果存在且不同）
-                    if old_df_in_dict is not None and old_df_in_dict is not self.klines[symbol]:
-                        del old_df_in_dict
+                merged_df = pl.concat([self.klines[symbol], kline_df])
 
-            # 重新实现：去除重复（按open_time去重，保留最新的），确保真正释放内存
-            current_len = len(self.klines[symbol])
-            
-            # 如果数据量较大，先trim再去重，减少处理量
-            if current_len > max_klines:
-                old_df = self.klines[symbol]
-                # 使用to_pandas再转回polars，确保完全释放内存
-                try:
-                    df_pd = old_df.tail(max_klines).to_pandas()
-                    trimmed_df = pl.from_pandas(df_pd)
-                    del df_pd
-                except Exception:
-                    trimmed_df = old_df.tail(max_klines).clone()
-                
-                self.klines[symbol] = trimmed_df
-                # 确保旧DataFrame被完全释放
-                if old_df is not None and old_df is not trimmed_df:
-                    del old_df
-                del trimmed_df
-                current_len = max_klines
-            
-            # 去重和排序（使用lazy API优化大数据量处理）
-            # 修复内存泄漏：只在必要时进行去重，并确保释放所有中间对象
-            if current_len > 50:  # 数据量大时使用lazy API
-                # 使用lazy API，减少中间对象
-                old_df = self.klines[symbol]
-                processed_df = (
-                    old_df
-                    .lazy()
-                    .unique(subset=["open_time"], keep="last")
-                    .sort("open_time")
-                    .collect()
-                )
-                # 使用to_pandas再转回polars，确保完全释放内存
-                try:
-                    df_pd = processed_df.to_pandas()
-                    processed_df_clean = pl.from_pandas(df_pd)
-                    del df_pd
-                except Exception:
-                    processed_df_clean = processed_df.clone()
-                
-                # 立即更新并释放旧对象
-                self.klines[symbol] = processed_df_clean
-                if old_df is not None and old_df is not processed_df_clean:
-                    del old_df
-                del processed_df
-                del processed_df_clean
-            elif current_len > 1:  # 只有1条数据时不需要去重
-                # 直接去重和排序
-                old_df = self.klines[symbol]
-                processed_df = (
-                    old_df
-                    .unique(subset=["open_time"], keep="last")
-                    .sort("open_time")
-                    .clone()
-                )
-                # 使用to_pandas再转回polars，确保完全释放内存
-                try:
-                    df_pd = processed_df.to_pandas()
-                    processed_df_clean = pl.from_pandas(df_pd)
-                    del df_pd
-                except Exception:
-                    processed_df_clean = processed_df.clone()
-                
-                self.klines[symbol] = processed_df_clean
-                if old_df is not None and old_df is not processed_df_clean:
-                    del old_df
-                del processed_df
-                del processed_df_clean
-
-            # 重新实现：最终强制检查，确保不超过限制，并真正释放内存
+            merged_df = merged_df.unique(subset=["open_time"], keep="last").sort("open_time")
+            if len(merged_df) > max_klines:
+                merged_df = merged_df.tail(max_klines)
+            self.klines[symbol] = merged_df.rechunk()
             final_len = len(self.klines[symbol])
-            if final_len > max_klines:
-                # 强制trim到限制值（保留最新的）
-                old_df = self.klines[symbol]
-                # 使用to_pandas再转回polars，确保完全释放内存
-                try:
-                    df_pd = old_df.tail(max_klines).to_pandas()
-                    final_df = pl.from_pandas(df_pd)
-                    del df_pd
-                except Exception:
-                    final_df = old_df.tail(max_klines).clone()
-                
-                self.klines[symbol] = final_df
-                # 确保旧DataFrame被完全释放
-                if old_df is not None and old_df is not final_df:
-                    del old_df
-                del final_df
-                logger.warning(
-                    f"{symbol} klines count ({final_len}) exceeds limit ({max_klines}), "
-                    f"force trimmed to {max_klines}"
-                )
-            # 额外检查：即使没有超过限制，如果接近限制也记录日志（用于调试）
-            elif final_len > max_klines * 0.9:
-                logger.debug(
-                    f"{symbol} klines count ({final_len}) is close to limit ({max_klines}), "
-                    f"will be trimmed in next cleanup cycle"
-                )
 
             # 强制垃圾回收：在关键路径上触发GC，帮助释放内存
             # 注意：只在数据量大时触发，避免频繁GC影响性能
@@ -1002,15 +1169,26 @@ class KlineAggregator:
         按当前pending快照聚合并更新K线，但不移除pending。
         用于周期性落盘，避免将活跃窗口分段覆盖。
         """
-        symbols_to_process = [format_symbol(symbol)] if symbol else list(self.pending_trades.keys())
+        symbols_to_process = [format_symbol(symbol)] if symbol else list(
+            set(self.pending_trades.keys()) | set(self.pending_compact.keys())
+        )
+        # 限制快照窗口数，避免每次保存都对历史grace窗口全量重聚合导致RSS慢涨。
+        # 0或负值表示不限制（保持历史行为）。
+        snapshot_max_windows = int(
+            config.get("data.kline_snapshot_max_windows_per_symbol", 2)
+        )
         for sym in symbols_to_process:
-            if sym not in self.pending_trades:
-                continue
             windows = self.pending_trades.get(sym, {})
-            if not windows:
+            compact_windows = self.pending_compact.get(sym, {})
+            if not windows and not compact_windows:
                 continue
-            for window_start_ms, window_trades in list(windows.items()):
-                if not window_trades:
+            all_windows = sorted(set(windows.keys()) | set(compact_windows.keys()))
+            if snapshot_max_windows > 0 and len(all_windows) > snapshot_max_windows:
+                all_windows = all_windows[-snapshot_max_windows:]
+            for window_start_ms in all_windows:
+                window_trades = windows.get(window_start_ms, [])
+                compact_state = compact_windows.get(window_start_ms)
+                if not window_trades and not compact_state:
                     continue
                 await self._aggregate_window(
                     sym,
@@ -1035,12 +1213,20 @@ class KlineAggregator:
             self.close_grace_windows * self.interval_seconds * 1000
         )
 
-        symbols_to_process = [format_symbol(symbol)] if symbol else list(self.pending_trades.keys())
+        symbols_to_process = (
+            [format_symbol(symbol)]
+            if symbol
+            else list(set(self.pending_trades.keys()) | set(self.pending_compact.keys()))
+        )
         for sym in symbols_to_process:
-            if sym not in self.pending_trades:
+            windows = self.pending_trades.get(sym, {})
+            compact_windows = self.pending_compact.get(sym, {})
+            if not windows and not compact_windows:
                 continue
             windows_to_close = sorted(
-                ws for ws in list(self.pending_trades[sym].keys()) if ws < close_before_ms
+                ws
+                for ws in (set(windows.keys()) | set(compact_windows.keys()))
+                if ws < close_before_ms
             )
             for window_start_ms in windows_to_close:
                 await self._aggregate_window(sym, window_start_ms)
@@ -1306,25 +1492,14 @@ class KlineAggregator:
                 keep_count = min(current_len, max_klines)
             else:
                 keep_count = min(current_len, 1)
-            
-            # 关键修复：如果数据量超过限制，或者force_rebuild_all为True，都需要重建DataFrame
+
+            # 如果数据量超过限制，或者force_rebuild_all为True，都需要重建DataFrame
             needs_rebuild = current_len > keep_count or force_rebuild_all
-            
+
             if needs_rebuild:
                 old_df = self.klines[symbol]
+                new_df = old_df.tail(keep_count).unique(subset=["open_time"], keep="last").sort("open_time").rechunk()
 
-                # 小DataFrame走轻量路径，避免频繁to_pandas引入额外内存抬升
-                if current_len <= 2 and keep_count <= 1:
-                    new_df = old_df.tail(keep_count).rechunk()
-                else:
-                    # 使用to_pandas再转回polars，确保完全释放内存
-                    try:
-                        df_pd = old_df.tail(keep_count).to_pandas()
-                        new_df = pl.from_pandas(df_pd)
-                        del df_pd
-                    except Exception:
-                        new_df = old_df.tail(keep_count).clone()
-                
                 # 更新并释放旧DataFrame
                 # 关键修复：先删除旧引用，再赋值新DataFrame，确保旧DataFrame可以被GC回收
                 if old_df is not None and old_df is not new_df:
@@ -1343,6 +1518,82 @@ class KlineAggregator:
                     total_trimmed += (current_len - keep_count)
         
         return cleaned_count, total_trimmed
+
+    def get_pending_trade_totals(self) -> tuple[int, int]:
+        """返回pending逐笔总量：(list_in_memory, compacted_trade_count)。"""
+        list_total = 0
+        compact_total = 0
+        for windows in self.pending_trades.values():
+            for trades in windows.values():
+                list_total += len(trades)
+        for windows in self.pending_compact.values():
+            for state in windows.values():
+                compact_total += int(state.get("trade_count", 0))
+        return list_total, compact_total
+
+    def get_pending_compact_window_count(self) -> int:
+        """返回pending_compact窗口总数（用于观测压缩态规模）。"""
+        total = 0
+        for windows in self.pending_compact.values():
+            total += len(windows)
+        return total
+
+    def compact_pending_for_memory(self, current_rss_mb: Optional[float] = None) -> tuple[int, int]:
+        """
+        对pending窗口执行一次内存导向压缩。
+        - 当前窗口按常规阈值压缩
+        - 非当前窗口使用更激进阈值，降低长grace期间的逐笔对象驻留
+        Returns:
+            (compacted_windows, moved_trades)
+        """
+        compacted_windows = 0
+        moved_trades = 0
+        # 基础阈值（可配置）
+        old_window_threshold = int(
+            config.get("data.kline_aggregator_pending_compact_old_window_threshold", 120)
+        )
+        old_window_keep_tail = int(
+            config.get("data.kline_aggregator_pending_compact_old_window_keep_tail", 20)
+        )
+        current_window_threshold = int(
+            config.get("data.kline_aggregator_pending_compact_current_window_threshold", 260)
+        )
+        current_window_keep_tail = int(
+            config.get("data.kline_aggregator_pending_compact_current_window_keep_tail", 40)
+        )
+
+        # 内存压力下进一步收紧（保持口径不变，只减少逐笔对象）
+        if current_rss_mb is not None:
+            if current_rss_mb >= 420:
+                old_window_threshold = min(old_window_threshold, 50)
+                old_window_keep_tail = min(old_window_keep_tail, 8)
+                current_window_threshold = min(current_window_threshold, 140)
+                current_window_keep_tail = min(current_window_keep_tail, 25)
+            elif current_rss_mb >= 350:
+                old_window_threshold = min(old_window_threshold, 80)
+                old_window_keep_tail = min(old_window_keep_tail, 12)
+                current_window_threshold = min(current_window_threshold, 200)
+                current_window_keep_tail = min(current_window_keep_tail, 32)
+
+        for symbol, windows in list(self.pending_trades.items()):
+            latest_ws = self.latest_seen_window_start.get(symbol)
+            for ws in list(windows.keys()):
+                threshold = current_window_threshold
+                keep_tail = current_window_keep_tail
+                if latest_ws is not None and ws < latest_ws:
+                    # 非当前窗口保留更少逐笔；聚合口径由compact_state保障
+                    threshold = min(threshold, old_window_threshold)
+                    keep_tail = min(keep_tail, old_window_keep_tail)
+                moved = self._compact_pending_window_if_needed(
+                    symbol,
+                    ws,
+                    threshold_override=threshold,
+                    keep_tail_override=keep_tail,
+                )
+                if moved > 0:
+                    compacted_windows += 1
+                    moved_trades += moved
+        return compacted_windows, moved_trades
 
     def get_stats(self) -> Dict:
         """获取统计信息"""

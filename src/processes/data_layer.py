@@ -673,6 +673,16 @@ class DataLayerProcess:
                         gc.collect()
                     
                     logger.debug(f"Periodic save completed, {saved_count} symbols")
+                    # 保存后立即裁剪内存驻留K线，避免“已持久化数据”长期驻留导致缓存膨胀
+                    max_klines = int(config.get('data.kline_aggregator_max_klines', 288))
+                    cleaned_count, total_trimmed = self.kline_aggregator.force_cleanup_klines(
+                        max_klines, force_rebuild_all=False
+                    )
+                    if cleaned_count > 0 and total_trimmed > 0:
+                        logger.info(
+                            f"Periodic save trim completed: cleaned={cleaned_count}, "
+                            f"trimmed={total_trimmed}, max_klines={max_klines}"
+                        )
                 elif self.kline_aggregator and self._kline_reconcile_enabled:
                     # 已启用官方回填时，K线在生成回调中已实时落盘，避免周期保存用内存旧值覆盖回填结果
                     logger.debug("Periodic kline save skipped because reconcile mode is enabled")
@@ -1432,6 +1442,11 @@ class DataLayerProcess:
                                 windows.clear()
                                 del windows
                                 inactive_cleaned += 1
+                            if symbol in self.kline_aggregator.pending_compact:
+                                compact_windows = self.kline_aggregator.pending_compact.pop(symbol, None)
+                                if compact_windows:
+                                    compact_windows.clear()
+                                    del compact_windows
                         
                         # 修复内存泄漏：清理所有空字典条目（即使symbol在universe中）
                         # 这是关键修复：清理pending_trades中的空字典条目
@@ -1443,6 +1458,11 @@ class DataLayerProcess:
                                 # 空字典，删除整个条目
                                 del self.kline_aggregator.pending_trades[symbol]
                                 empty_symbols.append(symbol)
+                        for symbol in list(self.kline_aggregator.pending_compact.keys()):
+                            if symbol not in self.kline_aggregator.pending_compact:
+                                continue
+                            if not self.kline_aggregator.pending_compact[symbol]:
+                                del self.kline_aggregator.pending_compact[symbol]
                         if empty_symbols:
                             logger.info(
                                 f"Cleaned up {len(empty_symbols)} empty pending_trades entries "
@@ -1463,16 +1483,42 @@ class DataLayerProcess:
                         pending_total_soft_limit = config.get(
                             "data.kline_aggregator_pending_trades_total_soft_limit", 200000
                         )
-                        total_pending_trades = 0
-                        for windows in self.kline_aggregator.pending_trades.values():
-                            for trades in windows.values():
-                                total_pending_trades += len(trades)
+                        pending_compact_soft_limit = config.get(
+                            "data.kline_aggregator_pending_compact_trades_soft_limit", 2000000
+                        )
+                        compacted_windows, moved_trades = (
+                            self.kline_aggregator.compact_pending_for_memory(
+                                current_rss_mb=mem_before if mem_before > 0 else None
+                            )
+                        )
+                        if compacted_windows > 0:
+                            logger.info(
+                                "Pending memory compaction applied: "
+                                f"windows={compacted_windows}, moved_trades={moved_trades}"
+                            )
+                        pending_list_total, pending_compact_total = (
+                            self.kline_aggregator.get_pending_trade_totals()
+                        )
+                        pending_compact_windows = (
+                            self.kline_aggregator.get_pending_compact_window_count()
+                        )
 
-                        if total_pending_trades > pending_total_soft_limit:
+                        # 逐笔列表直接对应Python对象内存，作为主告警口径
+                        if pending_list_total > pending_total_soft_limit:
                             logger.warning(
                                 "Pending trades soft-limit exceeded (observation only): "
-                                f"total_pending_trades={total_pending_trades}, "
+                                f"list_total={pending_list_total}, "
+                                f"compact_total={pending_compact_total}, "
+                                f"compact_windows={pending_compact_windows}, "
                                 f"soft_limit={pending_total_soft_limit}"
+                            )
+                        elif pending_compact_total > pending_compact_soft_limit:
+                            logger.info(
+                                "Pending compact summary is large but bounded in memory model: "
+                                f"compact_total={pending_compact_total}, "
+                                f"compact_windows={pending_compact_windows}, "
+                                f"compact_soft_limit={pending_compact_soft_limit}, "
+                                f"list_total={pending_list_total}"
                             )
                         
                         # 清理不在universe中的symbol的klines
@@ -1653,6 +1699,11 @@ class DataLayerProcess:
                         if not self.kline_aggregator.pending_trades[symbol]:
                             del self.kline_aggregator.pending_trades[symbol]
                             empty_pending_count += 1
+                    for symbol in list(self.kline_aggregator.pending_compact.keys()):
+                        if symbol not in self.kline_aggregator.pending_compact:
+                            continue
+                        if not self.kline_aggregator.pending_compact[symbol]:
+                            del self.kline_aggregator.pending_compact[symbol]
                     if empty_pending_count > 0:
                         logger.info(
                             f"Memory cleanup: removed {empty_pending_count} empty pending_trades entries "
@@ -1762,8 +1813,20 @@ class DataLayerProcess:
                         f"Average klines per symbol: {klines_total/klines_symbols:.1f} (max: {max_klines})"
                     )
                 
-                # 如果清理效果不明显（释放内存<1MB且内存仍在增长），触发更激进的清理
-                if mem_freed < 1.0 and mem_before > 200:  # 内存超过200MB但释放很少
+                # 如果清理效果不明显，在“较高内存”且“缓存确有超限”时才触发更激进清理。
+                # 说明：低内存阶段频繁重建DataFrame会增加分配/碎片开销，反而推高RSS。
+                aggressive_cleanup_threshold_mb = float(
+                    config.get("data.memory_aggressive_cleanup_threshold_mb", 900)
+                )
+                should_aggressive_cleanup = (
+                    mem_freed < 1.0
+                    and mem_before > aggressive_cleanup_threshold_mb
+                    and (
+                        klines_total > expected_max_klines * 1.05
+                        or mem_before > memory_critical_threshold
+                    )
+                )
+                if should_aggressive_cleanup:
                     logger.warning(
                         f"Memory cleanup had limited effect: freed only {mem_freed:.2f}MB. "
                         f"Current memory: {mem_after:.2f}MB. "
