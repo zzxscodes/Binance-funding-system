@@ -1043,6 +1043,88 @@ class OrderManager:
             logger.error(f"Failed to place market order for {symbol}: {e}", exc_info=True)
             return None
     
+    async def _get_current_position(self, symbol: str) -> float:
+        """
+        获取当前仓位
+        
+        Args:
+            symbol: 交易对
+        
+        Returns:
+            当前仓位数量（正数=多仓，负数=空仓，0=无仓）
+        """
+        try:
+            await self.position_manager.update_current_positions()
+            position_info = self.position_manager.current_positions.get(symbol, {})
+            return float(position_info.get('position_amt', 0.0))
+        except Exception as e:
+            logger.error(f"Failed to get current position for {symbol}: {e}", exc_info=True)
+            return 0.0
+    
+    async def _get_orderbook_prices(self, symbol: str) -> Optional[Dict[str, float]]:
+        """
+        获取订单簿价格（bid1 和 ask1）
+        
+        Args:
+            symbol: 交易对
+        
+        Returns:
+            包含 bid1 和 ask1 价格的字典，如果获取失败返回 None
+            {'bid1': float, 'ask1': float}
+        """
+        try:
+            orderbook = await self.client.get_orderbook(symbol, limit=1)
+            if orderbook and orderbook.get('bids') and orderbook.get('asks'):
+                return {
+                    'bid1': orderbook['bids'][0][0],  # 最高买价
+                    'ask1': orderbook['asks'][0][0],  # 最低卖价
+                }
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get orderbook prices for {symbol}: {e}")
+            return None
+    
+    async def place_limit_order(
+        self, symbol: str, side: str, quantity: float, price: float, reduce_only: bool = False
+    ) -> Optional[Dict]:
+        """
+        下限价单
+        
+        Args:
+            symbol: 交易对
+            side: 方向，'BUY' 或 'SELL'
+            quantity: 数量
+            price: 限价
+            reduce_only: 是否只减仓
+        
+        Returns:
+            订单结果
+        """
+        try:
+            position_side = 'BOTH'
+            try:
+                if not self.dry_run:
+                    dual_side_position = await self.client.get_position_mode()
+                    if dual_side_position:
+                        position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            except Exception as e:
+                logger.debug(f"Could not get position mode for {symbol}, using default BOTH: {e}")
+            
+            result = await self.client.place_order(
+                symbol=symbol,
+                side=side,
+                order_type='LIMIT',
+                quantity=quantity,
+                price=price,
+                position_side=position_side,
+                reduce_only=reduce_only,
+                time_in_force='GTC'
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Failed to place limit order for {symbol}: {e}", exc_info=True)
+            return None
+
     async def place_twap_order(
         self, 
         symbol: str, 
@@ -1056,12 +1138,19 @@ class OrderManager:
         """
         下TWAP订单（时间加权平均价格）
         
+        根据伪代码逻辑实现：
+        1. 计算需要交易的量（基于目标仓位）
+        2. 生成每步的目标仓位列表
+        3. 每步先下市价单补齐到理想仓位，然后下限价单微调
+        
         Args:
             symbol: 交易对
             side: 方向，'BUY' 或 'SELL'
-            total_quantity: 总数量
+            total_quantity: 总数量（目标仓位变化量）
             interval: 时间间隔，如 '5min', '1min' 等
             reduce_only: 是否只减仓
+            duration_minutes: 执行时长（分钟）
+            max_splits: 最大分割次数
         
         Returns:
             订单结果列表
@@ -1077,54 +1166,167 @@ class OrderManager:
             if duration_minutes is None:
                 duration_minutes = config.get('execution.twap.default_duration_minutes', 60)
             
-            # 计算分割次数
-            num_splits = max(1, int(duration_minutes / interval_minutes))
-            if max_splits is None:
-                max_splits = config.get('execution.twap.max_splits')
+            # 计算分割次数（步数）
+            num_steps = max(1, int(duration_minutes / interval_minutes))
             if max_splits is not None:
-                num_splits = min(num_splits, max_splits)
+                num_steps = min(num_steps, max_splits)
             
-            # 计算每个时间段的订单数量
-            quantity_per_order = total_quantity / num_splits
+            # 计算步长间隔（秒）
+            step_interval_seconds = (duration_minutes * 60) / num_steps
+            
+            # 获取当前仓位
+            current_position = await self._get_current_position(symbol)
+            
+            # 计算目标仓位（当前仓位 + 交易量）
+            if side == 'BUY':
+                target_position = current_position + total_quantity
+            else:  # SELL
+                target_position = current_position - total_quantity
+            
+            # 计算需要交易的量
+            volume = target_position - current_position
+            
+            if abs(volume) < 1e-8:
+                logger.info(f"TWAP: No volume to trade for {symbol}, current_position={current_position}, target_position={target_position}")
+                return []
+            
+            # 确定买卖方向
+            trade_side = 'BUY' if volume > 0 else 'SELL'
+            
+            # 计算每步的交易量
+            step_volume = abs(volume) / num_steps
+            
+            # 生成每步的目标仓位列表
+            step_target_position_list = []
+            for i in range(num_steps + 1):
+                step_target = current_position + (volume * i / num_steps)
+                step_target_position_list.append(step_target)
             
             # 获取symbol信息以规范化数量
             symbol_info = await self.get_symbol_info(symbol)
             step_size = symbol_info.get('step_size', 0.01)
-            quantity_per_order = round_qty(quantity_per_order, step_size)
-            
-            if quantity_per_order < symbol_info.get('min_qty', 0.001):
-                logger.warning(f"TWAP order quantity per split {quantity_per_order} is too small for {symbol}")
-                # 如果每单数量太小，只下一单
-                order_result = await self.place_market_order(symbol, side, total_quantity, reduce_only)
-                return [order_result] if order_result else []
+            min_qty = symbol_info.get('min_qty', 0.001)
             
             orders = []
-            start_time = datetime.now(timezone.utc)
-            
-            for i in range(num_splits):
-                # 计算预期执行时间
-                expected_time = start_time + timedelta(minutes=i * interval_minutes)
-                current_time = datetime.now(timezone.utc)
-                
-                # 如果还没到执行时间，等待
-                if current_time < expected_time:
-                    wait_seconds = (expected_time - current_time).total_seconds()
-                    if wait_seconds > 0:
-                        await asyncio.sleep(wait_seconds)
-                
-                order_result = await self.place_market_order(symbol, side, quantity_per_order, reduce_only)
-                if order_result:
-                    orders.append(order_result)
-                    logger.debug(
-                        f"TWAP order split {i+1}/{num_splits} for {symbol}: {quantity_per_order} {side}, "
-                        f"orderId={order_result.get('orderId')}"
-                    )
-                else:
-                    logger.warning(f"TWAP order split {i+1}/{num_splits} for {symbol} failed")
+            step_idx = 0
+            last_update_time = time.time()
+            start_time = time.time()
             
             logger.info(
-                f"TWAP order completed for {symbol}: {len(orders)}/{num_splits} orders executed, "
-                f"total executed: {sum(o.get('executedQty', 0) for o in orders):.6f}"
+                f"TWAP order started for {symbol}: current_position={current_position:.6f}, "
+                f"target_position={target_position:.6f}, volume={volume:.6f}, "
+                f"steps={num_steps}, step_interval={step_interval_seconds:.1f}s"
+            )
+            
+            while step_idx < num_steps:
+                current_time = time.time()
+                
+                # 检查是否到了下一个步长的时间
+                elapsed = current_time - last_update_time
+                if elapsed < step_interval_seconds:
+                    await asyncio.sleep(min(5.0, step_interval_seconds - elapsed))
+                    continue
+                
+                # 获取当前理想仓位和实际仓位
+                ideal_position = step_target_position_list[step_idx]
+                current_position = await self._get_current_position(symbol)
+                
+                # 计算需要交易的量（市价单）
+                market_volume = 0.0
+                if trade_side == 'BUY':
+                    if current_position < ideal_position:
+                        market_volume = ideal_position - current_position
+                else:  # SELL
+                    if current_position > ideal_position:
+                        market_volume = current_position - ideal_position
+                
+                # 先下市价单补齐到理想仓位
+                if market_volume > min_qty:
+                    market_volume = round_qty(market_volume, step_size)
+                    order_result = await self.place_market_order(
+                        symbol, trade_side, market_volume, reduce_only
+                    )
+                    if order_result:
+                        orders.append(order_result)
+                        logger.debug(
+                            f"TWAP step {step_idx+1}/{num_steps} market order: {symbol} {trade_side} "
+                            f"{market_volume:.6f} (ideal={ideal_position:.6f}, current={current_position:.6f})"
+                        )
+                        # 等待订单执行
+                        await asyncio.sleep(2)
+                        current_position = await self._get_current_position(symbol)
+                
+                # 检查是否接近目标，如果还有差距，下限价单微调
+                remaining_to_target = abs(target_position - current_position)
+                limit_volume = 0.0
+                
+                if remaining_to_target > step_volume:
+                    limit_volume = step_volume
+                elif remaining_to_target > 0.0 and remaining_to_target < step_volume:
+                    limit_volume = remaining_to_target
+                
+                if limit_volume > min_qty:
+                    limit_volume = round_qty(limit_volume, step_size)
+                    
+                    # 获取订单簿价格
+                    orderbook_prices = await self._get_orderbook_prices(symbol)
+                    if orderbook_prices:
+                        if trade_side == 'BUY':
+                            limit_price = orderbook_prices['bid1']  # 买入用 bid1
+                        else:  # SELL
+                            limit_price = orderbook_prices['ask1']  # 卖出用 ask1
+                        
+                        # 规范化价格
+                        tick_size = symbol_info.get('tick_size', 0.01)
+                        import math
+                        limit_price = round(limit_price / tick_size) * tick_size
+                        
+                        order_result = await self.place_limit_order(
+                            symbol, trade_side, limit_volume, limit_price, reduce_only
+                        )
+                        if order_result:
+                            orders.append(order_result)
+                            logger.debug(
+                                f"TWAP step {step_idx+1}/{num_steps} limit order: {symbol} {trade_side} "
+                                f"{limit_volume:.6f} @ {limit_price:.6f}"
+                            )
+                    else:
+                        logger.warning(f"TWAP: Cannot get orderbook prices for {symbol}, skipping limit order")
+                
+                # 检查是否已达到目标
+                current_position = await self._get_current_position(symbol)
+                if abs(target_position - current_position) < min_qty:
+                    logger.info(
+                        f"TWAP order completed early for {symbol}: reached target position "
+                        f"(current={current_position:.6f}, target={target_position:.6f})"
+                    )
+                    break
+                
+                step_idx += 1
+                last_update_time = time.time()
+            
+            # 最终检查：如果还有剩余差距，下市价单补齐
+            final_position = await self._get_current_position(symbol)
+            final_gap = target_position - final_position
+            if abs(final_gap) > min_qty:
+                final_volume = round_qty(abs(final_gap), step_size)
+                if final_volume > min_qty:
+                    final_side = 'BUY' if final_gap > 0 else 'SELL'
+                    order_result = await self.place_market_order(
+                        symbol, final_side, final_volume, reduce_only
+                    )
+                    if order_result:
+                        orders.append(order_result)
+                        logger.info(
+                            f"TWAP final market order: {symbol} {final_side} {final_volume:.6f} "
+                            f"to close gap (current={final_position:.6f}, target={target_position:.6f})"
+                        )
+            
+            final_position = await self._get_current_position(symbol)
+            logger.info(
+                f"TWAP order completed for {symbol}: {len(orders)} orders executed, "
+                f"final_position={final_position:.6f}, target_position={target_position:.6f}, "
+                f"deviation={abs(target_position - final_position):.6f}"
             )
             return orders
             

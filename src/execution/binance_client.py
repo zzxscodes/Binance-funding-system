@@ -548,6 +548,36 @@ class BinanceClient:
             logger.debug(f"Failed to get price for {symbol}: {e}")
             return None
     
+    async def get_orderbook(self, symbol: str, limit: int = 5) -> Optional[Dict]:
+        """
+        获取订单簿（深度）
+        
+        Args:
+            symbol: 交易对
+            limit: 深度限制（5, 10, 20, 50, 100, 500, 1000）
+        
+        Returns:
+            订单簿数据，包含 bids 和 asks，如果获取失败返回 None
+            {
+                'bids': [[price, quantity], ...],  # 买单，价格从高到低
+                'asks': [[price, quantity], ...],  # 卖单，价格从低到高
+            }
+        """
+        try:
+            symbol = format_symbol(symbol)
+            params = {'symbol': symbol, 'limit': limit}
+            data = await self._request('GET', '/fapi/v1/depth', params=params, signed=False)
+            
+            if data:
+                return {
+                    'bids': [[float(b[0]), float(b[1])] for b in data.get('bids', [])],
+                    'asks': [[float(a[0]), float(a[1])] for a in data.get('asks', [])],
+                }
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get orderbook for {symbol}: {e}")
+            return None
+    
     async def get_current_funding_rate(self, symbol: str) -> Optional[float]:
         """
         获取交易对的当前资金费率（最后一次资金费率）
