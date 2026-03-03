@@ -36,6 +36,8 @@ class BinanceClient:
         self.dry_run = dry_run
         self.session: Optional[aiohttp.ClientSession] = None
         self._time_offset: Optional[int] = None  # 服务器时间偏移量（毫秒）
+        self._time_offset_timestamp: Optional[float] = None  # 时间偏移量同步时间（秒，用于过期检查）
+        self._time_offset_ttl: float = 300.0  # 时间偏移量有效期（5分钟）
         
         # 从配置读取合约设置（灵活适配配置）
         contract_settings = config.get('execution.contract_settings', {})
@@ -120,9 +122,9 @@ class BinanceClient:
                     
                     if data:
                         server_time = data.get('serverTime', 0)
-                        # 计算网络延迟（往返时间的一半）
+                        # 计算网络延迟（往返时间的一半，增加20%安全余量）
                         rtt_ms = (request_end - request_start) * 1000
-                        network_delay_ms = rtt_ms / 2
+                        network_delay_ms = rtt_ms / 2 * 1.2  # 增加20%安全余量，更保守
                         
                         # 本地时间（请求发送时的中间时间点）
                         local_time = int((request_start + request_end) / 2 * 1000)
@@ -139,6 +141,7 @@ class BinanceClient:
                 offsets.sort()
                 median_offset = offsets[len(offsets) // 2]
                 self._time_offset = int(median_offset)
+                self._time_offset_timestamp = time.time()  # 记录同步时间
                 logger.debug(f"Server time synced, offset: {self._time_offset}ms (from {len(offsets)} measurements)")
                 return True
             else:
@@ -147,6 +150,14 @@ class BinanceClient:
         except Exception as e:
             logger.warning(f"Failed to sync server time: {e}")
             return False
+    
+    def _is_time_offset_valid(self) -> bool:
+        """检查时间偏移量是否仍然有效"""
+        if self._time_offset is None or self._time_offset_timestamp is None:
+            return False
+        # 检查是否过期（超过TTL）
+        elapsed = time.time() - self._time_offset_timestamp
+        return elapsed < self._time_offset_ttl
     
     def _get_timestamp(self) -> int:
         """获取同步后的时间戳"""
@@ -207,8 +218,8 @@ class BinanceClient:
         
         # 添加时间戳和recvWindow（Binance API要求）
         if signed:
-            # 首次请求时同步服务器时间
-            if self._time_offset is None:
+            # 首次请求时或时间偏移量过期时同步服务器时间
+            if self._time_offset is None or not self._is_time_offset_valid():
                 sync_success = await self._sync_server_time()
                 if not sync_success:
                     logger.warning("Time sync failed, using local time (may cause timestamp errors)")

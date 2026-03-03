@@ -876,6 +876,23 @@ class DataStorage:
             else:
                 raise TypeError(f"Unsupported DataFrame type: {type(df)}")
 
+            # 统一资金费率schema，避免历史文件(str)与新文件(float)混合导致后续concat失败
+            cast_exprs = []
+            if "symbol" in df_pl.columns:
+                cast_exprs.append(pl.col("symbol").cast(pl.Utf8, strict=False))
+            if "fundingTime" in df_pl.columns:
+                cast_exprs.append(
+                    pl.col("fundingTime").cast(
+                        pl.Datetime("ms", time_zone="UTC"), strict=False
+                    )
+                )
+            if "fundingRate" in df_pl.columns:
+                cast_exprs.append(pl.col("fundingRate").cast(pl.Float64, strict=False))
+            if "markPrice" in df_pl.columns:
+                cast_exprs.append(pl.col("markPrice").cast(pl.Float64, strict=False))
+            if cast_exprs:
+                df_pl = df_pl.with_columns(cast_exprs)
+
             # 确定日期：如果数据跨多天，需要按日期分组保存
             # 资金费率数据应该按日期分组保存，而不是只保存到最早日期
             if date is None:
@@ -1037,6 +1054,27 @@ class DataStorage:
                     if file_path.suffix == ".parquet":
                         # 使用lazy API扫描文件
                         lazy_df = pl.scan_parquet(file_path)
+                        # 统一schema，兼容历史文件中的字符串费率字段
+                        schema = lazy_df.collect_schema()
+                        cast_exprs = []
+                        if "symbol" in schema:
+                            cast_exprs.append(pl.col("symbol").cast(pl.Utf8, strict=False))
+                        if "fundingTime" in schema:
+                            cast_exprs.append(
+                                pl.col("fundingTime").cast(
+                                    pl.Datetime("ms", time_zone="UTC"), strict=False
+                                )
+                            )
+                        if "fundingRate" in schema:
+                            cast_exprs.append(
+                                pl.col("fundingRate").cast(pl.Float64, strict=False)
+                            )
+                        if "markPrice" in schema:
+                            cast_exprs.append(
+                                pl.col("markPrice").cast(pl.Float64, strict=False)
+                            )
+                        if cast_exprs:
+                            lazy_df = lazy_df.with_columns(cast_exprs)
                         lazy_dfs.append(lazy_df)
                     else:
                         # CSV文件需要先加载

@@ -22,7 +22,7 @@ from ..common.config import config
 from ..common.logger import get_logger
 from ..common.ipc import IPCClient, MessageType
 from ..common.network_utils import safe_http_request
-from ..common.utils import beijing_now
+from ..common.utils import beijing_now, format_symbol
 from ..monitoring.performance import get_performance_monitor
 from ..data.universe_manager import get_universe_manager
 from ..data.collector import TradeCollector
@@ -33,6 +33,7 @@ from ..data.storage import get_data_storage
 from ..data.api import get_data_api
 from ..data.funding_rate_collector import FundingRateCollector
 from ..data.premium_index_collector import get_premium_index_collector
+from ..data.funding_market_collector import FundingMarketCollector
 
 logger = get_logger('data_layer')
 
@@ -57,7 +58,9 @@ class DataLayerProcess:
         self.kline_aggregator: Optional[KlineAggregator] = None
         self.collector: Optional = None  # 可能是TradeCollector或MockTradeCollector
         self.funding_rate_collector: Optional[FundingRateCollector] = None
-        self.premium_index_collector = None  # 溢价指数收集器
+        self.premium_index_collector = None  # 溢价指数收集器（REST，仅用于启动回填）
+        self.funding_market_collector: Optional[FundingMarketCollector] = None  # WebSocket 实时采集（资金费率/标记价格/溢价指数）
+        self._funding_rate_backfill_in_progress = False  # 资金费率回填进行中标志
         self.data_api = None
         self.ipc_client: Optional[IPCClient] = None
         
@@ -124,14 +127,19 @@ class DataLayerProcess:
         )
         
         # 资金费率采集配置
-        self.funding_rate_collect_interval = config.get('data.funding_rate_collect_interval', 300)  # 5分钟
+        self.funding_rate_collect_interval = config.get('data.funding_rate_collect_interval', 300)
         self.last_funding_rate_collect_time = 0
-        self.funding_rate_collect_days = config.get('data.funding_rate_collect_days', 30)  # 采集最近N天的历史数据
+        self.funding_rate_collect_days = config.get('data.funding_rate_collect_days', 30)
         
         # 溢价指数K线采集配置
-        self.premium_index_collect_interval = config.get('data.premium_index_collect_interval', 300)  # 5分钟
+        self.premium_index_collect_interval = config.get('data.premium_index_collect_interval', 300)
         self.last_premium_index_collect_time = 0
-        self.premium_index_collect_days = config.get('data.premium_index_collect_days', 7)  # 采集最近N天的历史数据
+        self.premium_index_collect_days = config.get('data.premium_index_collect_days', 7)
+
+        # WebSocket 实时资金费率缓冲（FundingMarketCollector 回调写入，_periodic_save 刷盘）
+        self._ws_funding_rate_buffer: Dict[str, List[Dict]] = {}
+        # WebSocket 实时溢价指数 K 线缓冲
+        self._ws_premium_index_buffer: Dict[str, List[Dict]] = {}
 
         # data_complete 去重：同一个5分钟窗口（prev_window_end_5min）只通知一次
         # 说明：prev_window_end_5min 是"上一窗口的结束时间 = 当前窗口起始时间"，用它作为窗口唯一键
@@ -494,17 +502,15 @@ class DataLayerProcess:
                     
                     symbols_complete += 1
                 
-                # 计算数据完整度阈值：至少95%的交易对有数据且完整
-                # 这样可以处理交易量极少的交易对（可能没有交易就没有K线）
+                # 计算数据完整度阈值：至少 N% 的交易对拥有当前窗口的最新K线
+                # 这样可以处理交易量极少或断连后重连恢复中的交易对
                 completeness_threshold = config.get('data.completeness_threshold', 0.95)  # 默认95%阈值
-                min_symbols_with_data = int(len(universe) * completeness_threshold)
+                min_symbols_complete = int(len(universe) * completeness_threshold)
                 
-                # 检查条件：
-                # 1. 有数据的交易对数量达到阈值（至少95%）
-                # 2. 所有有数据的交易对都完成了上一窗口（all_complete为True，包括5min,1h,4h,8h,12h,24h）
+                # 检查条件：已完成当前窗口的交易对数量达到阈值
+                # symbols_complete: 拥有当前5min窗口K线的交易对数（不要求100%，允许少量低活跃/重连中的交易对缺失）
                 # 注意：由于其他周期（1h,4h,8h,12h,24h）是从5分钟数据聚合的，如果5分钟数据完整，其他周期也可以聚合
-                # 所以主要检查5分钟数据是否完整即可
-                if symbols_with_data >= min_symbols_with_data and all_complete:
+                if symbols_complete >= min_symbols_complete:
                     # ===== data_complete 去重：同一个5min窗口只通知一次 =====
                     prev_window_end_5min = prev_window_ends.get('5min')
                     if prev_window_end_5min is not None and self._last_notified_data_complete_5min_end == prev_window_end_5min:
@@ -543,7 +549,8 @@ class DataLayerProcess:
                                     self._last_notified_data_complete_5min_end = prev_window_end_5min
                                 logger.info(
                                     f"Notified data complete (5min,1h,4h,8h,12h,24h) for {len(symbols_with_complete_data)}/{len(universe)} symbols "
-                                    f"({symbols_with_data} have data, {len(incomplete_symbols)} incomplete) at {current_time}"
+                                    f"(complete={symbols_complete}, have_data={symbols_with_data}, incomplete={len(incomplete_symbols)}, "
+                                    f"threshold={min_symbols_complete}) at {current_time}"
                                 )
                                 break
                             except Exception as e:
@@ -637,6 +644,12 @@ class DataLayerProcess:
                 # 周期任务先基于pending快照更新K线（不弹出pending），再关闭已过grace窗口
                 if self.kline_aggregator:
                     await self.kline_aggregator.flush_pending_snapshot()
+                    
+                    # 快照完成后立即检查数据完整性并通知策略
+                    # 关键优化：flush_pending_snapshot 使用 snapshot_mode=True 跳过了逐条回调，
+                    # 因此需要在此处统一检查一次完整性。这比在回调中逐条检查快100倍以上。
+                    await self._check_and_notify_data_complete()
+                    
                     await self.kline_aggregator.flush_closed_windows()
                     
                     # 检查并生成无交易的窗口K线
@@ -673,7 +686,7 @@ class DataLayerProcess:
                         gc.collect()
                     
                     logger.debug(f"Periodic save completed, {saved_count} symbols")
-                    # 保存后立即裁剪内存驻留K线，避免“已持久化数据”长期驻留导致缓存膨胀
+                    # 保存后立即裁剪内存驻留K线，避免"已持久化数据"长期驻留导致缓存膨胀
                     max_klines = int(config.get('data.kline_aggregator_max_klines', 288))
                     cleaned_count, total_trimmed = self.kline_aggregator.force_cleanup_klines(
                         max_klines, force_rebuild_all=False
@@ -698,6 +711,10 @@ class DataLayerProcess:
                 ]
                 for sym in empty_symbols:
                     del self.trades_buffer[sym]
+                
+                # 刷新 WebSocket 实时缓冲（资金费率 + 溢价指数 K 线）
+                await self._flush_ws_funding_rate_buffer()
+                await self._flush_ws_premium_index_buffer()
                 
                 self.last_save_time = time.time()
                 
@@ -733,6 +750,9 @@ class DataLayerProcess:
                     if set(new_symbols) != old_symbols:
                         logger.info(f"Universe updated: {len(old_symbols)} -> {len(new_symbols)} symbols")
                         await self.collector.update_symbols(new_symbols)
+                        # 同步更新 funding market collector（无需重连）
+                        if self.funding_market_collector:
+                            self.funding_market_collector.update_symbols(new_symbols)
                         
             except asyncio.CancelledError:
                 break
@@ -839,36 +859,34 @@ class DataLayerProcess:
         symbol_update_task = asyncio.create_task(self._update_symbols())
         self._add_task_with_error_handler(symbol_update_task, "update_symbols")
         
-        # 9. 初始化资金费率采集器（非mock模式）
+        # 9. 启动 WebSocket 实时资金费率/标记价格/溢价指数采集器（非mock模式）
+        #    与 aggTrade 使用相同的 WebSocket 推送架构，不依赖 REST 轮询，
+        #    彻底消除 403/429 限流问题。
         if not self.is_mock_mode:
-            # 使用异步方法获取正确的API端点（支持testnet回退到live）
+            self.funding_market_collector = FundingMarketCollector(
+                symbols=symbols,
+                on_funding_rate_callback=self._on_ws_funding_rate,
+                on_premium_index_callback=self._on_ws_premium_index_kline,
+            )
+            funding_market_task = asyncio.create_task(self.funding_market_collector.start())
+            self._add_task_with_error_handler(funding_market_task, "funding_market_collector")
+            logger.info(
+                "Funding market WebSocket collector started "
+                "(real-time funding rates + premium index, no REST polling)"
+            )
+        
+        # 10. 初始化 REST 采集器（仅用于一次性启动回填历史数据，不做周期轮询）
+        if not self.is_mock_mode:
             api_base = await config.get_binance_api_base_for_data_layer_async()
             self.funding_rate_collector = FundingRateCollector(api_base=api_base)
-            logger.info(f"Funding rate collector initialized with API: {api_base}")
-            if config.get("data.enable_background_rest_collectors", False):
-                # 启动资金费率采集任务
-                funding_rate_task = asyncio.create_task(self._periodic_collect_funding_rates())
-                self._add_task_with_error_handler(funding_rate_task, "funding_rate_collector")
-                # 立即执行一次初始采集
-                asyncio.create_task(self._collect_funding_rates_initial())
-            else:
-                logger.info("Background funding-rate REST collectors disabled by config")
-        
-        # 10. 初始化溢价指数K线采集器（非mock模式）
-        if not self.is_mock_mode:
             self.premium_index_collector = get_premium_index_collector()
-            if config.get("data.enable_background_rest_collectors", False):
-                # 启动溢价指数K线采集任务
-                premium_index_task = asyncio.create_task(self._periodic_collect_premium_index())
-                self._add_task_with_error_handler(premium_index_task, "premium_index_collector")
-                # 立即执行一次初始采集
-                asyncio.create_task(self._collect_premium_index_initial())
-            else:
-                logger.info("Background premium-index REST collectors disabled by config")
+            logger.info(f"REST collectors initialized for one-time backfill (API: {api_base})")
+            # 启动一次性历史回填（后台，不影响主流程）
+            asyncio.create_task(self._backfill_funding_rates_once())
+            asyncio.create_task(self._backfill_premium_index_once())
         
-        # 11. 启动数据完整性检查和自动补全任务（每1小时检查一次）
+        # 11. 数据完整性检查（仅用于长期运行后的偶尔补漏，频率极低）
         if not self.is_mock_mode:
-            if config.get("data.enable_background_rest_collectors", False):
                 data_integrity_task = asyncio.create_task(self._check_and_complete_data())
                 self._add_task_with_error_handler(data_integrity_task, "data_integrity_check")
         
@@ -907,6 +925,13 @@ class DataLayerProcess:
         if self.collector:
             await self.collector.stop()
         
+        # 停止 funding market 采集器并 flush 缓冲
+        if self.funding_market_collector:
+            await self.funding_market_collector.stop()
+            await self.funding_market_collector.flush_all_premium_windows()
+        await self._flush_ws_funding_rate_buffer()
+        await self._flush_ws_premium_index_buffer()
+        
         # 停止Universe管理器
         if self.universe_manager:
             await self.universe_manager.stop()
@@ -931,6 +956,179 @@ class DataLayerProcess:
             await self.ipc_client.disconnect()
         
         logger.info("Data layer process stopped")
+    
+    # ==================================================================
+    # WebSocket 实时回调（FundingMarketCollector → data_layer）
+    # ==================================================================
+
+    async def _on_ws_funding_rate(self, symbol: str, data: Dict):
+        """
+        WebSocket 推送的资金费率结算回调
+        
+        注意：FundingMarketCollector 已经在内部通过 REST API 获取了真实的已结算资金费率，
+        所以回调传入的 data 已经是真实数据，不需要再次调用 REST API。
+        只需要将数据写入缓冲区，等待定期刷盘即可。
+        """
+        # 检查是否正在回填，如果是，跳过（避免与回填冲突）
+        if self._funding_rate_backfill_in_progress:
+            logger.debug(
+                f"Skipping WS funding rate callback for {symbol} during backfill "
+                f"(backfill will cover this data)"
+            )
+            return
+        
+        funding_time_ms = data.get('fundingTime', 0)
+        if funding_time_ms <= 0:
+            return
+        
+        # FundingMarketCollector 已经通过 REST API 获取了真实的已结算费率，
+        # 所以这里直接使用回调传入的数据（已经是真实数据）
+        if symbol not in self._ws_funding_rate_buffer:
+            self._ws_funding_rate_buffer[symbol] = []
+        self._ws_funding_rate_buffer[symbol].append(data)
+        
+        logger.debug(
+            f"WS funding rate: {symbol} rate={data.get('fundingRate'):.6f} "
+            f"time={funding_time_ms} (real settled data from FundingMarketCollector)"
+        )
+    
+
+    async def _on_ws_premium_index_kline(self, symbol: str, kline: Dict):
+        """
+        WebSocket 聚合的溢价指数 5 分钟 K 线回调 → 触发REST API获取真实历史数据
+        
+        注意：WebSocket基于实时价格计算的premium index是"评估数据"。
+        当5分钟K线完成时，立即调用REST API获取该时间段的真实历史K线数据。
+        """
+        open_time = kline.get('open_time')
+        if not open_time:
+            return
+        
+        # 转换open_time为datetime
+        if isinstance(open_time, pd.Timestamp):
+            open_time_dt = open_time.to_pydatetime()
+        elif isinstance(open_time, datetime):
+            open_time_dt = open_time
+        else:
+            try:
+                open_time_dt = pd.Timestamp(open_time).to_pydatetime()
+            except:
+                return
+        
+        # 计算时间范围（5分钟窗口）
+        start_time = open_time_dt
+        end_time = open_time_dt + timedelta(minutes=5)
+        
+        # 异步触发REST API获取真实的K线数据，不阻塞WebSocket回调
+        asyncio.create_task(self._fetch_real_premium_index_kline(symbol, start_time, end_time))
+        
+        logger.debug(
+            f"WS premium index kline completed: {symbol} open_time={open_time_dt}, "
+            f"triggering REST API fetch for real historical kline data"
+        )
+    
+    async def _fetch_real_premium_index_kline(self, symbol: str, start_time: datetime, end_time: datetime):
+        """
+        在5分钟K线完成时，通过REST API获取真实的溢价指数K线历史数据
+        
+        这是真实的K线数据，而非WebSocket基于实时价格计算的评估值。
+        """
+        try:
+            if not self.premium_index_collector:
+                return
+            
+            # 使用REST API获取真实的K线历史数据
+            klines = await self.premium_index_collector.fetch_premium_index_klines(
+                symbol=symbol,
+                start_time=start_time,
+                end_time=end_time,
+                interval='5m',
+                max_retries=3
+            )
+            
+            if klines:
+                # 转换为DataFrame并保存
+                df = pd.DataFrame(klines)
+                self.storage.save_premium_index_klines(symbol, df)
+                logger.info(
+                    f"Fetched real premium index kline data for {symbol}: {len(klines)} records "
+                    f"(window: {start_time} to {end_time})"
+                )
+            else:
+                logger.debug(f"No real premium index kline data found for {symbol} at {start_time}")
+        except Exception as e:
+            logger.error(
+                f"Failed to fetch real premium index kline data for {symbol} at {start_time}: {e}",
+                exc_info=True
+            )
+
+    async def _flush_ws_funding_rate_buffer(self):
+        """将 WebSocket 资金费率缓冲批量写入 storage"""
+        import polars as pl
+        for symbol in list(self._ws_funding_rate_buffer.keys()):
+            records = self._ws_funding_rate_buffer.pop(symbol, [])
+            if not records:
+                continue
+            try:
+                rows = []
+                for r in records:
+                    funding_time_ms = r.get('fundingTime', 0)
+                    rows.append({
+                        'symbol': format_symbol(symbol),
+                        'fundingTime': pd.Timestamp(funding_time_ms, unit='ms', tz='UTC'),
+                        'fundingRate': float(r.get('fundingRate', 0)),
+                        'markPrice': float(r.get('markPrice', 0)),
+                    })
+                df = pd.DataFrame(rows)
+                self.storage.save_funding_rates(symbol, df)
+                logger.debug(f"Flushed {len(rows)} WS funding rates for {symbol}")
+            except Exception as e:
+                logger.error(f"Failed to flush WS funding rates for {symbol}: {e}", exc_info=True)
+
+    async def _flush_ws_premium_index_buffer(self):
+        """将 WebSocket 溢价指数 K 线缓冲批量写入 storage"""
+        for symbol in list(self._ws_premium_index_buffer.keys()):
+            klines = self._ws_premium_index_buffer.pop(symbol, [])
+            if not klines:
+                continue
+            try:
+                df = pd.DataFrame(klines)
+                self.storage.save_premium_index_klines(symbol, df)
+                logger.debug(f"Flushed {len(klines)} WS premium index klines for {symbol}")
+            except Exception as e:
+                logger.error(
+                    f"Failed to flush WS premium index klines for {symbol}: {e}",
+                    exc_info=True,
+                )
+
+    # ==================================================================
+    # 一次性历史回填（REST，仅启动时执行一次）
+    # ==================================================================
+
+    async def _backfill_funding_rates_once(self):
+        """启动时一次性回填资金费率历史数据（REST），完成后不再轮询"""
+        try:
+            self._funding_rate_backfill_in_progress = True
+            await self._collect_funding_rates_initial()
+            logger.info("One-time funding rate backfill completed, WebSocket handles real-time data")
+        except Exception as e:
+            logger.error(f"Funding rate backfill error: {e}", exc_info=True)
+        finally:
+            self._funding_rate_backfill_in_progress = False
+
+    async def _backfill_premium_index_once(self):
+        """启动时一次性回填溢价指数历史数据（REST），完成后不再轮询"""
+        try:
+            # 错峰：等 funding rate 回填先跑一会儿
+            await asyncio.sleep(30)
+            await self._collect_premium_index_initial()
+            logger.info("One-time premium index backfill completed, WebSocket handles real-time data")
+        except Exception as e:
+            logger.error(f"Premium index backfill error: {e}", exc_info=True)
+
+    # ==================================================================
+    # REST 初始采集（保留原有逻辑，但只在启动时调用一次）
+    # ==================================================================
     
     async def _collect_funding_rates_initial(self):
         """初始采集资金费率数据（采集最近N天的历史数据）"""

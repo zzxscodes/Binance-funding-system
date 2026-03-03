@@ -534,6 +534,16 @@ class TradeCollector:
                                     f"将重连... 错误: {type(e).__name__}: {e}"
                                 )
                             break
+                    
+                    # ---- 防连接风暴：ConnectionClosed/内循环异常 break 后，
+                    # ---- 按 batch_index 错开重连，避免所有 batch 同时涌向服务器 ----
+                    if self.running:
+                        stagger = 1.0 + batch_index * 0.3 + random.uniform(0, 1.5)
+                        logger.info(
+                            f"WebSocket batch {batch_index + 1} 等待 {stagger:.1f}s "
+                            f"后重连（防止连接风暴）"
+                        )
+                        await asyncio.sleep(stagger)
                             
             except WebSocketException as e:
                 if self.running:

@@ -46,7 +46,19 @@ data:
   kline_aggregator_max_klines: 8  # 每个symbol最多缓存K线数（需覆盖grace窗口，避免晚到成交回补时丢失基线）
   kline_aggregator_max_pending_windows: 8  # 每个symbol最多保留的pending窗口数（精度优先，配合grace窗口）
   kline_aggregator_max_trades_per_window: 0  # 每窗口成交上限；0表示不截断（保证聚合口径一致）
-  kline_close_grace_windows: 6  # 延迟关窗窗口数（允许最近6个窗口接收晚到成交）
+  # pending窗口内逐笔压缩：超过阈值时把旧逐笔压缩为窗口统计，仅保留尾部逐笔，避免内存线性增长
+  kline_aggregator_pending_compact_threshold: 300
+  kline_aggregator_pending_compact_keep_tail: 60
+  # 按窗口年龄分层压缩（旧窗口更激进；内存高压时会再动态收紧）
+  kline_aggregator_pending_compact_old_window_threshold: 120
+  kline_aggregator_pending_compact_old_window_keep_tail: 20
+  kline_aggregator_pending_compact_current_window_threshold: 260
+  kline_aggregator_pending_compact_current_window_keep_tail: 40
+  # 周期保存时仅快照最近N个窗口，降低全窗口重聚合导致的RSS缓慢抬升
+  kline_snapshot_max_windows_per_symbol: 2
+  # 软阈值口径区分：list_total（真实对象内存）与compact_total（压缩统计计数）
+  kline_aggregator_pending_compact_trades_soft_limit: 2000000
+  kline_close_grace_windows: 2  # 延迟关窗窗口数（允许最近2个窗口接收晚到成交=10分钟）
   
   # DataStorage缓存配置
   storage_schema_cache_max_size: 1  # Schema缓存最大数量
@@ -59,21 +71,29 @@ data:
   memory_cleanup_interval: 60  # 定期内存清理间隔（秒，1分钟，极端优化：更频繁的清理以控制内存峰值）
   stats_cleanup_interval: 120  # 统计信息清理间隔（秒，2分钟，极端优化：更频繁的清理）
   memory_force_rebuild_interval: 60  # kline全量重建周期（cleanup轮次）。<=0禁用周期重建，仅高增长触发
+  memory_aggressive_cleanup_threshold_mb: 900  # 仅当RSS超过此阈值才允许执行激进trim，避免低内存阶段反复重建导致碎片抬升
   
-  # 资金费率采集配置
-  funding_rate_collect_interval: 300  # 5分钟轮询一次（交易所可能非固定时点更新）
-  funding_rate_collect_days: 30  # 采集最近N天的历史数据
-  funding_rate_collect_overlap_minutes: 60  # 定时增量拉取时的重叠窗口，防漏数
-  funding_rate_periodic_lookback_minutes: 480  # 无历史状态时的回看窗口（分钟）
-  
-  # 溢价指数K线采集配置
-  premium_index_collect_interval: 300  # 5分钟
-  premium_index_collect_days: 30  # 采集最近N天的历史数据
-  premium_index_collect_overlap_minutes: 10  # 定期增量采集时向前重叠窗口，避免边界漏数
-  premium_index_periodic_lookback_minutes: 60  # 无上次采集时间时的回看窗口（分钟）
+  # ---- 实时标记价格 WebSocket 采集（资金费率 + 溢价指数） ----
+  # 通过 !markPrice@arr 流实时接收所有交易对的标记价格/资金费率/指数价格，
+  # 与 aggTrade 一样走 WebSocket 推送，不依赖 REST 轮询，不触发 403/429。
+  mark_price_update_speed: "3s"  # "3s"（默认，每3秒推送一次）或 "1s"
+  mark_price_ping_interval_seconds: 20
+  mark_price_ping_timeout_seconds: 30
+  mark_price_open_timeout_seconds: 30
+
+  # ---- REST 回填配置（仅启动时一次性拉取历史数据，之后不再轮询） ----
+  funding_rate_collect_days: 30  # 启动回填最近N天的资金费率历史
+  funding_rate_collect_overlap_minutes: 60
+  funding_rate_periodic_lookback_minutes: 480
+  premium_index_collect_days: 30  # 启动回填最近N天的溢价指数历史
+  premium_index_collect_overlap_minutes: 10
+  premium_index_periodic_lookback_minutes: 60
+  # REST 回填串行控制（保守参数，避免触发限流）
+  history_collect_max_concurrent: 1
+  history_collect_batch_size: 8
   
   # 数据完整性检查配置
-  completeness_threshold: 0.95  # 数据完整性阈值（95%）
+  completeness_threshold: 0.90  # 数据完整性阈值（90%）- 允许10%的symbol因网络抖动暂缺
   data_complete_retry_throttle: 10.0  # data_complete重试节流时间（秒）
   data_complete_retry_attempts: 3  # data_complete重试次数
   data_complete_retry_delays: [0.05, 0.2, 0.5]  # data_complete重试延迟（秒）
@@ -119,9 +139,6 @@ data:
   # 数据API缓存配置
   cache_max_symbols: 1  # 内存缓存最多保留的symbol数量（只缓存最活跃的1个symbol）
   cache_max_klines: 1 # 缓存最大K线数
-  
-  # 历史数据采集并发配置
-  history_collect_max_concurrent: 1  # 历史数据采集最大并发数（降低到1，避免触发403限流）
 
 strategy:
   history_days: 30
@@ -208,7 +225,6 @@ strategy:
     generation:
       output_dir: data/factor_mining  # 因子输出目录
       default_lookback_bars: 1000  # 默认回看K线数
-
 
 execution:
   # 执行模式: 'testnet' (测试网), 'mock' (模拟), 'live' (实盘)

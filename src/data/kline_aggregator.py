@@ -575,6 +575,7 @@ class KlineAggregator:
         window_start_ms: int,
         trades_override: Optional[List[Dict]] = None,
         preserve_pending: bool = False,
+        snapshot_mode: bool = False,
     ):
         """
         聚合指定窗口的所有交易，生成K线（使用Polars向量化操作）
@@ -1065,7 +1066,8 @@ class KlineAggregator:
 
             # 强制垃圾回收：在关键路径上触发GC，帮助释放内存
             # 注意：只在数据量大时触发，避免频繁GC影响性能
-            if final_len > 100:
+            # snapshot_mode时跳过：flush_pending_snapshot调用1000+次，每次GC极其昂贵
+            if final_len > 100 and not snapshot_mode:
                 import gc
                 gc.collect()
 
@@ -1108,7 +1110,8 @@ class KlineAggregator:
             
             # 强制GC，确保polars DataFrame的内存被真正释放
             # 注意：只在数据量大时触发，避免频繁GC影响性能
-            if has_trades and trades_count_before_cleanup > 100:
+            # snapshot_mode时跳过：避免1000+次GC开销
+            if has_trades and trades_count_before_cleanup > 100 and not snapshot_mode:
                 import gc
                 gc.collect()
             
@@ -1133,7 +1136,9 @@ class KlineAggregator:
                 )
 
             # 调用回调函数（传递dict而不是Series）
-            if self.on_kline_callback:
+            # snapshot_mode时跳过：flush_pending_snapshot生成的K线不需要逐条落盘和检查完整性
+            # 调用者（_periodic_save）会在批量快照完成后统一落盘并检查完整性
+            if self.on_kline_callback and not snapshot_mode:
                 try:
                     await self.on_kline_callback(symbol, kline_data)
                 except Exception as e:
@@ -1195,6 +1200,7 @@ class KlineAggregator:
                     window_start_ms,
                     trades_override=list(window_trades),
                     preserve_pending=True,
+                    snapshot_mode=True,
                 )
 
     async def flush_closed_windows(self, now_ms: Optional[int] = None, symbol: Optional[str] = None):
@@ -1492,10 +1498,10 @@ class KlineAggregator:
                 keep_count = min(current_len, max_klines)
             else:
                 keep_count = min(current_len, 1)
-
+            
             # 如果数据量超过限制，或者force_rebuild_all为True，都需要重建DataFrame
             needs_rebuild = current_len > keep_count or force_rebuild_all
-
+            
             if needs_rebuild:
                 old_df = self.klines[symbol]
                 new_df = old_df.tail(keep_count).unique(subset=["open_time"], keep="last").sort("open_time").rechunk()
